@@ -1163,3 +1163,78 @@ def test_auto_step_github_challenged_skips_redundant_ip_check(api):
     # No redundant is_ip_restricted_page call after submit_github_signup returned challenged.
     assert call_records == ["is_ip_restricted_page", "submit_github_signup"]
 
+
+def test_skip_to_workbuddy_action_advances_existing_github_account(api):
+    acc = add_mail(api, "existing_gh@ggb6.com")
+    started = api.start_workbuddy_queue([acc["id"]])
+    assert started["ok"] is True
+    cur = started["queue"]["current"]
+    assert cur["step"] == "github"
+
+    res = api.workbuddy_action(cur["id"], cur["revision"], "skip_to_workbuddy", "existing-gh-99")
+    assert res["ok"] is True
+    assert res["step"] == "workbuddy"
+    assert res["queue"]["current"]["step"] == "workbuddy"
+    assert res["queue"]["current"]["username"] == "existing-gh-99"
+
+    saved_acc = api.db.get_account(acc["id"])
+    assert saved_acc["custom_fields"]["wb_reg_step"] == "workbuddy"
+
+    api._workbuddy.browser.complete_workbuddy_github_login = Mock(return_value={
+        "status": "next_step",
+        "next": "region",
+        "message": "已授权登录",
+    })
+    cur = res["queue"]["current"]
+    auto_res = api.workbuddy_action(cur["id"], cur["revision"], "auto_step")
+    assert auto_res["ok"] is True
+    assert auto_res["auto_advanced"] is True
+    assert auto_res["step"] == "region"
+    assert auto_res["queue"]["current"]["step"] == "region"
+
+    api._workbuddy.browser.complete_workbuddy_github_login.assert_called_once()
+    called_task, called_pw = api._workbuddy.browser.complete_workbuddy_github_login.call_args[0]
+    assert called_task["id"] == cur["id"]
+    assert called_pw == acc["password"]
+
+
+def test_auto_step_surfaces_account_suspended_and_pauses(api):
+    acc = add_mail(api, "suspended_user@ggb6.com")
+    started = api.start_workbuddy_queue([acc["id"]])
+    assert started["ok"] is True
+    cur = started["queue"]["current"]
+
+    res = api.workbuddy_action(cur["id"], cur["revision"], "skip_to_workbuddy", "suspended-gh")
+    assert res["ok"] is True
+    cur = res["queue"]["current"]
+    assert cur["step"] == "workbuddy"
+
+    api._workbuddy.browser.complete_workbuddy_github_login = Mock(return_value={
+        "status": "account_suspended",
+        "message": "检测到该 GitHub 账号已被官方封禁 (Account suspended)",
+    })
+    auto_res = api.workbuddy_action(cur["id"], cur["revision"], "auto_step")
+    assert auto_res["ok"] is True
+    assert auto_res["paused_for_human"] is True
+    assert auto_res["account_suspended"] is True
+    assert "Account suspended" in auto_res["message"]
+    assert auto_res["queue"]["current"]["status"] == "paused"
+
+
+def test_start_resumes_from_account_custom_fields(api):
+    acc = api.save_account({
+        "account_type": "域名邮箱",
+        "account": "resume_cf@ggb6.com",
+        "password": "pass",
+        "custom_fields": {
+            "github_username": "preset-gh-user",
+            "wb_reg_step": "workbuddy",
+        },
+    })["account"]
+    started = api.start_workbuddy_queue([acc["id"]])
+    assert started["ok"] is True
+    task = started["queue"]["current"]
+    assert task["username"] == "preset-gh-user"
+    assert task["step"] == "workbuddy"
+
+

@@ -394,6 +394,10 @@ function renderWorkBuddyModal() {
     ? '<span>🧬 临时新指纹 · ' + escapeHtml(task.fp_summary) + '</span>'
     : '';
 
+  const skipToWbBtn = ["github", "email"].includes(task.step)
+    ? '<button class="btn btn-secondary" data-workbuddy-action onclick="skipToWorkBuddyStep()" title="若该邮箱之前已注册成功 GitHub，可跳过 GitHub 注册直接登录 WorkBuddy">⏭️ 已注册好 GitHub？直接进入 WorkBuddy</button>'
+    : '';
+
   body.innerHTML = roundSlotsHtml +
     '<div class="workbuddy-person"><span>第 ' + currentIndex + ' / ' + items.length + ' 人</span><strong>' +
     escapeHtml(task.email) + '</strong><span>GitHub · ' + escapeHtml(task.username) + '</span>' +
@@ -402,11 +406,13 @@ function renderWorkBuddyModal() {
     '<div id="workbuddy-message" role="status"></div>' +
     (paused ? '<div class="workbuddy-paused">⏸️ 已暂停等待人工完成验证：若浏览器中弹出滑块/拼图人机验证，请在浏览器窗口内拖动完成后点击下方「✅ 验证已完成，继续全自动注册」；若页面显示「访问暂时受限」，请直接点击「🔀 当前IP受限？拉黑并换新节点重开」自动切换干净节点！</div>' +
     '<div class="workbuddy-actions"><button class="btn btn-secondary" data-workbuddy-action onclick="workBuddyAction(\'show\')">打开待验证窗口</button>' +
-    '<button class="btn btn-secondary" data-workbuddy-action onclick="workBuddyAction(\'switch_node\')">🔀 当前IP受限？拉黑并换新节点重开</button></div>' :
+    '<button class="btn btn-secondary" data-workbuddy-action onclick="workBuddyAction(\'switch_node\')">🔀 当前IP受限？拉黑并换新节点重开</button>' +
+    skipToWbBtn + '</div>' :
     '<div class="workbuddy-actions"><button class="btn btn-secondary" data-workbuddy-action onclick="workBuddyAction(\'open\')">' +
     phase.open + '</button><button class="copy-btn" data-workbuddy-action onclick="copyWorkBuddyField(\'email\')">复制邮箱</button>' +
     '<button class="copy-btn" data-workbuddy-action onclick="copyWorkBuddyField(\'username\')">复制用户名</button>' +
     (["github", "email", "workbuddy"].includes(task.step) ? '<button class="copy-btn" data-workbuddy-action onclick="workBuddyAction(\'password\')">复制邮箱密码</button>' : "") +
+    skipToWbBtn +
     '</div>' + fields + credBanner +
     '<label class="workbuddy-ack"><input id="workbuddy-ack" type="checkbox" onchange="updateWorkBuddyConfirm()" />' +
     phase.confirm + '</label>') +
@@ -556,6 +562,27 @@ async function resumeAndAutoRunWorkBuddy() {
     }
   }
   await runWorkBuddyAutoLoop(wasPaused && !rotatedDuringResume);
+  schedulePausedWorkBuddyCheck();
+}
+
+async function skipToWorkBuddyStep() {
+  const task = getFocusedWorkBuddyTask();
+  if (!task || workbuddy.busy || workbuddy.autoRunning) return;
+  const usernameInput = document.getElementById("workbuddy-username");
+  const username = usernameInput ? usernameInput.value.trim() : (task.username || "");
+  workbuddy.busy = true;
+  setWorkBuddyBusy(true);
+  try {
+    const res = await requestWorkBuddyAction(task, "skip_to_workbuddy", username);
+    if (res && res.ok) {
+      syncLocalAccountsFromQueue(res.queue || workbuddy.queue);
+      renderAccounts();
+    }
+  } finally {
+    workbuddy.busy = false;
+    setWorkBuddyBusy(false);
+  }
+  await runWorkBuddyAutoLoop(true);
   schedulePausedWorkBuddyCheck();
 }
 

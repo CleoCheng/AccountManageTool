@@ -340,6 +340,69 @@ WORKBUDDY_REGION_HOME_HTML = """
 </body></html>
 """
 
+# Homepage variant that only links to the real /login page, where the entire
+# login/register UI lives inside a same-origin ``login-iframe``.
+WORKBUDDY_HOME_IFRAME_LOGIN_HTML = """
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>WorkBuddy</title></head>
+<body>
+  <a class="wb2-hero__online" href="/login">Get Started</a>
+</body></html>
+"""
+
+# The parent React component keeps the iframe at opacity:0 and covers the
+# viewport with ``.t-loading`` until iframe.onLoad fires (which real WorkBuddy
+# can stall for 15-30s while a background MP4 loads).
+WORKBUDDY_LOGIN_IFRAME_HTML = """
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>WorkBuddy Login</title></head>
+<body>
+  <div class="absolute"><div class="t-loading"></div></div>
+  <iframe title="login-iframe"
+    src="https://www.workbuddy.ai/auth/realms/copilot/protocol/openid-connect/auth"
+    style="opacity:0;width:800px;height:600px;"></iframe>
+</body></html>
+"""
+
+# Keycloak-style auth document rendered inside the login-iframe. Both policy
+# checkboxes must be checked before ``a#social-github`` navigates.
+WORKBUDDY_AUTH_IFRAME_HTML = """
+<!DOCTYPE html>
+<html><body>
+  <div class="login-tab active">注册</div>
+  <a id="social-github" href="https://github.com/login?return_to=%2Flogin%2Foauth%2Fauthorize"
+     onclick="if(!document.getElementById('agree-policy-account-service').checked || !document.getElementById('agree-policy-account-privacy').checked){ return false; } window.top.location.href=this.href; return false;">使用 GitHub 注册</a>
+  <label class="custom-checkbox"><input id="agree-policy-account-service" type="checkbox" /><span>本人已阅读并同意服务协议</span></label>
+  <label class="custom-checkbox"><input id="agree-policy-account-privacy" type="checkbox" /><span>本人已阅读并知悉隐私政策</span></label>
+</body></html>
+"""
+
+WORKBUDDY_REGISTER_COMPLETE_HTML = """
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Complete Your Profile</title></head>
+<body>
+  <div class="select-account-title">Complete Your Profile</div>
+  <button class="select-account-button" onclick="location.href='/app'">Continue</button>
+</body></html>
+"""
+
+GITHUB_SUSPENDED_HTML = """
+<html><body><h1>Account suspended</h1>
+<p>Access to your account has been suspended due to a violation of our Terms of Service.</p>
+</body></html>
+"""
+
+# GitHub /login as reached from the WorkBuddy login-iframe: signing in must
+# continue to the OAuth authorize page, like the real broker flow.
+GITHUB_LOGIN_THEN_AUTHORIZE_HTML = """
+<html><body>
+  <input id="login_field" name="login" />
+  <input id="password" name="password" type="password" />
+  <button type="submit" name="commit"
+    onclick="window.sessionStorage.setItem('gh_logged_in_user', document.getElementById('login_field').value); location.href='/login/oauth/authorize'; return false;">Sign in</button>
+</body></html>
+"""
+
 
 def _workbuddy_home_with_profile_html() -> str:
     return """
@@ -513,8 +576,8 @@ class LocalHttpsSite:
         # Scenario switches used by the browser-auto tests.
         self.github_signup_mode = "wizard"  # "wizard" | "submit" | "taken" | "verified"
         self.github_verify_mode = "pending"  # "pending" | "ok"
-        self.github_oauth_mode = "plain"  # "plain" | "authorize"
-        self.workbuddy_home_mode = "login"  # "login" | "region" | "profile"
+        self.github_oauth_mode = "plain"  # "plain" | "authorize" | "login_then_authorize" | "suspended"
+        self.workbuddy_home_mode = "login"  # "login" | "region" | "profile" | "oauth" | "iframe_login"
         self.workbuddy_app_mode = "plain"  # "plain" | "replied"
         self._username_taken_polls = 0
         cert_path, key_path = _generate_self_signed_cert(cert_dir)
@@ -578,7 +641,13 @@ class LocalHttpsSite:
             if path == "/restricted":
                 return 200, GITHUB_RESTRICTED_HTML, html
             if path == "/login":
+                if self.github_oauth_mode == "login_then_authorize":
+                    return 200, GITHUB_LOGIN_THEN_AUTHORIZE_HTML, html
+                if self.github_oauth_mode == "suspended":
+                    return 200, GITHUB_SUSPENDED_HTML, html
                 return 200, "<html><body><input id='login'></body></html>", html
+            if path == "/account_suspended":
+                return 200, GITHUB_SUSPENDED_HTML, html
             return 404, "<html><body>Not Found</body></html>", html
         if host in ("geo.captcha-delivery.com", "octocaptcha.com"):
             return 200, "<html><body>challenge frame</body></html>", html
@@ -593,6 +662,12 @@ class LocalHttpsSite:
                 return 200, WORKBUDDY_APP_HTML, html
             if path == "/oauth/callback":
                 return 200, WORKBUDDY_OAUTH_CALLBACK_HTML, html
+            if path == "/login":
+                return 200, WORKBUDDY_LOGIN_IFRAME_HTML, html
+            if path == "/auth/realms/copilot/protocol/openid-connect/auth":
+                return 200, WORKBUDDY_AUTH_IFRAME_HTML, html
+            if path == "/login/register/user/complete":
+                return 200, WORKBUDDY_REGISTER_COMPLETE_HTML, html
             if path == "/":
                 if self.workbuddy_home_mode == "region":
                     return 200, WORKBUDDY_REGION_HOME_HTML, html
@@ -600,6 +675,8 @@ class LocalHttpsSite:
                     return 200, _workbuddy_home_with_profile_html(), html
                 if self.workbuddy_home_mode == "oauth":
                     return 200, WORKBUDDY_HOME_OAUTH_HTML, html
+                if self.workbuddy_home_mode == "iframe_login":
+                    return 200, WORKBUDDY_HOME_IFRAME_LOGIN_HTML, html
                 return 200, WORKBUDDY_HOME_HTML, html
             return 404, "<html><body>Not Found</body></html>", html
         return 404, "<html><body>Unknown host</body></html>", html
@@ -2797,3 +2874,207 @@ def test_check_paused_challenge_state_reports_ip_restricted_solved_and_pending(
     )
     helper.sessions[task["id"]] = {"context": _FakeCtx([signup_page], [])}
     assert helper.check_paused_challenge_state(task) == "still_challenged"
+
+
+# ---------------------------------------------------------------------------
+# 23. WorkBuddy same-origin login-iframe: policies + existing GitHub sign-in
+# ---------------------------------------------------------------------------
+@requires_chrome
+def test_workbuddy_login_iframe_checks_policies_and_signs_in_existing_github(
+    tmp_path: Path, site: LocalHttpsSite, launched_processes, action_delays
+):
+    """The hidden ``login-iframe`` must be unhidden, its two policy checkboxes
+    checked, and GitHub login must continue into the OAuth broker flow."""
+    helper = _new_helper(tmp_path, site)
+    task = {
+        "id": 131,
+        "email": "worker@example.org",
+        "username": "worker1234",
+        "step": "workbuddy",
+        "greeting": "hi",
+        "round_slot": 0,
+    }
+    try:
+        site.github_status = 200
+        site.workbuddy_home_mode = "iframe_login"
+        site.github_oauth_mode = "login_then_authorize"
+
+        page = helper._page(
+            task["id"], "workbuddy", "https://www.workbuddy.ai/login", task=task
+        )
+        # The login UI lives inside a same-origin iframe whose parent keeps it
+        # at opacity:0 behind a full-viewport ``.t-loading`` overlay.
+        assert _wait_until(
+            lambda: page.evaluate(
+                """() => {
+                    const ifr = document.querySelector('iframe[title="login-iframe"]');
+                    const doc = ifr && (ifr.contentDocument || ifr.contentWindow?.document);
+                    return !!(doc && doc.body && doc.getElementById('social-github')
+                        && doc.getElementById('agree-policy-account-service')
+                        && doc.getElementById('agree-policy-account-privacy'));
+                }"""
+            ),
+            timeout=8.0,
+        )
+        assert (
+            page.evaluate(
+                "() => document.querySelector('iframe[title=\"login-iframe\"]').style.opacity"
+            )
+            == "0"
+        )
+
+        # Clicking GitHub while the policies are unchecked is a no-op.
+        page.evaluate(
+            """() => {
+                const doc = document.querySelector('iframe[title="login-iframe"]').contentDocument;
+                doc.getElementById('social-github').click();
+            }"""
+        )
+        time.sleep(0.3)
+        assert urllib.parse.urlsplit(page.url).path == "/login"
+        assert page.evaluate(
+            """() => {
+                const doc = document.querySelector('iframe[title="login-iframe"]').contentDocument;
+                return [
+                    doc.getElementById('agree-policy-account-service').checked,
+                    doc.getElementById('agree-policy-account-privacy').checked,
+                ];
+            }"""
+        ) == [False, False]
+
+        # Neutralize the top-level redirect so the helper's side effects stay
+        # observable on the same document.
+        page.evaluate(
+            """() => {
+                const doc = document.querySelector('iframe[title="login-iframe"]').contentDocument;
+                doc.addEventListener('click', (event) => {
+                    event.preventDefault();
+                    event.stopImmediatePropagation();
+                }, true);
+            }"""
+        )
+        assert helper._trigger_workbuddy_login_iframe(page) is True
+        assert page.evaluate(
+            """() => {
+                const ifr = document.querySelector('iframe[title="login-iframe"]');
+                const doc = ifr.contentDocument;
+                const overlay = document.querySelector('.t-loading');
+                return {
+                    opacity: ifr.style.opacity,
+                    pointerEvents: ifr.style.pointerEvents,
+                    overlayHidden: !overlay || overlay.parentElement.style.display === 'none',
+                    policies: [
+                        doc.getElementById('agree-policy-account-service').checked,
+                        doc.getElementById('agree-policy-account-privacy').checked,
+                    ],
+                };
+            }"""
+        ) == {
+            "opacity": "1",
+            "pointerEvents": "auto",
+            "overlayHidden": True,
+            "policies": [True, True],
+        }
+
+        # A fresh homepage: open() must reach /login, drive the iframe and
+        # broker to GitHub, where the existing account is signed in.
+        page.goto("https://www.workbuddy.ai/")
+        message = helper.open(task, "testPassword123")
+        assert "WorkBuddy" in message
+        assert _wait_until(
+            lambda: urllib.parse.urlsplit(page.url).netloc == "github.com",
+            timeout=10.0,
+        ), page.url
+        assert urllib.parse.urlsplit(page.url).path == "/login"
+        assert _wait_until(lambda: page.locator("#login_field").is_visible(), timeout=8.0)
+
+        act = helper._handle_github_login_or_verify(page, task, "testPassword123")
+        assert act == "submitted_login"
+        assert page.evaluate("() => sessionStorage.getItem('gh_logged_in_user')") == task["email"]
+        assert _wait_until(
+            lambda: urllib.parse.urlsplit(page.url).path == "/login/oauth/authorize",
+            timeout=8.0,
+        ), page.url
+        _assert_no_runtime_enable(helper)
+    finally:
+        helper.close()
+
+
+# ---------------------------------------------------------------------------
+# 24. complete_workbuddy_region: /login/register/user/complete page
+# ---------------------------------------------------------------------------
+@requires_chrome
+def test_complete_workbuddy_region_handles_register_user_complete_page(
+    tmp_path: Path, site: LocalHttpsSite, launched_processes, action_delays
+):
+    helper = _new_helper(tmp_path, site)
+    task = {
+        "id": 132,
+        "email": "worker@example.org",
+        "username": "worker1234",
+        "step": "region",
+        "greeting": "hi",
+        "round_slot": 0,
+    }
+    try:
+        site.github_status = 200
+        page = helper._page(
+            task["id"],
+            "workbuddy",
+            "https://www.workbuddy.ai/login/register/user/complete",
+            task=task,
+        )
+        assert page.locator("button.select-account-button").is_visible()
+
+        result = helper.complete_workbuddy_region(task)
+
+        assert result["status"] == "next_step", result
+        assert result["next"] == "greeting"
+        assert result["region"] == "confirmed"
+        assert "地区确认" in result["message"]
+        assert _wait_until(
+            lambda: urllib.parse.urlsplit(page.url).path.rstrip("/") == "/app",
+            timeout=5.0,
+        ), page.url
+        _assert_no_runtime_enable(helper)
+    finally:
+        helper.close()
+
+
+# ---------------------------------------------------------------------------
+# 25. Suspended GitHub accounts are detected in OTP and WorkBuddy login
+# ---------------------------------------------------------------------------
+@requires_chrome
+def test_github_account_suspended_detected_in_otp_and_workbuddy_login(
+    tmp_path: Path, site: LocalHttpsSite, launched_processes, action_delays
+):
+    helper = _new_helper(tmp_path, site)
+    task = {
+        "id": 133,
+        "email": "worker@example.org",
+        "username": "worker1234",
+        "step": "email",
+        "greeting": "hi",
+        "round_slot": 0,
+    }
+    try:
+        site.github_status = 200
+
+        # 1) OTP step: a suspended account must abort immediately.
+        page = helper._page(
+            task["id"], "github", "https://github.com/account_suspended", task=task
+        )
+        assert "Account suspended" in page.evaluate("() => document.body.innerText")
+        result = helper.submit_github_otp(task, "123456", "testPassword123")
+        assert result["status"] == "account_suspended", result
+        assert "封禁" in result["message"]
+
+        # 2) WorkBuddy login: the GitHub broker lands on the suspended page.
+        site.workbuddy_home_mode = "iframe_login"
+        site.github_oauth_mode = "suspended"
+        result = helper.complete_workbuddy_github_login(task, "testPassword123")
+        assert result["status"] == "account_suspended", result
+        assert "封禁" in result["message"]
+        _assert_no_runtime_enable(helper)
+    finally:
+        helper.close()

@@ -19,7 +19,7 @@ from urllib.parse import quote, urlencode, urlsplit
 from websockets.sync.client import connect as _ws_connect
 
 from src.browser_service import find_chromium_executable, generate_fingerprint_config
-from src.github_mail import MAIL_URL
+from src.github_mail import MAIL_URL, read_github_code
 from src.proxy_service import activate_proxy_node
 
 
@@ -2522,14 +2522,18 @@ class WorkBuddyBrowser:
 
     @staticmethod
     def _github_page_state(page) -> str:
-        """Classify the GitHub tab as ``otp``, ``logged_in`` or ``signup``."""
+        """Classify the GitHub tab as ``suspended``, ``otp``, ``logged_in`` or ``signup``."""
         try:
             state = page.evaluate("""() => {
                 const path = location.pathname || '';
+                const bodyText = document.body?.innerText || '';
+                if (path.toLowerCase().startsWith('/account_suspended') ||
+                    /Account suspended|Access to your account has been suspended/i.test(bodyText)) {
+                    return 'suspended';
+                }
                 const otpVisible = Array.from(document.querySelectorAll(
                     'input[name="launch_code[]"], input[autocomplete="one-time-code"], input[name="otp"], input#otp'
                 )).some(el => !!el.getClientRects().length);
-                const bodyText = document.body?.innerText || '';
                 if (path.startsWith('/account_verifications') || otpVisible ||
                     /Enter the.*code|sent a launch code|verify your email|Confirm your email|输入验证码/i.test(bodyText)) {
                     return 'otp';
@@ -2542,7 +2546,7 @@ class WorkBuddyBrowser:
             }""")
         except Exception:
             return "signup"
-        return state if state in ("otp", "logged_in", "signup") else "signup"
+        return state if state in ("suspended", "otp", "logged_in", "signup") else "signup"
 
     @staticmethod
     def _username_taken(page) -> bool:
@@ -2558,6 +2562,211 @@ class WorkBuddyBrowser:
             }"""))
         except Exception:
             return False
+
+    @staticmethod
+    def _is_github_account_suspended(page) -> bool:
+        """True when GitHub shows 'Account suspended' / '/account_suspended'."""
+        try:
+            return bool(page.evaluate("""() => {
+                const path = (location.pathname || '').toLowerCase();
+                if (path.startsWith('/account_suspended') || path.includes('/suspended')) return true;
+                const text = (document.body?.innerText || '').slice(0, 3000);
+                return /Account suspended|Access to your account has been suspended|账号已被封禁|账户已被暂停/i.test(text);
+            }"""))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _email_already_registered_on_github(page) -> bool:
+        """True when GitHub /signup reports that the email address is already taken/associated."""
+        try:
+            return bool(page.evaluate("""() => {
+                const emailEl = document.querySelector('#email, input[name="user[email]"], input[autocomplete="email"]');
+                const errors = Array.from(document.querySelectorAll(
+                    '#email-err, [id*="email"][id*="err"], [role="alert"], .flash-error, .error, [class*="error"]'
+                )).filter(node => !!node.getClientRects().length);
+                const errText = errors.map(n => n.innerText || n.textContent || '').join(' ');
+                if (/Email is invalid or already taken|already associated with an account|email.*is already taken|邮箱已被注册|已被使用/i.test(errText)) {
+                    return true;
+                }
+                if (emailEl && emailEl.getAttribute('aria-invalid') === 'true' && /already taken|already associated|已被/i.test(errText)) {
+                    return true;
+                }
+                return false;
+            }"""))
+        except Exception:
+            return False
+
+    def _trigger_workbuddy_login_iframe(self, page) -> bool:
+        """Unhide WorkBuddy's same-origin login-iframe, check policy checkboxes, and click GitHub."""
+        try:
+            prep = page.evaluate("""() => {
+                const ifr = document.querySelector(
+                    'iframe[title="login-iframe"], iframe[src*="/auth/realms/"], iframe[src*="/protocol/openid-connect/"]'
+                );
+                if (!ifr) return {found: false};
+                let doc = null;
+                try { doc = ifr.contentDocument || ifr.contentWindow?.document; } catch (_) {}
+                if (!doc || !doc.body) return {found: true, ready: false};
+                const gh = doc.querySelector('a#social-github, a[href*="/broker/github/"], #kc-social-providers a[id*="github"]');
+                if (!gh) return {found: true, ready: false};
+
+                // Unhide iframe immediately in case background video delays iframe.onload
+                ifr.style.opacity = '1';
+                ifr.style.pointerEvents = 'auto';
+                document.querySelectorAll('.t-loading').forEach(el => {
+                    const wrapper = el.parentElement;
+                    if (wrapper && wrapper.classList.contains('absolute')) {
+                        wrapper.style.display = 'none';
+                    }
+                });
+
+                const checkboxes = Array.from(doc.querySelectorAll('input[type="checkbox"][id^="agree-policy-"]'));
+                let checkedCount = 0;
+                for (const cb of checkboxes) {
+                    const label = cb.closest('label.custom-checkbox') || doc.querySelector(`label[for="${cb.id}"]`);
+                    const visTarget = label || cb;
+                    if (!visTarget.getClientRects().length) continue;
+                    if (!cb.checked) {
+                        if (label) label.click();
+                        if (!cb.checked) {
+                            cb.checked = true;
+                            cb.dispatchEvent(new Event('change', {bubbles: true}));
+                        }
+                    }
+                    if (cb.checked) checkedCount++;
+                }
+                return {found: true, ready: true, checkedCount};
+            }""")
+        except Exception:
+            return False
+
+        if not isinstance(prep, dict) or not prep.get("ready"):
+            return False
+
+        _sleep_action_delay(1.0, 2.0)
+        try:
+            clicked = bool(page.evaluate("""() => {
+                const ifr = document.querySelector(
+                    'iframe[title="login-iframe"], iframe[src*="/auth/realms/"], iframe[src*="/protocol/openid-connect/"]'
+                );
+                if (!ifr) return false;
+                const doc = ifr.contentDocument || ifr.contentWindow?.document;
+                if (!doc) return false;
+                for (const cb of doc.querySelectorAll('input[type="checkbox"][id^="agree-policy-"]')) {
+                    const label = cb.closest('label.custom-checkbox') || doc.querySelector(`label[for="${cb.id}"]`);
+                    if ((label || cb).getClientRects().length && !cb.checked) {
+                        if (label) label.click();
+                        if (!cb.checked) {
+                            cb.checked = true;
+                            cb.dispatchEvent(new Event('change', {bubbles: true}));
+                        }
+                    }
+                }
+                const gh = doc.querySelector('a#social-github, a[href*="/broker/github/"], #kc-social-providers a[id*="github"]');
+                if (!gh || !gh.getClientRects().length) return false;
+                gh.click();
+                return true;
+            }"""))
+            return clicked
+        except Exception:
+            return False
+
+    def _handle_github_login_or_verify(self, page, task: dict, password: str = "") -> str:
+        """Auto-fill GitHub /login or /sessions/verified-device when signing into an existing account."""
+        if self._is_github_account_suspended(page):
+            return "suspended"
+        state = self._github_page_state(page)
+        if state == "suspended":
+            return "suspended"
+        if state == "logged_in":
+            return "logged_in"
+
+        loc = urlsplit(page.url)
+        if loc.netloc != "github.com":
+            return ""
+        path = loc.path.rstrip("/") or "/"
+
+        if path in ("/login", "/session"):
+            try:
+                has_auth_err = bool(page.evaluate("""() => {
+                    const errs = Array.from(document.querySelectorAll('.flash-error, [role="alert"]'))
+                        .filter(el => !!el.getClientRects().length);
+                    return errs.some(el => /Incorrect username or password/i.test(el.innerText || ''));
+                }"""))
+            except Exception:
+                has_auth_err = False
+            if has_auth_err:
+                return "auth_error"
+
+            if not password:
+                return ""
+            login_val = str(task.get("email") or task.get("username") or "").strip()
+            login_loc = self._first_visible(page.locator('#login_field, input[name="login"], input#login'))
+            pwd_loc = self._first_visible(page.locator('#password, input[name="password"]'))
+            if login_loc is not None and pwd_loc is not None:
+                try:
+                    cur_login = str(login_loc.input_value(timeout=1000) or "").strip()
+                except Exception:
+                    cur_login = ""
+                if not cur_login and login_val:
+                    self._human_paste_input(
+                        page, login_loc, login_val, origin=GITHUB_URL, path=path, task=task
+                    )
+                    _sleep_action_delay(1.0, 2.0)
+                try:
+                    cur_pwd = str(pwd_loc.input_value(timeout=1000) or "").strip()
+                except Exception:
+                    cur_pwd = ""
+                if not cur_pwd and password:
+                    self._human_paste_input(
+                        page, pwd_loc, password, origin=GITHUB_URL, path=path, task=task
+                    )
+                    _sleep_action_delay(1.0, 2.0)
+                sign_in_btn = self._first_visible_any(
+                    page,
+                    [
+                        'input[type="submit"][name="commit"]',
+                        'button[type="submit"][name="commit"]',
+                        '.js-sign-in-button',
+                        'form[action="/session"] input[type="submit"]',
+                        'form[action="/session"] button[type="submit"]',
+                        'input[type="submit"]',
+                        'button[type="submit"]',
+                    ],
+                )
+                if sign_in_btn is not None:
+                    self._human_click(page, sign_in_btn)
+                    time.sleep(1.2)
+                    if self._is_github_account_suspended(page):
+                        return "suspended"
+                    return "submitted_login"
+
+        if path.startswith("/sessions/verified-device") or path.startswith("/account_verifications") or state == "otp":
+            email_addr = str(task.get("email") or "").strip()
+            if email_addr and password:
+                try:
+                    code = read_github_code(email_addr, password, max(0, int(time.time()) - 300))
+                except Exception:
+                    code = ""
+                if code:
+                    self.fill_github_code(task, code)
+                    _sleep_action_delay(1.0, 2.0)
+                    btn = self._first_visible_any(
+                        page,
+                        [
+                            'button[type="submit"]',
+                            'button:has-text("Verify")',
+                            'button:has-text("Continue")',
+                        ],
+                    )
+                    if btn is not None:
+                        self._human_click(page, btn)
+                    time.sleep(1.2)
+                    if self._is_github_account_suspended(page):
+                        return "suspended"
+                    return "submitted_otp"
+        return ""
 
     def open(self, task, password, *, mailbox=False):
         if mailbox:
@@ -2630,6 +2839,8 @@ class WorkBuddyBrowser:
         if self.challenge_page(task):
             return "工作窗口出现人机验证或访问暂时受限，请完成验证后继续。"
         if task["step"] == "region":
+            if urlsplit(page.url).path.rstrip("/") == "/login/register/user/complete":
+                return "已打开 WorkBuddy 地区确认页，请核对非国区地区后继续。"
             profile = self._first_visible(
                 page.get_by_text(re.compile(r"^(完善信息|Complete (your )?(profile|information))$", re.I))
             )
@@ -2639,7 +2850,12 @@ class WorkBuddyBrowser:
                 return "已打开完善信息页面，请核对非国区地区后保存。"
             return "请检查右上角的完善信息入口，并记录实际地区确认结果。"
 
-        gh_re = re.compile(r"^(Continue with GitHub|Sign in with GitHub|GitHub|使用 GitHub 登录)$", re.I)
+        gh_re = re.compile(
+            r"^(Continue with GitHub|Sign in with GitHub|Sign up with GitHub|GitHub|使用 GitHub 登录|使用 GitHub 注册)$",
+            re.I,
+        )
+        if self._trigger_workbuddy_login_iframe(page):
+            return "已从 WorkBuddy 登录页勾选协议并触发 GitHub 授权登录，请核对用户名。"
         provider = self._first_visible(page.get_by_text(gh_re))
         if provider is not None:
             self._human_click(page, provider)
@@ -2655,13 +2871,31 @@ class WorkBuddyBrowser:
             ):
                 if loc_cand is not None:
                     entry_candidates.append(loc_cand)
+            if not entry_candidates:
+                fallback_entry = self._first_visible(
+                    page.locator('a.wb2-hero__online[href*="/app"], a[href="/app"], button.btn-login')
+                )
+                if fallback_entry is not None:
+                    entry_candidates.append(fallback_entry)
             if entry_candidates:
                 chosen_entry = secrets.choice(entry_candidates)
                 self._human_click(page, chosen_entry)
                 _sleep_action_delay(1.0, 2.0)
-                provider_after = self._first_visible(page.get_by_text(gh_re))
-                if provider_after is not None:
-                    self._human_click(page, provider_after)
+                triggered = self._trigger_workbuddy_login_iframe(page)
+                if not triggered:
+                    provider_after = self._first_visible(page.get_by_text(gh_re))
+                    if provider_after is not None:
+                        self._human_click(page, provider_after)
+                        triggered = True
+                if not triggered and urlsplit(page.url).netloc == "www.workbuddy.ai":
+                    # The entry click may still be navigating to /login when
+                    # this runs; keep polling so the same-origin login-iframe
+                    # DOM has time to finish loading a#social-github.
+                    poll_deadline = time.time() + 2.5
+                    while time.time() < poll_deadline:
+                        time.sleep(0.5)
+                        if self._trigger_workbuddy_login_iframe(page):
+                            break
         return "已从 WorkBuddy 国际版首页触发登录/注册入口，请使用 GitHub 完成授权并核对用户名。"
 
     def submit_github_signup(self, task: dict, password: str) -> dict:
@@ -2684,6 +2918,12 @@ class WorkBuddyBrowser:
             }
 
         state = self._github_page_state(page)
+        if state == "suspended" or self._is_github_account_suspended(page):
+            return {
+                "status": "account_suspended",
+                "username": username,
+                "message": "检测到该 GitHub 账号已被官方封禁 (Account suspended)，请点击「跳过此人」改用下一个邮箱。",
+            }
         if state == "otp":
             return {
                 "status": "next_step",
@@ -2715,6 +2955,12 @@ class WorkBuddyBrowser:
                     "message": "当前节点 IP 被 GitHub 限制访问（访问暂时受限），正在自动拉黑该节点并切换新节点重开…",
                 }
             state = self._github_page_state(page)
+            if state == "suspended" or self._is_github_account_suspended(page):
+                return {
+                    "status": "account_suspended",
+                    "username": username,
+                    "message": "检测到该 GitHub 账号已被官方封禁 (Account suspended)，请点击「跳过此人」改用下一个邮箱。",
+                }
             if state == "otp":
                 return {
                     "status": "next_step",
@@ -2841,6 +3087,29 @@ class WorkBuddyBrowser:
                     "status": "challenged",
                     "username": username,
                     "message": "工作窗口出现人机验证，请在浏览器点击完成验证后点击「继续自动注册」。",
+                }
+
+            # An email that GitHub already knows is rejected at /signup. Log in
+            # with it instead of retrying the signup form.
+            if self._email_already_registered_on_github(page):
+                page.goto(
+                    GITHUB_URL + "/login",
+                    wait_until="domcontentloaded",
+                    timeout=15000,
+                )
+                _sleep_action_delay(1.0, 2.0)
+                act = self._handle_github_login_or_verify(page, task, password)
+                if act == "suspended" or self._is_github_account_suspended(page):
+                    return {
+                        "status": "account_suspended",
+                        "username": actual_username,
+                        "message": "检测到该邮箱对应的 GitHub 账号已被官方封禁 (Account suspended)，请点击「跳过此人」改用下一个邮箱。",
+                    }
+                return {
+                    "status": "next_step",
+                    "next": "workbuddy",
+                    "username": actual_username,
+                    "message": "检测到该邮箱已注册过 GitHub，已自动登录并进入 WorkBuddy 授权！",
                 }
 
             # Blur #login with a native CDP Tab key so validation/blur events are
@@ -3034,7 +3303,7 @@ class WorkBuddyBrowser:
             "message": "已填写并点击 Create account，请在浏览器窗口确认是否需要补充验证后点击继续。",
         }
 
-    def submit_github_otp(self, task: dict, code: str) -> dict:
+    def submit_github_otp(self, task: dict, code: str, password: str = "") -> dict:
         """Submit the GitHub email verification code without touching challenges."""
         filled = self.fill_github_code(task, code)
         _sleep_action_delay(1.2, 2.2)
@@ -3078,7 +3347,38 @@ class WorkBuddyBrowser:
                 pass
 
         deadline = time.time() + 10.0
+        login_attempted = False
         while time.time() < deadline:
+            if page is not None and self._is_github_account_suspended(page):
+                return {
+                    "status": "account_suspended",
+                    "filled": filled,
+                    "message": "检测到该 GitHub 账号已被官方封禁 (Account suspended)，无法继续授权 WorkBuddy，请跳过此人。",
+                }
+            if page is not None and urlsplit(page.url).path.rstrip("/") in ("/login", "/session"):
+                # GitHub can bounce /account_verifications -> /login?return_to=%2Fdashboard
+                # when the account already exists, so sign in instead of waiting.
+                if password and not login_attempted:
+                    login_attempted = True
+                    act = self._handle_github_login_or_verify(page, task, password)
+                    if act == "suspended" or self._is_github_account_suspended(page):
+                        return {
+                            "status": "account_suspended",
+                            "filled": filled,
+                            "message": "检测到该 GitHub 账号已被官方封禁 (Account suspended)，无法继续授权 WorkBuddy，请跳过此人。",
+                        }
+                elif not password:
+                    try:
+                        has_login_meta = bool(
+                            page.evaluate(
+                                "() => !!(document.querySelector('meta[name=\"user-login\"]')?.getAttribute('content') || '').trim()"
+                            )
+                        )
+                    except Exception:
+                        has_login_meta = False
+                    if not has_login_meta:
+                        time.sleep(0.8)
+                        continue
             if self.challenge_page(task):
                 return {
                     "status": "challenged",
@@ -3102,9 +3402,18 @@ class WorkBuddyBrowser:
                     pass
                 try:
                     verified = page.evaluate("""() => {
+                        const bodyText = document.body?.innerText || '';
+                        if (/Account suspended|Access to your account has been suspended/i.test(bodyText)) return false;
+                        const path = (location.pathname || '').replace(/\\/+$/, '') || '/';
                         const meta = document.querySelector('meta[name="user-login"]');
-                        if ((meta?.getAttribute('content') || '').trim()) return true;
-                        const path = location.pathname || '';
+                        if ((meta?.getAttribute('content') || '').trim() && path !== '/signup' && path !== '/login' && path !== '/session') {
+                            return true;
+                        }
+                        if (path === '/signup' || path === '/login' || path === '/session' ||
+                            path.startsWith('/account_verifications') || path.startsWith('/sessions/') ||
+                            path.startsWith('/account_suspended')) {
+                            return false;
+                        }
                         const otpVisible = Array.from(document.querySelectorAll(
                             'input[name="launch_code[]"], input#otp, input[name="otp"]'
                         )).some(el => !!el.getClientRects().length);
@@ -3112,12 +3421,13 @@ class WorkBuddyBrowser:
                             '.flash-error, [role="alert"]'
                         )).filter(node => !!node.getClientRects().length);
                         const hasError = errors.some(node =>
-                            /incorrect|invalid|expired/i.test(node.innerText || ''));
-                        return path !== '/signup' && !otpVisible && !hasError;
+                            /incorrect|invalid|expired|suspended/i.test(node.innerText || ''));
+                        return !otpVisible && !hasError;
                     }""")
                 except Exception:
                     verified = False
                 if verified:
+                    _sleep_action_delay(1.0, 2.0)
                     return {
                         "status": "next_step",
                         "next": "workbuddy",
@@ -3153,8 +3463,11 @@ class WorkBuddyBrowser:
                 pass
             try:
                 in_app = p.evaluate(
-                    "() => location.pathname.replace(/\\/+$/, '') === '/app' "
-                    "&& !document.querySelector('.cloud-welcome__login-btn')"
+                    "() => {"
+                    "  const p = location.pathname.replace(/\\/+$/, '');"
+                    "  if (p === '/login/register/user/complete' || p === '/login/started') return true;"
+                    "  return p === '/app' && !document.querySelector('.cloud-welcome__login-btn');"
+                    "}"
                 )
                 if in_app:
                     return True
@@ -3162,7 +3475,7 @@ class WorkBuddyBrowser:
                 pass
         return False
 
-    def complete_workbuddy_github_login(self, task: dict) -> dict:
+    def complete_workbuddy_github_login(self, task: dict, password: str = "") -> dict:
         """Drive WorkBuddy homepage Login -> Continue with GitHub -> Authorize."""
         page = self._page(task["id"], "workbuddy", WORKBUDDY_URL + "/", task=task)
         tid = int(task["id"])
@@ -3170,9 +3483,10 @@ class WorkBuddyBrowser:
         if self._is_workbuddy_logged_in(tid, ctx):
             return {"status": "next_step", "next": "region", "message": "已登录 WorkBuddy 国际版！"}
 
-        self.open({**task, "step": "workbuddy"}, "")
+        self.open({**task, "step": "workbuddy"}, password)
 
-        deadline = time.time() + 18.0
+        timeout_s = 18.0 if os.environ.get("PYTEST_CURRENT_TEST") else 38.0
+        deadline = time.time() + timeout_s
         while time.time() < deadline:
             pages = ctx.pages
             for p in pages:
@@ -3192,40 +3506,85 @@ class WorkBuddyBrowser:
                 if p.is_closed():
                     continue
                 loc = urlsplit(p.url)
-                if loc.netloc == "github.com" and loc.path.startswith("/login/oauth/authorize"):
-                    auth_btn = self._first_visible_any(
-                        p,
-                        [
-                            "button#js-oauth-authorize-btn",
-                            'button[name="authorize"][value="1"]',
-                            'form[action*="/login/oauth/authorize"] button[type="submit"]',
-                        ],
-                    )
-                    if auth_btn is None:
-                        auth_btn = self._first_visible(
-                            p.get_by_role("button", name=re.compile(r"^(Authorize|授权)", re.I))
+                if loc.netloc == "github.com":
+                    if self._is_github_account_suspended(p):
+                        return {
+                            "status": "account_suspended",
+                            "message": "检测到该 GitHub 账号已被官方封禁 (Account suspended)，无法用于登录 WorkBuddy。请点击「跳过此人」改用下一个邮箱。",
+                        }
+                    if loc.path.startswith("/login/oauth/authorize"):
+                        auth_btn = self._first_visible_any(
+                            p,
+                            [
+                                "button#js-oauth-authorize-btn",
+                                'button[name="authorize"][value="1"]',
+                                'form[action*="/login/oauth/authorize"] button[type="submit"]',
+                            ],
                         )
-                    if auth_btn is not None:
-                        try:
-                            enabled = auth_btn.evaluate("el => !el.disabled")
-                        except Exception:
+                        if auth_btn is None:
+                            auth_btn = self._first_visible(
+                                p.get_by_role("button", name=re.compile(r"^(Authorize|授权)", re.I))
+                            )
+                        if auth_btn is not None:
                             enabled = False
-                        if enabled:
-                            try:
-                                p.bring_to_front()
-                            except Exception:
-                                pass
-                            _sleep_action_delay(1.0, 2.0)
-                            self._human_click(p, auth_btn)
-                            try:
-                                p.wait_for_url("**/www.workbuddy.ai/**", timeout=1.5)
-                            except Exception:
-                                time.sleep(1.5)
+                            enabled_deadline = time.time() + 2.0
+                            while time.time() < enabled_deadline:
+                                try:
+                                    enabled = bool(
+                                        auth_btn.evaluate(
+                                            "el => !el.disabled && el.getAttribute('aria-disabled') !== 'true'"
+                                        )
+                                    )
+                                except Exception:
+                                    enabled = False
+                                if enabled:
+                                    break
+                                time.sleep(0.2)
+                            if enabled:
+                                try:
+                                    p.bring_to_front()
+                                except Exception:
+                                    pass
+                                _sleep_action_delay(1.0, 2.0)
+                                self._human_click(p, auth_btn)
+                                try:
+                                    p.wait_for_url("**/www.workbuddy.ai/**", timeout=1.5)
+                                except Exception:
+                                    time.sleep(1.5)
+                    elif (
+                        loc.path.rstrip("/") in ("/login", "/session")
+                        or loc.path.startswith("/sessions/verified-device")
+                        or loc.path.startswith("/account_verifications")
+                    ):
+                        act = self._handle_github_login_or_verify(p, task, password)
+                        if act == "suspended" or self._is_github_account_suspended(p):
+                            return {
+                                "status": "account_suspended",
+                                "message": "检测到该 GitHub 账号已被官方封禁 (Account suspended)，无法用于登录 WorkBuddy。请点击「跳过此人」改用下一个邮箱。",
+                            }
                 elif loc.netloc == "www.workbuddy.ai":
+                    if self._trigger_workbuddy_login_iframe(p):
+                        continue
+                    if loc.path.rstrip("/") in ("/login/select", "/select"):
+                        sel_btn = self._first_visible(
+                            p.locator("button.select-account-button:not([disabled])")
+                        )
+                        if sel_btn is not None:
+                            self._human_click(p, sel_btn)
+                            continue
+                    if loc.path.startswith(
+                        "/auth/realms/copilot/login-actions/first-broker-login"
+                    ):
+                        sub_btn = self._first_visible_any(
+                            p, ['input[type="submit"]', 'button[type="submit"]']
+                        )
+                        if sub_btn is not None:
+                            self._human_click(p, sub_btn)
+                            continue
                     gh_btn = self._first_visible(
                         p.get_by_text(
                             re.compile(
-                                r"^(Continue with GitHub|Sign in with GitHub|GitHub|使用 GitHub 登录)$",
+                                r"^(Continue with GitHub|Sign in with GitHub|Sign up with GitHub|GitHub|使用 GitHub 登录|使用 GitHub 注册)$",
                                 re.I,
                             )
                         )
@@ -3296,6 +3655,95 @@ class WorkBuddyBrowser:
         if self.challenge_page(task):
             return {"status": "challenged", "message": "窗口出现人机验证，请在窗口完成后点击继续。"}
 
+        # New WorkBuddy flow: after GitHub OAuth the user lands on
+        # /login/register/user/complete with a pre-selected non-CN region.
+        register_page = None
+        try:
+            ctx = self._context_for(int(task["id"]), task=task)
+            candidates = [page] + [
+                p
+                for p in ctx.pages
+                if p is not page
+                and urlsplit(p.url).netloc == "www.workbuddy.ai"
+                and not p.is_closed()
+            ]
+        except Exception:
+            candidates = [page]
+        for cand in candidates:
+            if urlsplit(cand.url).path.rstrip("/") == "/login/register/user/complete":
+                register_page = cand
+                break
+            try:
+                if cand.locator(
+                    ".select-account-title, button.select-account-button"
+                ).count():
+                    register_page = cand
+                    break
+            except Exception:
+                continue
+        if register_page is not None:
+            page = register_page
+            try:
+                page.bring_to_front()
+            except Exception:
+                pass
+            btn = None
+            wait_deadline = time.time() + 4.0
+            while time.time() < wait_deadline:
+                btn = self._first_visible(page.locator("button.select-account-button"))
+                if btn is not None:
+                    break
+                time.sleep(0.2)
+            if btn is not None:
+                try:
+                    disabled = bool(
+                        btn.evaluate(
+                            "el => !!el.disabled || el.getAttribute('aria-disabled') === 'true'"
+                        )
+                    )
+                except Exception:
+                    disabled = False
+                if disabled:
+                    try:
+                        page.evaluate("""() => {
+                            const isCn = (text) => /中国|中国大陆|China|CN\\b/i.test(text || '');
+                            for (const span of document.querySelectorAll('div.mt-2 span.cursor-pointer')) {
+                                if (!span.getClientRects().length) continue;
+                                const text = (span.innerText || span.textContent || '').trim();
+                                if (text && !isCn(text)) { span.click(); return true; }
+                            }
+                            const select = document.querySelector('.t-select select, select');
+                            if (select instanceof HTMLSelectElement) {
+                                const option = Array.from(select.options).find(
+                                    opt => opt.value && !isCn(opt.value) && !isCn(opt.textContent)
+                                );
+                                if (option) {
+                                    select.value = option.value;
+                                    select.dispatchEvent(new Event('change', {bubbles: true}));
+                                    return true;
+                                }
+                            }
+                            return false;
+                        }""")
+                    except Exception:
+                        pass
+                    _sleep_action_delay(1.0, 2.0)
+                self._human_click(page, btn)
+                nav_deadline = time.time() + 3.0
+                while time.time() < nav_deadline:
+                    if (
+                        urlsplit(page.url).path.rstrip("/")
+                        != "/login/register/user/complete"
+                    ):
+                        break
+                    time.sleep(0.2)
+            return {
+                "status": "next_step",
+                "next": "greeting",
+                "region": "confirmed",
+                "message": "已自动完成 WorkBuddy 非国区地区确认！",
+            }
+
         profile = self._first_visible(
             page.get_by_text(
                 re.compile(
@@ -3344,7 +3792,7 @@ class WorkBuddyBrowser:
         confirm_btn = self._first_visible(
             page.get_by_role(
                 "button",
-                name=re.compile(r"^(确认|保存|提交|确定|Confirm|Save|Submit|Continue)$", re.I),
+                name=re.compile(r"^(确认|保存|提交|确定|继续|Confirm|Save|Submit|Continue)$", re.I),
             )
         )
         if confirm_btn is not None:
@@ -3637,16 +4085,23 @@ class WorkBuddyBrowser:
         _sleep_action_delay(1.0, 2.0)
 
         if not self.challenge_page(task):
-            try:
-                btn = page.get_by_role(
-                    "button",
-                    name=re.compile(r"^(授权|确认授权|确认登录|允许|同意|确认|Authorize|Confirm|Allow|Approve|Continue)$", re.I),
-                ).first
-                btn.wait_for(state="visible", timeout=2000)
-                if urlsplit(page.url).netloc.endswith("workbuddy.ai"):
-                    self._human_click(page, btn)
-            except Exception:
-                pass
+            if not self._trigger_workbuddy_login_iframe(page):
+                sel_btn = self._first_visible(
+                    page.locator("button.select-account-button:not([disabled])")
+                )
+                if sel_btn is not None:
+                    self._human_click(page, sel_btn)
+                else:
+                    try:
+                        btn = page.get_by_role(
+                            "button",
+                            name=re.compile(r"^(授权|确认授权|确认登录|允许|同意|确认|继续|Authorize|Confirm|Allow|Approve|Continue)$", re.I),
+                        ).first
+                        btn.wait_for(state="visible", timeout=2000)
+                        if urlsplit(page.url).netloc.endswith("workbuddy.ai"):
+                            self._human_click(page, btn)
+                    except Exception:
+                        pass
 
         for _ in range(4):
             time.sleep(1.0)

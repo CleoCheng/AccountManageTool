@@ -699,7 +699,7 @@ class WorkBuddyQueue:
                 last = conn.execute("SELECT * FROM tasks WHERE email = ? ORDER BY id DESC LIMIT 1", (email,)).fetchone()
                 if (last and last["status"] == "done") or (account.get("custom_fields") or {}).get("wb_reg_status") == "已完成":
                     raise ValueError(f"{email} 已完成开户，请取消勾选。")
-                validated.append({"account_id": account_id, "email": email, "last": last})
+                validated.append({"account_id": account_id, "email": email, "last": last, "account": account})
 
             idx = 0
             round_no = 1
@@ -717,6 +717,8 @@ class WorkBuddyQueue:
                     account_id = entry["account_id"]
                     email = entry["email"]
                     last = entry["last"]
+                    acc_obj = entry.get("account") or {}
+                    cf = acc_obj.get("custom_fields") if isinstance(acc_obj.get("custom_fields"), dict) else {}
                     fresh_fp = generate_fingerprint_config(
                         account_id,
                         email,
@@ -726,8 +728,20 @@ class WorkBuddyQueue:
                         salt=uuid4().hex,
                     )
                     now = int(time.time())
-                    task_username = last["username"] if last else _username(email)
-                    task_step = last["step"] if last else STEPS[0]
+                    cf_user = str(cf.get("github_username") or "").strip()
+                    if last and last["username"]:
+                        task_username = last["username"]
+                    elif cf_user and len(cf_user) <= 39 and re.fullmatch(r"[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)*", cf_user):
+                        task_username = cf_user
+                    else:
+                        task_username = _username(email)
+
+                    last_step = last["step"] if (last and last["step"] in STEPS) else STEPS[0]
+                    cf_step = str(cf.get("wb_reg_step") or "").strip()
+                    if cf_step in STEPS and STEPS.index(cf_step) > STEPS.index(last_step):
+                        task_step = cf_step
+                    else:
+                        task_step = last_step
                     conn.execute("""INSERT INTO tasks
                         (batch, account_id, email, username, greeting, greeting_attempted, step, region,
                          proxy_url, proxy_node, fp_json, oauth_state, credential_json,
@@ -1142,6 +1156,31 @@ class WorkBuddyQueue:
                     }
                 return {"still_paused": True}
 
+            if action == "skip_to_workbuddy":
+                if task["step"] not in ("github", "email"):
+                    return {"step": task["step"], "message": "当前已在 WorkBuddy 授权或后续阶段。"}
+                raw_user = value.strip() if isinstance(value, str) and value.strip() else str(task["username"] or "").strip()
+                if len(raw_user) <= 39 and re.fullmatch(r"[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)*", raw_user):
+                    username = raw_user
+                else:
+                    username = task["username"]
+                conn.execute(
+                    "UPDATE tasks SET step='workbuddy', status='ready', username=?, revision=revision+1, updated_at=? WHERE id=?",
+                    (username, now, task_id),
+                )
+                self._sync_account_step(
+                    task["account_id"],
+                    "workbuddy",
+                    username=username,
+                    proxy_url=task["proxy_url"],
+                    proxy_node=task["proxy_node"],
+                )
+                return {
+                    "step": "workbuddy",
+                    "auto_advanced": True,
+                    "message": "已跳过 GitHub 注册，直接进入 WorkBuddy 登录授权（将使用该邮箱已注册的 GitHub 账号自动登录）…",
+                }
+
             if paused:
                 if action == "show":
                     self.browser.show_paused_window(dict(task))
@@ -1252,6 +1291,19 @@ class WorkBuddyQueue:
                     else:
                         username = task["username"]
 
+                    if res.get("status") == "account_suspended":
+                        conn.execute(
+                            "UPDATE tasks SET status='paused', username=?, revision=revision+1, updated_at=? WHERE id=?",
+                            (username, now, task_id),
+                        )
+                        self._sync_account_step(task["account_id"], step, username=username, proxy_url=task["proxy_url"], proxy_node=task["proxy_node"])
+                        return {
+                            "auto_advanced": False,
+                            "paused_for_human": True,
+                            "account_suspended": True,
+                            "message": str(res.get("message") or "检测到该 GitHub 账号已被官方封禁 (Account suspended)，请点击「跳过此人」改用下一个邮箱。"),
+                        }
+
                     if res.get("status") in ("challenged", "ip_restricted") or self._pause_for_challenge(conn, task):
                         conn.execute(
                             "UPDATE tasks SET status='paused', username=?, revision=revision+1, updated_at=? WHERE id=?",
@@ -1301,7 +1353,10 @@ class WorkBuddyQueue:
                         }
 
                     if hasattr(self.browser, "submit_github_otp"):
-                        res = self.browser.submit_github_otp(dict(task), code)
+                        try:
+                            res = self.browser.submit_github_otp(dict(task), code, account["password"])
+                        except TypeError:
+                            res = self.browser.submit_github_otp(dict(task), code)
                         if not isinstance(res, dict):
                             fill_res = self.browser.fill_github_code(dict(task), code)
                             filled = bool(fill_res is not False and fill_res is not None and fill_res != "")
@@ -1319,6 +1374,20 @@ class WorkBuddyQueue:
                             "next": "workbuddy",
                             "filled": filled,
                             "message": "已自动读取并填入 GitHub 验证码。",
+                        }
+
+                    if res.get("status") == "account_suspended":
+                        conn.execute(
+                            "UPDATE tasks SET status='paused', revision=revision+1, updated_at=? WHERE id=?",
+                            (now, task_id),
+                        )
+                        return {
+                            "auto_advanced": False,
+                            "paused_for_human": True,
+                            "account_suspended": True,
+                            "code": code,
+                            "filled": bool(res.get("filled")),
+                            "message": str(res.get("message") or "检测到该 GitHub 账号已被官方封禁 (Account suspended)，请点击「跳过此人」改用下一个邮箱。"),
                         }
 
                     if res.get("status") == "challenged" or self._pause_for_challenge(conn, task):
@@ -1358,13 +1427,28 @@ class WorkBuddyQueue:
 
                 if step == "workbuddy":
                     if hasattr(self.browser, "complete_workbuddy_github_login"):
-                        res = self.browser.complete_workbuddy_github_login(dict(task))
+                        try:
+                            res = self.browser.complete_workbuddy_github_login(dict(task), account["password"])
+                        except TypeError:
+                            res = self.browser.complete_workbuddy_github_login(dict(task))
                         if not isinstance(res, dict):
                             msg = self.browser.open(dict(task), account["password"])
                             res = {"status": "next_step", "next": "region", "message": msg}
                     else:
                         msg = self.browser.open(dict(task), account["password"])
                         res = {"status": "next_step", "next": "region", "message": msg}
+
+                    if res.get("status") == "account_suspended":
+                        conn.execute(
+                            "UPDATE tasks SET status='paused', revision=revision+1, updated_at=? WHERE id=?",
+                            (now, task_id),
+                        )
+                        return {
+                            "auto_advanced": False,
+                            "paused_for_human": True,
+                            "account_suspended": True,
+                            "message": str(res.get("message") or "检测到该 GitHub 账号已被官方封禁 (Account suspended)，无法用于授权 WorkBuddy。请点击「跳过此人」改用下一个邮箱。"),
+                        }
 
                     if res.get("status") == "challenged" or self._pause_for_challenge(conn, task):
                         conn.execute(
