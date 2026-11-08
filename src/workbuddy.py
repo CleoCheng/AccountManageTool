@@ -1159,6 +1159,52 @@ class WorkBuddyQueue:
             "message": f"检测到节点「{bad_node or '旧节点'}」触发 GitHub IP 访问暂时受限，已自动拉黑该节点、清理浏览器缓存并切换至新节点「{chosen_node}」重开本轮窗口…",
         }
 
+    def _capture_and_persist_credential(self, conn, task, account, now: float) -> dict | None:
+        saved_cred = None
+        if task["credential_json"]:
+            try:
+                parsed = json.loads(task["credential_json"])
+                if isinstance(parsed, dict) and parsed.get("accessToken"):
+                    saved_cred = parsed
+                    if parsed.get("refreshToken"):
+                        return saved_cred
+            except Exception:
+                saved_cred = None
+
+        captured = None
+        pwd = ""
+        if account:
+            try:
+                pwd = account["password"]
+            except Exception:
+                pwd = ""
+        try:
+            try:
+                captured = self.browser.capture_credential(
+                    dict(task),
+                    oauth_state=task["oauth_state"],
+                    password=pwd,
+                )
+            except TypeError:
+                captured = self.browser.capture_credential(
+                    dict(task),
+                    oauth_state=task["oauth_state"],
+                )
+        except Exception:
+            captured = None
+
+        if isinstance(captured, dict) and captured.get("accessToken"):
+            cred_json = json.dumps(captured, ensure_ascii=False)
+            conn.execute(
+                "UPDATE tasks SET credential_json=?, updated_at=? WHERE id=?",
+                (cred_json, now, task["id"]),
+            )
+            if hasattr(self.accounts, "save_workbuddy_credential"):
+                self.accounts.save_workbuddy_credential(task["account_id"], captured)
+            return captured
+
+        return saved_cred
+
     def _action(self, task_id, revision, action, value):
         with closing(self._connect()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -1418,9 +1464,22 @@ class WorkBuddyQueue:
                 return {"code": code, "filled": filled}
             if action == "oauth" and task["step"] in ("workbuddy", "region", "greeting"):
                 task_dict = dict(task)
+                pwd = ""
+                if account:
+                    try:
+                        pwd = account["password"]
+                    except Exception:
+                        pwd = ""
                 if task["oauth_state"]:
                     try:
-                        polled_cred = self.browser.capture_credential(task_dict, oauth_state=task["oauth_state"])
+                        try:
+                            polled_cred = self.browser.capture_credential(
+                                task_dict, oauth_state=task["oauth_state"], password=pwd
+                            )
+                        except TypeError:
+                            polled_cred = self.browser.capture_credential(
+                                task_dict, oauth_state=task["oauth_state"]
+                            )
                     except Exception:
                         polled_cred = None
                     if isinstance(polled_cred, dict) and polled_cred.get("accessToken"):
@@ -1433,7 +1492,10 @@ class WorkBuddyQueue:
                             self.accounts.save_workbuddy_credential(task["account_id"], polled_cred)
                         return {"credential_saved": True, "message": "已成功捕获并保存 WorkBuddy2API 登录凭据！"}
 
-                oauth_res = self.browser.start_cli_oauth(task_dict)
+                try:
+                    oauth_res = self.browser.start_cli_oauth(task_dict, password=pwd)
+                except TypeError:
+                    oauth_res = self.browser.start_cli_oauth(task_dict)
                 if not isinstance(oauth_res, dict):
                     raise ValueError("无法启动 WorkBuddy CLI 凭据授权，请检查窗口状态。")
                 new_state = str(oauth_res.get("state") or "")
@@ -1695,6 +1757,8 @@ class WorkBuddyQueue:
 
                     if res.get("status") == "next_step":
                         region_val = res.get("region") if res.get("region") in ("confirmed", "not_required") else "not_required"
+                        if getattr(self.browser, "_is_real_browser", False) is True:
+                            self._capture_and_persist_credential(conn, task, account, now)
                         conn.execute(
                             "UPDATE tasks SET step='greeting', region=?, status='ready', revision=revision+1, updated_at=? WHERE id=?",
                             (region_val, now, task_id),
@@ -1754,22 +1818,7 @@ class WorkBuddyQueue:
                             "message": str(res.get("message") or "请在在线 WorkBuddy 窗口核对招呼回复后点击完成。"),
                         }
 
-                    saved_cred = None
-                    if task["credential_json"]:
-                        try:
-                            parsed = json.loads(task["credential_json"])
-                            if isinstance(parsed, dict) and parsed.get("accessToken"):
-                                saved_cred = parsed
-                        except Exception:
-                            saved_cred = None
-
-                    if not (saved_cred and saved_cred.get("refreshToken")):
-                        try:
-                            captured = self.browser.capture_credential(dict(task), oauth_state=task["oauth_state"])
-                            if isinstance(captured, dict) and captured.get("accessToken"):
-                                saved_cred = captured
-                        except Exception:
-                            pass
+                    saved_cred = self._capture_and_persist_credential(conn, task, account, now)
 
                     other_active = [t for t in round_active if t["id"] != task_id]
                     round_completed = False
@@ -1849,13 +1898,7 @@ class WorkBuddyQueue:
             round_transitioned = False
             next_node_label = ""
             if finished:
-                if not (saved_cred and saved_cred.get("refreshToken")):
-                    try:
-                        captured = self.browser.capture_credential(dict(task), oauth_state=task["oauth_state"])
-                        if isinstance(captured, dict) and captured.get("accessToken"):
-                            saved_cred = captured
-                    except Exception:
-                        pass
+                saved_cred = self._capture_and_persist_credential(conn, task, account, now)
                 if not other_active:
                     round_completed = True
                     round_transitioned, next_node_label = self._finish_round_browsers(

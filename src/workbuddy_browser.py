@@ -2848,6 +2848,93 @@ class WorkBuddyBrowser:
                     return "submitted_otp"
         return ""
 
+    def _trigger_workbuddy_home_entry(self, page) -> bool:
+        """Enter WorkBuddy's login/registration flow from the marketing homepage.
+
+        The homepage React SPA renders ``button.btn-login`` only after
+        ``GET /console/accounts`` resolves, so a page inspected 1-2s after
+        ``domcontentloaded`` can still have no entry button at all. Callers
+        therefore retry this helper instead of relying on a one-shot click.
+        """
+        try:
+            loc = urlsplit(page.url)
+        except Exception:
+            return False
+        if loc.netloc != "www.workbuddy.ai" or loc.path.rstrip("/") not in ("", "/"):
+            return False
+        if not os.environ.get("PYTEST_CURRENT_TEST"):
+            # Do not double-click while a navigation to /login is starting.
+            last_trigger = float(getattr(page, "_last_wb_home_trigger_at", 0.0) or 0.0)
+            if time.time() - last_trigger < 3.5:
+                return True
+
+        gh_re = re.compile(
+            r"^(Continue with GitHub|Sign in with GitHub|Sign up with GitHub|GitHub|使用 GitHub 登录|使用 GitHub 注册)$",
+            re.I,
+        )
+        provider = self._first_visible(page.get_by_text(gh_re))
+        if provider is not None:
+            self._human_click(page, provider)
+            return True
+
+        login_re = re.compile(r"^(登录|Log\s?in|Sign\s?in)$", re.I)
+        signup_re = re.compile(
+            r"^(注册|Sign\s*up|Get\s+Started|Try\s+Now|免费使用|立即体验|开始使用)$", re.I
+        )
+        entry_candidates = []
+        for cand in (
+            self._first_visible(page.locator("button.btn-login")),
+            self._first_visible(page.get_by_role("button", name=login_re)),
+            self._first_visible(page.get_by_role("link", name=login_re)),
+            self._first_visible(page.get_by_role("button", name=signup_re)),
+            self._first_visible(page.get_by_role("link", name=signup_re)),
+        ):
+            if cand is not None:
+                entry_candidates.append(cand)
+        if not entry_candidates:
+            fallback_entry = self._first_visible(
+                page.locator(
+                    'a.wb2-hero__online[href*="/login"], a.wb2-hero__online[href*="/app"], '
+                    'a[href*="/login"], a[href="/app"]'
+                )
+            )
+            if fallback_entry is not None:
+                entry_candidates.append(fallback_entry)
+        if not entry_candidates:
+            return False
+
+        try:
+            page._last_wb_home_trigger_at = time.time()
+        except Exception:
+            pass
+        chosen_entry = secrets.choice(entry_candidates)
+        self._human_click(page, chosen_entry)
+        _sleep_action_delay(1.0, 2.0)
+        if self._trigger_workbuddy_login_iframe(page):
+            return True
+        provider_after = self._first_visible(page.get_by_text(gh_re))
+        if provider_after is not None:
+            self._human_click(page, provider_after)
+            return True
+        # The entry click may still be navigating to /login when this runs;
+        # keep polling so the same-origin login-iframe DOM has time to finish
+        # loading a#social-github.
+        poll_deadline = time.time() + 2.5
+        while time.time() < poll_deadline:
+            time.sleep(0.5)
+            try:
+                if urlsplit(page.url).netloc != "www.workbuddy.ai":
+                    break
+            except Exception:
+                break
+            if self._trigger_workbuddy_login_iframe(page):
+                return True
+            provider_after = self._first_visible(page.get_by_text(gh_re))
+            if provider_after is not None:
+                self._human_click(page, provider_after)
+                return True
+        return True
+
     def open(self, task, password, *, mailbox=False):
         if mailbox:
             page = self._page(task["id"], "mail", MAIL_URL, task=task)
@@ -2922,7 +3009,12 @@ class WorkBuddyBrowser:
             if urlsplit(page.url).path.rstrip("/") == "/login/register/user/complete":
                 return "已打开 WorkBuddy 地区确认页，请核对非国区地区后继续。"
             profile = self._first_visible(
-                page.get_by_text(re.compile(r"^(完善信息|Complete (your )?(profile|information))$", re.I))
+                page.get_by_text(
+                    re.compile(
+                        r"^(完善信息|补充信息|完善地区|Complete\s*Region|Complete (your )?(profile|information))$",
+                        re.I,
+                    )
+                )
             )
             if profile is not None:
                 self._human_click(page, profile)
@@ -2940,42 +3032,7 @@ class WorkBuddyBrowser:
         if provider is not None:
             self._human_click(page, provider)
         else:
-            login_re = re.compile(r"^(登录|Log\s?in|Sign\s?in)$", re.I)
-            signup_re = re.compile(r"^(注册|Sign\s?up|Get\s+Started|Try\s+Now|免费使用|立即体验|开始使用)$", re.I)
-            entry_candidates = []
-            for loc_cand in (
-                self._first_visible(page.get_by_role("button", name=login_re)),
-                self._first_visible(page.get_by_role("link", name=login_re)),
-                self._first_visible(page.get_by_role("button", name=signup_re)),
-                self._first_visible(page.get_by_role("link", name=signup_re)),
-            ):
-                if loc_cand is not None:
-                    entry_candidates.append(loc_cand)
-            if not entry_candidates:
-                fallback_entry = self._first_visible(
-                    page.locator('a.wb2-hero__online[href*="/app"], a[href="/app"], button.btn-login')
-                )
-                if fallback_entry is not None:
-                    entry_candidates.append(fallback_entry)
-            if entry_candidates:
-                chosen_entry = secrets.choice(entry_candidates)
-                self._human_click(page, chosen_entry)
-                _sleep_action_delay(1.0, 2.0)
-                triggered = self._trigger_workbuddy_login_iframe(page)
-                if not triggered:
-                    provider_after = self._first_visible(page.get_by_text(gh_re))
-                    if provider_after is not None:
-                        self._human_click(page, provider_after)
-                        triggered = True
-                if not triggered and urlsplit(page.url).netloc == "www.workbuddy.ai":
-                    # The entry click may still be navigating to /login when
-                    # this runs; keep polling so the same-origin login-iframe
-                    # DOM has time to finish loading a#social-github.
-                    poll_deadline = time.time() + 2.5
-                    while time.time() < poll_deadline:
-                        time.sleep(0.5)
-                        if self._trigger_workbuddy_login_iframe(page):
-                            break
+            self._trigger_workbuddy_home_entry(page)
         return "已从 WorkBuddy 国际版首页触发登录/注册入口，请使用 GitHub 完成授权并核对用户名。"
 
     def submit_github_signup(self, task: dict, password: str) -> dict:
@@ -3546,7 +3603,13 @@ class WorkBuddyBrowser:
                     "() => {"
                     "  const p = location.pathname.replace(/\\/+$/, '');"
                     "  if (p === '/login/register/user/complete' || p === '/login/started') return true;"
-                    "  return p === '/app' && !document.querySelector('.cloud-welcome__login-btn');"
+                    "  if (p === '/app' && !document.querySelector('.cloud-welcome__login-btn')) return true;"
+                    "  if (!p.startsWith('/login') && !p.startsWith('/auth')) {"
+                    "    if (sessionStorage.getItem('website-userId')) return true;"
+                    "    if (localStorage.getItem('CODEBUDDY_IDE_SELECTED_ACCOUNT_ID') && !document.querySelector('button.btn-login')) return true;"
+                    "    if (document.querySelector('button.btn-user, button.btn-complete-region, .user-dropdown-container, .mobile-user-info')) return true;"
+                    "  }"
+                    "  return false;"
                     "}"
                 )
                 if in_app:
@@ -3567,6 +3630,7 @@ class WorkBuddyBrowser:
 
         timeout_s = 18.0 if os.environ.get("PYTEST_CURRENT_TEST") else 38.0
         deadline = time.time() + timeout_s
+        home_entered_at = time.time()
         while time.time() < deadline:
             pages = ctx.pages
             for p in pages:
@@ -3661,10 +3725,59 @@ class WorkBuddyBrowser:
                         sel_btn = self._first_visible(
                             p.locator("button.select-account-button:not([disabled])")
                         )
+                        if sel_btn is None:
+                            # TDesign renders the account cards disabled until
+                            # one is picked; click the card first.
+                            disabled_btn = self._first_visible(
+                                p.locator("button.select-account-button")
+                            )
+                            card = self._first_visible(p.locator(".select-account-card"))
+                            card_disabled = False
+                            if disabled_btn is not None:
+                                try:
+                                    card_disabled = bool(
+                                        disabled_btn.evaluate(
+                                            "el => !!el.disabled || el.getAttribute('aria-disabled') === 'true'"
+                                        )
+                                    )
+                                except Exception:
+                                    card_disabled = False
+                            if card_disabled and card is not None:
+                                self._human_click(p, card)
+                                time.sleep(0.4)
+                                sel_btn = self._first_visible(
+                                    p.locator("button.select-account-button:not([disabled])")
+                                )
                         if sel_btn is not None:
                             _sleep_action_delay(1.0, 2.0)
                             self._human_click(p, sel_btn)
                             time.sleep(1.0 if ACTION_DELAY > 0 else 0.1)
+                            continue
+                    if loc.path.rstrip("/") in ("", "/"):
+                        if self._trigger_workbuddy_home_entry(p):
+                            continue
+                        # The homepage SPA may still be hydrating (GET
+                        # /console/accounts) or the entry button may never
+                        # render over a slow proxy; fall back to the official
+                        # website login URL after a short grace period.
+                        if (
+                            not self.extra_chromium_args
+                            and time.time() - home_entered_at > 5.0
+                        ):
+                            login_target = (
+                                f"{WORKBUDDY_URL}/login?platform=website&state=2"
+                                f"&redirect_uri={urllib.parse.quote(WORKBUDDY_URL + '/', safe='')}"
+                                f"&product=workbuddy"
+                            )
+                            try:
+                                p.goto(
+                                    login_target,
+                                    wait_until="domcontentloaded",
+                                    timeout=15000,
+                                )
+                                home_entered_at = time.time()
+                            except Exception:
+                                pass
                             continue
                     if loc.path.startswith(
                         "/auth/realms/copilot/login-actions/first-broker-login"
@@ -3689,19 +3802,12 @@ class WorkBuddyBrowser:
                         self._human_click(p, gh_btn)
             time.sleep(1.0)
 
-        if self._is_workbuddy_logged_in(tid, ctx) or (
-            urlsplit(page.url).netloc == "www.workbuddy.ai"
-            and self._first_visible(
-                page.get_by_role("button", name=re.compile(r"^(登录|Log\s?in|Sign\s?in)$", re.I))
-            )
-            is None
-        ):
-            if self._is_workbuddy_logged_in(tid, ctx):
-                return {
-                    "status": "next_step",
-                    "next": "region",
-                    "message": "已完成 GitHub 授权并登录 WorkBuddy 国际版！",
-                }
+        if self._is_workbuddy_logged_in(tid, ctx):
+            return {
+                "status": "next_step",
+                "next": "region",
+                "message": "已完成 GitHub 授权并登录 WorkBuddy 国际版！",
+            }
         return {
             "status": "waiting_human",
             "message": "已在窗口触发 WorkBuddy 的 GitHub 登录，请在窗口确认授权后点击继续。",
@@ -3715,7 +3821,18 @@ class WorkBuddyBrowser:
         _sleep_action_delay(1.0, 2.0)
         composer = page.locator(".wb-home-composer:visible")
         editor = composer.locator('[role="textbox"][contenteditable="true"][data-slate-editor="true"]:visible')
-        send = composer.locator('[data-cb-chat-input-toolbar-right] [role="button"][data-track-id="agent_session_input_status"]:visible')
+        send = composer.locator('[data-cb-chat-input-toolbar-right] [data-track-id="agent_session_input_status"]:visible')
+        # ``/app`` ships a ~20MB bundle that renders a ``.skeleton-item`` screen
+        # while it hydrates over the proxy; poll instead of failing instantly.
+        wait_composer_deadline = time.time() + (
+            0.8 if os.environ.get("PYTEST_CURRENT_TEST") else 12.0
+        )
+        while time.time() < wait_composer_deadline:
+            if page.locator(".cloud-welcome__login-btn:visible").count():
+                break
+            if editor.count() == 1 and send.count() == 1:
+                break
+            time.sleep(0.25)
         if page.locator(".cloud-welcome__login-btn:visible").count():
             raise ValueError("请先登录当前员工的 WorkBuddy，再发送招呼。")
         if editor.count() != 1 or send.count() != 1:
@@ -3777,15 +3894,71 @@ class WorkBuddyBrowser:
                     break
             except Exception:
                 continue
+        if register_page is None:
+            # Live WorkBuddy renders ``<button class="btn btn-complete-region">``
+            # on the homepage; its "Complete Region" label is split across
+            # ``span.single-letter`` nodes, so a text locator misses it.
+            try:
+                on_home = (
+                    urlsplit(page.url).netloc == "www.workbuddy.ai"
+                    and urlsplit(page.url).path.rstrip("/") in ("", "/")
+                )
+            except Exception:
+                on_home = False
+            complete_region_btn = (
+                self._first_visible(page.locator("button.btn-complete-region"))
+                if on_home
+                else None
+            )
+            if complete_region_btn is not None:
+                self._human_click(page, complete_region_btn)
+                wait_timeout = 1.5 if os.environ.get("PYTEST_CURRENT_TEST") else 4.0
+                wait_deadline = time.time() + wait_timeout
+                while time.time() < wait_deadline:
+                    try:
+                        if (
+                            urlsplit(page.url).path.rstrip("/")
+                            == "/login/register/user/complete"
+                        ):
+                            register_page = page
+                            break
+                        if page.locator(
+                            ".select-account-title, button.select-account-button"
+                        ).count():
+                            register_page = page
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(0.2)
         if register_page is not None:
             page = register_page
             try:
                 page.bring_to_front()
             except Exception:
                 pass
+            in_tests = bool(os.environ.get("PYTEST_CURRENT_TEST"))
             btn = None
-            wait_deadline = time.time() + 4.0
+            wait_deadline = time.time() + (2.5 if in_tests else 6.0)
             while time.time() < wait_deadline:
+                # The page auto-redirects away when ``areaInfoComplete`` was
+                # already ``true``: nothing left to confirm here.
+                try:
+                    if (
+                        urlsplit(page.url).path.rstrip("/")
+                        != "/login/register/user/complete"
+                        and page.locator(
+                            ".select-account-title, button.select-account-button"
+                        ).count()
+                        == 0
+                    ):
+                        return {
+                            "status": "next_step",
+                            "next": "greeting",
+                            "region": "confirmed",
+                            "message": "地区信息已完善，自动进入在线 WorkBuddy 发送招呼！",
+                        }
+                except Exception:
+                    pass
                 btn = self._first_visible(page.locator("button.select-account-button"))
                 if btn is not None:
                     break
@@ -3832,6 +4005,73 @@ class WorkBuddyBrowser:
                     except Exception:
                         still_disabled = True
                     if still_disabled:
+                        # When the proxy IP's country is not in the pre-populated
+                        # suggestion list (US/DE/UK), ``RegisterRegion`` renders a
+                        # TDesign ``.t-select`` dropdown instead of clickable spans.
+                        t_select = self._first_visible_any(
+                            page,
+                            [
+                                ".t-select__wrap",
+                                ".t-select",
+                                ".t-input__wrap",
+                                ".t-input",
+                                '[role="combobox"]',
+                            ],
+                        )
+                        if t_select is not None:
+                            self._human_click(page, t_select)
+                            time.sleep(0.6 if ACTION_DELAY > 0 else 0.15)
+                            opt_rect = None
+                            try:
+                                opt_rect = page.evaluate("""() => {
+                                    const isCn = (text) => /中国|中国大陆|China|CN\\b/i.test(text || '');
+                                    const prefer = (text) => /Singapore|新加坡|Japan|日本|Taiwan|台湾|Hong Kong|香港|United States|美国/i.test(text || '');
+                                    const items = Array.from(document.querySelectorAll(
+                                        'li.t-select-option, .t-select-option, [role="option"]'
+                                    )).filter(el => !!el.getClientRects().length);
+                                    const valid = items.filter(el => {
+                                        const t = (el.innerText || el.textContent || '').trim();
+                                        return t && !isCn(t);
+                                    });
+                                    const chosen = valid.find(el => prefer(el.innerText || el.textContent)) || valid[0];
+                                    if (!chosen) return null;
+                                    chosen.scrollIntoView({block: 'nearest'});
+                                    const r = chosen.getBoundingClientRect();
+                                    return {x: r.x, y: r.y, width: r.width, height: r.height};
+                                }""")
+                            except Exception:
+                                opt_rect = None
+                            if (
+                                isinstance(opt_rect, dict)
+                                and opt_rect.get("width", 0) > 4
+                                and opt_rect.get("height", 0) > 4
+                            ):
+                                _human_click_rect(page, opt_rect)
+                            else:
+                                try:
+                                    page.evaluate("""() => {
+                                        const isCn = (text) => /中国|中国大陆|China|CN\\b/i.test(text || '');
+                                        const items = Array.from(document.querySelectorAll(
+                                            'li.t-select-option, .t-select-option, [role="option"]'
+                                        )).filter(el => !!el.getClientRects().length);
+                                        const chosen = items.find(el => {
+                                            const t = (el.innerText || el.textContent || '').trim();
+                                            return t && !isCn(t);
+                                        });
+                                        if (chosen) chosen.click();
+                                    }""")
+                                except Exception:
+                                    pass
+                            time.sleep(0.4 if ACTION_DELAY > 0 else 0.1)
+                    try:
+                        still_disabled = bool(
+                            btn.evaluate(
+                                "el => !!el.disabled || el.getAttribute('aria-disabled') === 'true'"
+                            )
+                        )
+                    except Exception:
+                        still_disabled = True
+                    if still_disabled:
                         try:
                             page.evaluate("""() => {
                                 const isCn = (text) => /中国|中国大陆|China|CN\\b/i.test(text || '');
@@ -3857,7 +4097,7 @@ class WorkBuddyBrowser:
                             pass
                     _sleep_action_delay(1.0, 2.0)
                 self._human_click(page, btn)
-                nav_deadline = time.time() + 3.0
+                nav_deadline = time.time() + (2.5 if in_tests else 5.0)
                 while time.time() < nav_deadline:
                     if (
                         urlsplit(page.url).path.rstrip("/")
@@ -3877,7 +4117,8 @@ class WorkBuddyBrowser:
         profile = self._first_visible(
             page.get_by_text(
                 re.compile(
-                    r"^(完善信息|补充信息|Complete (your )?(profile|information))$", re.I
+                    r"^(完善信息|补充信息|完善地区|Complete\s*Region|Complete (your )?(profile|information))$",
+                    re.I,
                 )
             )
         )
@@ -4249,11 +4490,12 @@ class WorkBuddyBrowser:
             return {"status": "ok", "credential": cred}
         return {"status": "pending", "message": "暂未获取到有效 JWT 凭据"}
 
-    def start_cli_oauth(self, task: dict) -> dict:
+    def start_cli_oauth(self, task: dict, password: str = "") -> dict:
         tid = int(task["id"])
-        # ``task["proxy_url"]`` is often empty (the node lives on the session
-        # fingerprint); resolving from the active session keeps the state
-        # request off the bare host IP.
+        # Resolve the proxy AFTER ``_context_for`` so the active session (and
+        # its proxy sidecar) is guaranteed to exist; otherwise the state
+        # request would leave from the bare host IP.
+        context = self._context_for(tid, task=task)
         proxy_url = self._resolve_active_proxy_url(tid, task)
         state_url = f"{WORKBUDDY_URL}{AUTH_STATE_PATH}?platform=CLI"
         payload = _wb_http_json(
@@ -4270,7 +4512,7 @@ class WorkBuddyBrowser:
         if not state or not auth_url:
             raise ValueError("未能从 WorkBuddy 获取 CLI 授权地址，请确认网络与代理连接正常。")
 
-        context = self._context_for(tid, task=task)
+        already_logged_in = self._is_workbuddy_logged_in(tid, context)
         tabs = self._tabs_for(tid)
         old_tab = tabs.get("wb_oauth")
         if old_tab and not old_tab.is_closed():
@@ -4282,26 +4524,119 @@ class WorkBuddyBrowser:
         page.bring_to_front()
         _sleep_action_delay(1.0, 2.0)
 
-        if not self.challenge_page(task):
-            if not self._trigger_workbuddy_login_iframe(page):
-                sel_btn = self._first_visible(
-                    page.locator("button.select-account-button:not([disabled])")
-                )
-                if sel_btn is not None:
-                    self._human_click(page, sel_btn)
-                else:
-                    try:
-                        btn = page.get_by_role(
-                            "button",
-                            name=re.compile(r"^(授权|确认授权|确认登录|允许|同意|确认|继续|Authorize|Confirm|Allow|Approve|Continue)$", re.I),
-                        ).first
-                        btn.wait_for(state="visible", timeout=2000)
-                        if urlsplit(page.url).netloc.endswith("workbuddy.ai"):
-                            self._human_click(page, btn)
-                    except Exception:
-                        pass
+        in_tests = bool(os.environ.get("PYTEST_CURRENT_TEST"))
+        # ``/login`` -> GitHub OAuth -> ``/login/started`` ->
+        # ``/console/auth/login`` regularly takes 6-15s over the proxy, so a
+        # single UI pass with four 1s polls was far too short.
+        max_rounds = 4 if in_tests else 22
+        started_at = time.time()
 
-        for _ in range(4):
+        for _round_idx in range(max_rounds):
+            if not self.challenge_page(task):
+                try:
+                    cur_url = str(getattr(page, "url", "") or "")
+                except Exception:
+                    cur_url = ""
+                loc = urlsplit(cur_url)
+                if loc.netloc == "github.com":
+                    if loc.path.startswith("/login/oauth/authorize"):
+                        auth_btn = self._first_visible_any(
+                            page,
+                            [
+                                "button#js-oauth-authorize-btn",
+                                'button[name="authorize"][value="1"]',
+                                'form[action*="/login/oauth/authorize"] button[type="submit"]',
+                            ],
+                        )
+                        if auth_btn is None:
+                            try:
+                                auth_btn = self._first_visible(
+                                    page.get_by_role(
+                                        "button",
+                                        name=re.compile(r"^(Authorize|授权)", re.I),
+                                    )
+                                )
+                            except Exception:
+                                auth_btn = None
+                        if auth_btn is not None:
+                            try:
+                                enabled = bool(
+                                    auth_btn.evaluate(
+                                        "el => !el.disabled && el.getAttribute('aria-disabled') !== 'true'"
+                                    )
+                                )
+                            except Exception:
+                                enabled = False
+                            if enabled:
+                                self._human_click(page, auth_btn)
+                    elif (
+                        loc.path.rstrip("/") in ("/login", "/session")
+                        or loc.path.startswith("/sessions/verified-device")
+                        or loc.path.startswith("/account_verifications")
+                    ):
+                        try:
+                            self._handle_github_login_or_verify(page, task, password)
+                        except Exception:
+                            pass
+                elif loc.netloc.endswith("workbuddy.ai"):
+                    path_clean = loc.path.rstrip("/")
+                    if path_clean in ("/login/select", "/select"):
+                        sel_btn = self._first_visible(
+                            page.locator("button.select-account-button:not([disabled])")
+                        )
+                        if sel_btn is None:
+                            card = self._first_visible(page.locator(".select-account-card"))
+                            if card is not None:
+                                self._human_click(page, card)
+                                time.sleep(0.3 if ACTION_DELAY > 0 else 0.05)
+                            sel_btn = self._first_visible(
+                                page.locator("button.select-account-button:not([disabled])")
+                            )
+                        if sel_btn is not None:
+                            self._human_click(page, sel_btn)
+                    elif path_clean == "/login/register/user/complete":
+                        try:
+                            self.complete_workbuddy_region(task)
+                        except Exception:
+                            pass
+                    elif path_clean != "/login/started":
+                        # An already-logged-in browser auto-SSOs through
+                        # ``GET /console/accounts`` -> ``POST
+                        # /console/login/enterprise`` -> ``/login/started``.
+                        # Clicking ``a#social-github`` in the login-iframe
+                        # during that window aborts the SSO and forces a
+                        # redundant GitHub round trip, so give it ~3s first.
+                        allow_iframe = (
+                            in_tests
+                            or not already_logged_in
+                            or (time.time() - started_at) >= 3.0
+                        )
+                        triggered = False
+                        if allow_iframe:
+                            triggered = bool(self._trigger_workbuddy_login_iframe(page))
+                        if not triggered:
+                            sel_btn = self._first_visible(
+                                page.locator("button.select-account-button:not([disabled])")
+                            )
+                            if sel_btn is not None:
+                                self._human_click(page, sel_btn)
+                            else:
+                                try:
+                                    btn = page.get_by_role(
+                                        "button",
+                                        name=re.compile(
+                                            r"^(授权|确认授权|确认登录|允许|同意|确认|继续|Authorize|Confirm|Allow|Approve|Continue)$",
+                                            re.I,
+                                        ),
+                                    ).first
+                                    btn.wait_for(
+                                        state="visible", timeout=800 if not in_tests else 2000
+                                    )
+                                    if urlsplit(page.url).netloc.endswith("workbuddy.ai"):
+                                        self._human_click(page, btn)
+                                except Exception:
+                                    pass
+
             time.sleep(1.0)
             polled = self.poll_cli_oauth(state, task)
             if polled.get("status") == "ok" and polled.get("credential"):
@@ -4316,7 +4651,9 @@ class WorkBuddyBrowser:
             "message": "已在工作窗口打开 CLI 授权页，请在浏览器内点击确认授权后再次点击「保存登录凭据」或「确认完成」。",
         }
 
-    def capture_credential(self, task: dict, oauth_state: str = "") -> dict | None:
+    def capture_credential(
+        self, task: dict, oauth_state: str = "", password: str = ""
+    ) -> dict | None:
         tid = int(task["id"])
         if oauth_state:
             for _ in range(2):
@@ -4370,14 +4707,20 @@ class WorkBuddyBrowser:
                 except Exception:
                     continue
 
-            now_cached = self.captured_tokens.get(tid)
-            if not (isinstance(now_cached, dict) and now_cached.get("refreshToken")):
+        # Runs even when ``tid`` had no session yet: ``start_cli_oauth`` opens
+        # one itself, and a credential without a refreshToken is unusable for
+        # the WorkBuddy2API sidecar.
+        now_cached = self.captured_tokens.get(tid)
+        if not (isinstance(now_cached, dict) and now_cached.get("refreshToken")):
+            try:
                 try:
+                    res = self.start_cli_oauth(task, password=password)
+                except TypeError:
                     res = self.start_cli_oauth(task)
-                    if res.get("credential"):
-                        return res["credential"]
-                except Exception:
-                    pass
+                if isinstance(res, dict) and res.get("credential"):
+                    return res["credential"]
+            except Exception:
+                pass
 
         final_cached = self.captured_tokens.get(tid)
         if isinstance(final_cached, dict) and final_cached.get("accessToken"):

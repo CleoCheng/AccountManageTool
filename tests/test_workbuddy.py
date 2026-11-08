@@ -1350,4 +1350,105 @@ def test_preflight_preserves_sticky_node_for_post_github_steps(api, monkeypatch)
     assert sg_quota["blocked"] is False
 
 
+def test_auto_step_region_proactively_captures_credential_on_real_browser(api):
+    # Setup paired accounts: domain email and WorkBuddy
+    email = "proactive_wb_test@ggb6.com"
+    dom_acc = add_mail(api, email)
+    wb_acc = api.save_account({
+        "account_type": "WorkBuddy",
+        "account": email,
+        "password": "pAss----word|23",
+    })["account"]
+
+    api._workbuddy.browser._is_real_browser = True
+    captured_cred = {
+        "accessToken": "header.eyJzdWIiOiAibXl1aWQxMjMifQ.sig",
+        "refreshToken": "ref-tok-12345",
+        "uid": "100234",
+        "enterpriseId": "ent_999",
+    }
+    api._workbuddy.browser.capture_credential.return_value = captured_cred
+
+    started = api.start_workbuddy_queue([dom_acc["id"]])
+    assert started["ok"] is True
+    cur = started["queue"]["current"]
+
+    # Advance to workbuddy via skip_to_workbuddy
+    res = api.workbuddy_action(cur["id"], cur["revision"], "skip_to_workbuddy", "test-user-wb")
+    assert res["ok"] is True
+    cur = res["queue"]["current"]
+    assert cur["step"] == "workbuddy"
+
+    # Advance workbuddy -> region via auto_step
+    api._workbuddy.browser.complete_workbuddy_github_login = Mock(return_value={
+        "status": "next_step",
+        "next": "region",
+        "message": "已授权登录",
+    })
+    res = api.workbuddy_action(cur["id"], cur["revision"], "auto_step")
+    assert res["ok"] is True
+    assert res["step"] == "region"
+    cur = res["queue"]["current"]
+    assert cur["step"] == "region"
+
+    # Configure region completion
+    api._workbuddy.browser.complete_workbuddy_region = Mock(return_value={
+        "status": "next_step",
+        "next": "greeting",
+        "region": "confirmed",
+        "message": "地区确认完成",
+    })
+
+    # Advance region -> greeting via auto_step
+    # Because _is_real_browser is True, region completion proactively captures credentials!
+    res = api.workbuddy_action(cur["id"], cur["revision"], "auto_step")
+    assert res["ok"] is True
+    assert res["step"] == "greeting"
+    cur = res["queue"]["current"]
+    assert cur["step"] == "greeting"
+
+    # 1. Verify credential_json was immediately saved to tasks table
+    with api._workbuddy._connect() as conn:
+        task_row = conn.execute("SELECT credential_json FROM tasks WHERE id = ?", (cur["id"],)).fetchone()
+        assert task_row["credential_json"] is not None
+        saved_task_cred = json.loads(task_row["credential_json"])
+        assert saved_task_cred == captured_cred
+    assert cur["has_credential"] is True
+    assert cur["has_refresh_token"] is True
+
+    # 2. Verify wb_credential and wb_uid persisted to domain email account
+    dom_saved = api.db.get_account(dom_acc["id"])
+    assert dom_saved["custom_fields"]["wb_credential"] == captured_cred
+    assert dom_saved["custom_fields"]["wb_uid"] == "100234"
+
+    # 3. Verify wb_credential and wb_uid persisted to paired WorkBuddy account in db
+    wb_saved = api.db.get_account(wb_acc["id"])
+    assert wb_saved["custom_fields"]["wb_credential"] == captured_cred
+    assert wb_saved["custom_fields"]["wb_uid"] == "100234"
+
+    # Verify capture_credential was called exactly once during region step
+    assert api._workbuddy.browser.capture_credential.call_count == 1
+
+    # 4. Advance greeting -> done via auto_step
+    api._workbuddy.browser.send_greeting_and_wait_reply = Mock(return_value={
+        "status": "replied",
+        "sent": True,
+        "message": "已收到回复",
+    })
+    res_done = api.workbuddy_action(cur["id"], cur["revision"], "auto_step")
+    assert res_done["ok"] is True
+    assert res_done["auto_advanced"] is True
+    assert res_done["task_done"] is True
+    assert res_done["credential_saved"] is True
+
+    # Verify capture_credential was NOT called again (reused existing credential)
+    assert api._workbuddy.browser.capture_credential.call_count == 1
+
+    # Final DB check: status is '已完成'
+    dom_final = api.db.get_account(dom_acc["id"])
+    assert dom_final["custom_fields"]["wb_reg_status"] == "已完成"
+    assert dom_final["custom_fields"]["wb_credential"] == captured_cred
+
+
+
 

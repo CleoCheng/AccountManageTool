@@ -340,6 +340,113 @@ WORKBUDDY_REGION_HOME_HTML = """
 </body></html>
 """
 
+# Live homepage renders ``<button class="btn btn-complete-region">`` with the
+# label split across ``span.single-letter`` nodes, so a text locator misses it.
+WORKBUDDY_HOME_COMPLETE_REGION_HTML = """
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>WorkBuddy</title></head>
+<body>
+  <header>
+    <button class="btn btn-complete-region"
+      onclick="location.href='/login/register/user/complete'">
+      <span class="single-letter">C</span><span class="single-letter">o</span><span class="single-letter">m</span><span class="single-letter">p</span><span class="single-letter">l</span><span class="single-letter">e</span><span class="single-letter">t</span><span class="single-letter">e</span><span class="single-letter"> </span><span class="single-letter">R</span><span class="single-letter">e</span><span class="single-letter">g</span><span class="single-letter">i</span><span class="single-letter">o</span><span class="single-letter">n</span>
+    </button>
+  </header>
+  <main><p>Welcome back</p></main>
+</body></html>
+"""
+
+# Live homepage states used by the login-state probe: a session cookie +
+# ``sessionStorage['website-userId']`` + ``button.btn-user`` when signed in,
+# and a bare ``button.btn-login`` when signed out. Neither stores a 3-dot JWT.
+WORKBUDDY_HOME_LOGGED_IN_HTML = """
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>WorkBuddy</title>
+<script>
+  sessionStorage.setItem('website-userId', 'worker1234');
+  localStorage.setItem('CODEBUDDY_IDE_SELECTED_ACCOUNT_ID', 'acct-1');
+</script>
+</head>
+<body>
+  <header>
+    <button class="btn btn-user">worker1234</button>
+  </header>
+  <main><p>Welcome back</p></main>
+</body></html>
+"""
+
+WORKBUDDY_HOME_LOGGED_IN_USER_BUTTON_ONLY_HTML = """
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>WorkBuddy</title></head>
+<body>
+  <header>
+    <button class="btn btn-user">worker1234</button>
+  </header>
+  <main><p>Welcome back</p></main>
+</body></html>
+"""
+
+WORKBUDDY_HOME_COMPLETE_REGION_BUTTON_ONLY_HTML = """
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>WorkBuddy</title></head>
+<body>
+  <header>
+    <button class="btn btn-complete-region"><span class="single-letter">C</span></button>
+  </header>
+  <main><p>Welcome back</p></main>
+</body></html>
+"""
+
+WORKBUDDY_HOME_LOGGED_OUT_HTML = """
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>WorkBuddy</title></head>
+<body>
+  <header>
+    <button class="btn btn-login">Log in</button>
+  </header>
+  <main><p>Welcome back</p></main>
+</body></html>
+"""
+
+# Region confirmation page as rendered when the proxy IP's country is not in
+# the pre-populated suggestion list: the region choice is a TDesign dropdown
+# (``.t-select`` + ``li.t-select-option``) and Continue stays disabled until a
+# region is picked.
+WORKBUDDY_REGISTER_COMPLETE_TDESIGN_HTML = """
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Complete Your Profile</title>
+<style>
+  .t-select { width: 240px; padding: 10px; border: 1px solid #ccc; }
+  ul.t-select__list { list-style: none; margin: 0; padding: 0; }
+  li.t-select-option { display: none; padding: 10px 12px; border: 1px solid #eee; }
+  .t-select.open + ul.t-select__list li.t-select-option { display: block; }
+</style>
+</head>
+<body>
+  <div class="select-account-title">Complete Your Profile</div>
+  <div class="t-select" onclick="this.classList.toggle('open');">
+    <span class="t-select-placeholder">Select region</span>
+  </div>
+  <ul class="t-select__list">
+    <li class="t-select-option" onclick="pickRegion('Singapore')">Singapore</li>
+    <li class="t-select-option" onclick="pickRegion('中国')">中国</li>
+  </ul>
+  <button class="select-account-button" disabled
+    onclick="location.href='/app'">Continue</button>
+  <script>
+    function pickRegion(region) {
+      sessionStorage.setItem('picked_region', region);
+      document.querySelector('.t-select-placeholder').textContent = region;
+      document.querySelector('button.select-account-button').disabled = false;
+      document.querySelector('.t-select').classList.remove('open');
+      document.querySelectorAll('li.t-select-option').forEach((el) => {
+        el.style.display = 'none';
+      });
+    }
+  </script>
+</body></html>
+"""
+
 # Homepage variant that only links to the real /login page, where the entire
 # login/register UI lives inside a same-origin ``login-iframe``.
 WORKBUDDY_HOME_IFRAME_LOGIN_HTML = """
@@ -579,6 +686,7 @@ class LocalHttpsSite:
         self.github_oauth_mode = "plain"  # "plain" | "authorize" | "login_then_authorize" | "suspended"
         self.workbuddy_home_mode = "login"  # "login" | "region" | "profile" | "oauth" | "iframe_login"
         self.workbuddy_app_mode = "plain"  # "plain" | "replied"
+        self.workbuddy_register_mode = "plain"  # "plain" | "tdesign"
         self._username_taken_polls = 0
         cert_path, key_path = _generate_self_signed_cert(cert_dir)
         self._httpd = _QuietThreadingHTTPServer(("127.0.0.1", 0), _SiteHandler)
@@ -666,8 +774,6 @@ class LocalHttpsSite:
                 return 200, WORKBUDDY_LOGIN_IFRAME_HTML, html
             if path == "/auth/realms/copilot/protocol/openid-connect/auth":
                 return 200, WORKBUDDY_AUTH_IFRAME_HTML, html
-            if path == "/login/register/user/complete":
-                return 200, WORKBUDDY_REGISTER_COMPLETE_HTML, html
             if path == "/":
                 if self.workbuddy_home_mode == "region":
                     return 200, WORKBUDDY_REGION_HOME_HTML, html
@@ -677,7 +783,21 @@ class LocalHttpsSite:
                     return 200, WORKBUDDY_HOME_OAUTH_HTML, html
                 if self.workbuddy_home_mode == "iframe_login":
                     return 200, WORKBUDDY_HOME_IFRAME_LOGIN_HTML, html
+                if self.workbuddy_home_mode == "logged_in":
+                    return 200, WORKBUDDY_HOME_LOGGED_IN_HTML, html
+                if self.workbuddy_home_mode == "user_button":
+                    return 200, WORKBUDDY_HOME_LOGGED_IN_USER_BUTTON_ONLY_HTML, html
+                if self.workbuddy_home_mode == "complete_region_button":
+                    return 200, WORKBUDDY_HOME_COMPLETE_REGION_BUTTON_ONLY_HTML, html
+                if self.workbuddy_home_mode == "logged_out":
+                    return 200, WORKBUDDY_HOME_LOGGED_OUT_HTML, html
+                if self.workbuddy_home_mode == "complete_region":
+                    return 200, WORKBUDDY_HOME_COMPLETE_REGION_HTML, html
                 return 200, WORKBUDDY_HOME_HTML, html
+            if path == "/login/register/user/complete":
+                if self.workbuddy_register_mode == "tdesign":
+                    return 200, WORKBUDDY_REGISTER_COMPLETE_TDESIGN_HTML, html
+                return 200, WORKBUDDY_REGISTER_COMPLETE_HTML, html
             return 404, "<html><body>Not Found</body></html>", html
         return 404, "<html><body>Unknown host</body></html>", html
     def github_paths(self) -> list[str]:
@@ -720,6 +840,22 @@ def _wait_until(predicate, timeout: float = 8.0, interval: float = 0.05) -> bool
             return True
         time.sleep(interval)
     return predicate()
+
+
+def _no_jwt_in_storage_js() -> str:
+    """JS probe asserting neither storage holds a 3-dot WorkBuddy JWT."""
+    return """() => {
+        for (const store of [window.localStorage, window.sessionStorage]) {
+            if (!store) continue;
+            for (let i = 0; i < store.length; i++) {
+                const v = store.getItem(store.key(i)) || '';
+                if (/^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$/.test(v.trim())) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }"""
 
 
 def _assert_no_runtime_enable(helper: WorkBuddyBrowser) -> None:
@@ -3042,7 +3178,123 @@ def test_complete_workbuddy_region_handles_register_user_complete_page(
 
 
 # ---------------------------------------------------------------------------
-# 25. Suspended GitHub accounts are detected in OTP and WorkBuddy login
+# 25. Homepage session detection: sessionStorage / btn-user / btn-complete-region
+# ---------------------------------------------------------------------------
+@requires_chrome
+def test_is_workbuddy_logged_in_detects_homepage_session_and_user_button(
+    tmp_path: Path, site: LocalHttpsSite, launched_processes, action_delays
+):
+    """Live WorkBuddy never stores a 3-dot JWT on the homepage: a session
+    cookie plus ``sessionStorage['website-userId']`` / ``button.btn-user`` /
+    ``button.btn-complete-region`` is the real logged-in signal."""
+    helper = _new_helper(tmp_path, site)
+    task = {
+        "id": 141,
+        "email": "worker@example.org",
+        "username": "worker1234",
+        "step": "workbuddy",
+        "greeting": "hi",
+        "round_slot": 0,
+    }
+    try:
+        site.github_status = 200
+
+        # 1) sessionStorage['website-userId'] set, no JWT anywhere.
+        site.workbuddy_home_mode = "logged_in"
+        page = helper._page(
+            task["id"], "workbuddy", "https://www.workbuddy.ai/", task=task
+        )
+        ctx = helper.sessions[task["id"]]["context"]
+        assert page.evaluate("() => sessionStorage.getItem('website-userId')")
+        assert page.evaluate(_no_jwt_in_storage_js()) is True
+        assert helper._is_workbuddy_logged_in(task["id"], ctx) is True
+
+        # 2) Only ``<button class="btn btn-user">`` is present.
+        site.workbuddy_home_mode = "user_button"
+        page.goto("https://www.workbuddy.ai/")
+        page.evaluate("() => { sessionStorage.clear(); localStorage.clear(); }")
+        assert page.locator("button.btn-user").is_visible()
+        assert page.evaluate(_no_jwt_in_storage_js()) is True
+        assert helper._is_workbuddy_logged_in(task["id"], ctx) is True
+
+        # 3) Only ``<button class="btn btn-complete-region">`` is present.
+        site.workbuddy_home_mode = "complete_region_button"
+        page.goto("https://www.workbuddy.ai/")
+        page.evaluate("() => { sessionStorage.clear(); localStorage.clear(); }")
+        assert page.locator("button.btn-complete-region").is_visible()
+        assert helper._is_workbuddy_logged_in(task["id"], ctx) is True
+
+        # 4) Signed out: ``<button class="btn btn-login">`` and no session.
+        site.workbuddy_home_mode = "logged_out"
+        page.goto("https://www.workbuddy.ai/")
+        page.evaluate(
+            "() => { sessionStorage.clear(); localStorage.clear(); }"
+        )
+        assert page.locator("button.btn-login").is_visible()
+        assert helper._is_workbuddy_logged_in(task["id"], ctx) is False
+        _assert_no_runtime_enable(helper)
+    finally:
+        helper.close()
+
+
+# ---------------------------------------------------------------------------
+# 26. complete_workbuddy_region: btn-complete-region + TDesign region dropdown
+# ---------------------------------------------------------------------------
+@requires_chrome
+def test_complete_workbuddy_region_handles_btn_complete_region_and_tdesign_select(
+    tmp_path: Path, site: LocalHttpsSite, launched_processes, action_delays
+):
+    """On the homepage, ``button.btn-complete-region`` must be clicked (its
+    label is split across ``span.single-letter`` nodes), and on
+    ``/login/register/user/complete`` a TDesign ``.t-select`` dropdown must be
+    used to pick a non-CN region so Continue enables."""
+    helper = _new_helper(tmp_path, site)
+    task = {
+        "id": 142,
+        "email": "worker@example.org",
+        "username": "worker1234",
+        "step": "region",
+        "greeting": "hi",
+        "round_slot": 0,
+    }
+    try:
+        site.github_status = 200
+        site.workbuddy_home_mode = "complete_region"
+        site.workbuddy_register_mode = "tdesign"
+
+        page = helper._page(
+            task["id"], "workbuddy", "https://www.workbuddy.ai/", task=task
+        )
+        assert page.locator("button.btn-complete-region").is_visible()
+        assert page.locator("button.select-account-button").count() == 0
+
+        result = helper.complete_workbuddy_region(task)
+
+        assert result["status"] == "next_step", result
+        assert result["next"] == "greeting"
+        assert result["region"] == "confirmed"
+        assert _wait_until(
+            lambda: urllib.parse.urlsplit(page.url).path.rstrip("/") == "/app",
+            timeout=5.0,
+        ), page.url
+        assert any(
+            r["host"] == "www.workbuddy.ai"
+            and r["path"] == "/login/register/user/complete"
+            for r in site.requests
+        ), "the region confirmation page was never opened"
+        # ``sessionStorage`` survives the same-origin hop to /app, proving the
+        # non-CN option was picked through the TDesign dropdown rather than
+        # through a ``div.mt-2 span.cursor-pointer`` (there is none here).
+        assert (
+            page.evaluate("() => sessionStorage.getItem('picked_region')") == "Singapore"
+        ), "the TDesign region option was never selected"
+        _assert_no_runtime_enable(helper)
+    finally:
+        helper.close()
+
+
+# ---------------------------------------------------------------------------
+# 27. Suspended GitHub accounts are detected in OTP and WorkBuddy login
 # ---------------------------------------------------------------------------
 @requires_chrome
 def test_github_account_suspended_detected_in_otp_and_workbuddy_login(
