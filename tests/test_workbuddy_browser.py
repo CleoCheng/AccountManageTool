@@ -2694,6 +2694,64 @@ def test_check_paused_challenge_state_waits_out_datadome_interstitial(
     assert helper.check_paused_challenge_state(task) == "still_challenged"
 
 
+def test_check_paused_challenge_state_treats_closed_window_as_still_challenged(
+    tmp_path: Path, monkeypatch
+):
+    """Closing the Chrome window while paused must never report the task solved."""
+    helper = WorkBuddyBrowser(tmp_path / "sessions")
+    task = {
+        "id": 206,
+        "email": "worker@example.org",
+        "username": "worker1234",
+        "step": "github",
+        "greeting": "hi",
+        "round_slot": 0,
+    }
+
+    # A real ``_CdpContext`` whose process is still alive but has no open pages
+    # (the operator closed the window).
+    helper.sessions[task["id"]] = {"context": _FakeCdpContext([], [])}
+    monkeypatch.setattr(helper, "is_ip_restricted_page", lambda _task: False)
+    monkeypatch.setattr(helper, "challenge_page", lambda _task: None)
+    assert helper.check_paused_challenge_state(task) == "still_challenged"
+
+    # The Chrome process exited entirely.
+    dead_proc = types.SimpleNamespace(poll=lambda: 1)
+    dead_ctx = _FakeCdpContext([], [])
+    dead_ctx._proc = dead_proc
+    helper.sessions[task["id"]] = {"context": dead_ctx}
+    assert helper.check_paused_challenge_state(task) == "still_challenged"
+
+    # A live ``_CdpContext`` with an open page keeps the normal behaviour.
+    live_ctx = _FakeCdpContext([_FakeTargetPage(evaluate_result="signup")], [])
+    helper.sessions[task["id"]] = {"context": live_ctx}
+    assert helper.check_paused_challenge_state(task) == "solved"
+
+
+def test_is_ip_restricted_page_disables_active_fe_skip_for_verified_task(
+    tmp_path: Path, monkeypatch
+):
+    """A resume-time probe must inspect the OOPIF DOM for a transitioned frame."""
+    calls: list[bool] = []
+    helper = WorkBuddyBrowser(tmp_path / "sessions")
+    task = {"id": 207, "step": "github", "status": "verified"}
+    page = _FakeTargetPage(evaluate_result="check_oopif")
+    helper.sessions[task["id"]] = {"context": _FakeCdpContext([page])}
+
+    def _spy(ctx, *, allow_active_fe_skip: bool = False) -> str:
+        calls.append(allow_active_fe_skip)
+        return "slider"
+
+    monkeypatch.setattr(helper, "_inspect_datadome_oopif", _spy)
+    assert helper.is_ip_restricted_page(task) is False
+    assert calls == [False]
+
+    # An explicit override always wins.
+    calls.clear()
+    assert helper.is_ip_restricted_page(task, allow_active_fe_skip=True) is False
+    assert calls == [True]
+
+
 def test_check_paused_challenge_state_reports_ip_restricted_solved_and_pending(
     tmp_path: Path, monkeypatch
 ):

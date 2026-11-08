@@ -141,6 +141,25 @@ def test_rank_nodes_for_workbuddy_prioritizes_clean_regions_over_hk():
     assert rank_nodes_for_workbuddy([None, "nope"]) == []
 
 
+def test_rank_nodes_for_workbuddy_prefers_iepl_dedicated_lines_in_same_region():
+    from src.sidecar_proxy import rank_nodes_for_workbuddy
+
+    nodes = [
+        {"name": "🇸🇬 Singapore | 01", "delay": 20},
+        {"name": "🇸🇬 新加坡实验性 IEPL 专线 1", "delay": 300},
+        {"name": "🇸🇬 Singapore | 02", "delay": 10},
+        {"name": "🇸🇬 新加坡 IPLC 专线 2", "delay": 400},
+    ]
+    ranked = [n["name"] for n in rank_nodes_for_workbuddy(nodes)]
+    # IEPL / 专线 / IPLC nodes lead their region bucket even with higher latency.
+    assert ranked[:2] == [
+        "🇸🇬 新加坡实验性 IEPL 专线 1",
+        "🇸🇬 新加坡 IPLC 专线 2",
+    ]
+    assert ranked.index("🇸🇬 新加坡实验性 IEPL 专线 1") < ranked.index("🇸🇬 Singapore | 02")
+    assert ranked.index("🇸🇬 Singapore | 02") < ranked.index("🇸🇬 Singapore | 01")
+
+
 # ---------------------------------------------------------------------------
 # Read-only extraction + environment description
 # ---------------------------------------------------------------------------
@@ -188,6 +207,168 @@ def test_extract_leaf_proxies_and_describe_environment_never_touches_clash_verge
     assert {n["name"] for n in generic["nodes"]} == set(names)
     assert generic["sidecar"] is True
     assert not manager._proc, "describe_environment must never spawn the kernel"
+
+
+def test_extract_leaf_proxies_reads_remote_profiles_when_no_env_override(
+    tmp_path: Path, monkeypatch
+):
+    from src.sidecar_proxy import SidecarProxyManager
+
+    monkeypatch.delenv("KEYVAULT_CLASH_CONFIG", raising=False)
+
+    verge_dir = tmp_path / "verge"
+    profiles_dir = verge_dir / "profiles"
+    provider_dir = verge_dir / "proxy_provider"
+    profiles_dir.mkdir(parents=True)
+    provider_dir.mkdir(parents=True)
+
+    primary = verge_dir / "clash-verge.yaml"
+    primary.write_text(
+        yaml.safe_dump(
+            {
+                "proxies": [
+                    {
+                        "name": "🇭🇰 Hong Kong | 01",
+                        "type": "ss",
+                        "server": "127.0.0.1",
+                        "port": 30001,
+                        "cipher": "aes-128-gcm",
+                        "password": "hk-pass",
+                    },
+                    {
+                        "name": "🇯🇵 Japan | 01",
+                        "type": "ss",
+                        "server": "1.1.1.1",
+                        "port": 30002,
+                        "cipher": "aes-128-gcm",
+                        "password": "jp-pass",
+                    },
+                ],
+                "proxy-groups": [
+                    {"name": "Proxies", "type": "select", "proxies": ["🇭🇰 Hong Kong | 01"]}
+                ],
+            },
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    (profiles_dir / "remote-profile.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "proxies": [
+                    {
+                        "name": "🇸🇬 Singapore | 01",
+                        "type": "ss",
+                        "server": "127.0.0.1",
+                        "port": 30003,
+                        "cipher": "aes-128-gcm",
+                        "password": "sg-pass",
+                    },
+                    {
+                        "name": "🇭🇰 Hong Kong | 01",
+                        "type": "ss",
+                        "server": "127.0.0.1",
+                        "port": 30001,
+                        "cipher": "aes-128-gcm",
+                        "password": "hk-pass",
+                    },
+                ],
+                "proxy-groups": [
+                    {"name": "RemoteGroup", "type": "select", "proxies": ["🇸🇬 Singapore | 01"]}
+                ],
+            },
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    (provider_dir / "provider-a.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "proxies": [
+                    {
+                        "name": "🇯🇵 Japan | 02",
+                        "type": "ss",
+                        "server": "2.2.2.2",
+                        "port": 30004,
+                        "cipher": "aes-128-gcm",
+                        "password": "jp-pass",
+                    },
+                    {
+                        "name": "🇯🇵 Japan | 03",
+                        "type": "ss",
+                        "server": "127.0.0.1",
+                        "port": 30005,
+                        "cipher": "aes-128-gcm",
+                        "password": "jp-pass",
+                    },
+                ]
+            },
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    (verge_dir / "profiles.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "current": "remote-profile",
+                "items": [
+                    {
+                        "uid": "remote-profile",
+                        "type": "remote",
+                        "name": "Remote Sub",
+                        "file": "remote-profile.yaml",
+                        "url": "https://example.invalid/sub",
+                    },
+                    {"uid": "local-profile", "type": "local", "name": "Local", "file": "local.yaml"},
+                    {"uid": "missing", "type": "remote", "name": "Missing", "file": "missing.yaml"},
+                    "not-a-dict",
+                ],
+            },
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        "src.sidecar_proxy.find_clash_config_files",
+        lambda: [("Clash Verge Rev", primary)],
+    )
+
+    manager = SidecarProxyManager(runtime_dir=tmp_path / "sidecar")
+    label, yaml_path, raw_proxies, node_summaries = manager.extract_leaf_proxies()
+
+    assert label == "Clash Verge Rev"
+    assert Path(yaml_path).resolve() == primary.resolve()
+    leaf_names = [p["name"] for p in raw_proxies]
+    # Primary file first, then remote profile, then proxy_provider YAMLs; deduped.
+    assert leaf_names == [
+        "🇭🇰 Hong Kong | 01",
+        "🇸🇬 Singapore | 01",
+        "🇯🇵 Japan | 03",
+    ]
+    assert len(leaf_names) == len(set(leaf_names))
+    # Invalid placeholder servers from every source are filtered out.
+    assert all(p["server"] not in ("1.1.1.1", "2.2.2.2") for p in raw_proxies)
+    assert [n["name"] for n in node_summaries] == leaf_names
+    assert manager._proc is None
+
+    # profiles.yaml changes must invalidate the cached signature and trigger a reload.
+    base_sig = manager._yaml_signature(primary)
+    assert base_sig is not None
+    (verge_dir / "profiles.yaml").write_text(
+        (verge_dir / "profiles.yaml").read_text(encoding="utf-8") + "\n# changed\n",
+        encoding="utf-8",
+    )
+    changed_sig = manager._yaml_signature(primary)
+    assert changed_sig is not None
+    assert changed_sig != base_sig
 
 
 # ---------------------------------------------------------------------------

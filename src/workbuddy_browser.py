@@ -9,11 +9,12 @@ import subprocess
 import sys
 import threading
 import time
+import types
 import urllib.parse
 import urllib.request
 from collections import deque
 from pathlib import Path
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 
 from websockets.sync.client import connect as _ws_connect
 
@@ -1779,9 +1780,21 @@ class WorkBuddyBrowser:
         if task and self.challenge_page(task):
             return "challenged"
 
+        # Cold clicks on the header ``Sign up`` link (or a bare ``GET /signup``)
+        # are the requests DataDome answers with ``403 t=bv`` ("访问暂时受限"),
+        # while submitting the homepage hero email box goes through with 200.
+        # Production therefore always enters via ``hero_email`` first; tests
+        # monkeypatch ``wb.secrets`` with a ``types.SimpleNamespace`` and keep
+        # their deterministic channel selection.
+        pick = secrets.randbelow(2)
+        if (
+            isinstance(secrets, types.ModuleType)
+            and getattr(secrets.randbelow, "__name__", "") == "randbelow"
+        ):
+            pick = 0
         channels = (
             ["hero_email", "header_signup"]
-            if secrets.randbelow(2) == 0
+            if pick == 0
             else ["header_signup", "hero_email"]
         )
         for ch in channels:
@@ -1854,8 +1867,17 @@ class WorkBuddyBrowser:
                 pass
             self._wait_for_datadome_interstitial(page)
         if urlsplit(page.url).path.rstrip("/") != "/signup" and not (task and self.challenge_page(task)):
+            # A bare ``GET /signup`` is a cold DataDome request (403 t=bv),
+            # whereas the hero email form posts a ``user_email`` and passes.
+            # Only real GitHub gets the query string; the local test server
+            # keeps the plain URL.
+            target_signup_url = (
+                f"{GITHUB_URL}/signup?source=form-home-signup&user_email={quote(str(email))}"
+                if (email and not self.extra_chromium_args)
+                else GITHUB_URL + "/signup"
+            )
             resp = page.goto(
-                GITHUB_URL + "/signup",
+                target_signup_url,
                 referer=GITHUB_URL + "/",
                 wait_until="domcontentloaded",
                 timeout=15000,
@@ -1973,7 +1995,7 @@ class WorkBuddyBrowser:
         else:
             self._page(task["id"], "workbuddy", WORKBUDDY_URL + "/", task=task)
 
-    def _wait_for_datadome_interstitial(self, page, timeout: float = 7.0) -> None:
+    def _wait_for_datadome_interstitial(self, page, timeout: float = 12.0) -> None:
         """Wait for DataDome's silent device-check interstitial to redirect.
 
         GitHub's edge filter shows a 1.5-3.5s automatic ``/interstitial/`` frame
@@ -2010,7 +2032,17 @@ class WorkBuddyBrowser:
             try:
                 present = bool(page.evaluate(probe))
             except Exception:
-                present = False
+                if isinstance(page, _CdpPage):
+                    # The device check navigated the page, invalidating the
+                    # isolated world. Wait for the new document and re-probe
+                    # instead of assuming the interstitial is gone.
+                    try:
+                        page.wait_for_load_state("domcontentloaded", timeout=5000)
+                        present = bool(page.evaluate(probe))
+                    except Exception:
+                        present = False
+                else:
+                    present = False
         # ``i.js`` waits ~500ms after the device check before reloading, so the
         # real /signup document is only ready after that extra beat.
         time.sleep(0.65)
@@ -2212,14 +2244,22 @@ class WorkBuddyBrowser:
                         pass
         return ""
 
-    def is_ip_restricted_page(self, task) -> bool:
+    def is_ip_restricted_page(self, task, *, allow_active_fe_skip: bool | None = None) -> bool:
         """True only for a dead-end IP block, not an interactive slider.
 
         ``"访问暂时受限"`` has no puzzle left to solve, so the queue must rotate
         to a clean proxy node instead of asking the operator to click a slider.
         DataDome renders that text inside a cross-origin
         ``geo.captcha-delivery.com`` iframe, which is inspected separately.
+
+        ``allow_active_fe_skip`` skips attaching to a live ``t=fe`` slider
+        OOPIF (attaching would taint its token). It defaults to True while the
+        task is still being worked and False once the task is ``verified``,
+        because a resume-time probe must read the OOPIF DOM to notice that the
+        frame transitioned to ``"访问暂时受限"``.
         """
+        if allow_active_fe_skip is None:
+            allow_active_fe_skip = str((task or {}).get("status") or "") != "verified"
         tid = int(task["id"])
         sess = self.sessions.get(tid)
         ctx = sess.get("context") if sess else None
@@ -2270,7 +2310,10 @@ class WorkBuddyBrowser:
                             if (isShown(frame)) checkOopif = true;
                             continue;
                         }
-                        if (/octocaptcha\.com\/datadome/i.test(u.href) && (box.width < 120 || box.height < 120)) continue;
+                        if (/octocaptcha\.com\/datadome/i.test(u.href)) {
+                            if (box.width < 120 || box.height < 120) continue;
+                            if (isShown(frame)) { checkOopif = true; continue; }
+                        }
                         const haystack = [u.href, frame.id || '', frame.className || '', frame.title || ''].join(' ');
                         if (!/octocaptcha|arkoselabs|funcaptcha|hcaptcha|recaptcha|geetest/i.test(haystack)) continue;
                         if (isShown(frame) && box.width >= 100 && box.height >= 50) return 'slider';
@@ -2283,6 +2326,15 @@ class WorkBuddyBrowser:
                     for (const widget of widgets) {
                         if (widget.querySelector('input#email')) continue;
                         const box = widget.getBoundingClientRect();
+                        if (widget.matches('.js-octocaptcha-frame')) {
+                            // The octocaptcha shell wraps DataDome's OOPIF:
+                            // inspect the nested frame before calling it a slider.
+                            if (box.width >= 120 && box.height >= 120 && isShown(widget)) {
+                                checkOopif = true;
+                                continue;
+                            }
+                            continue;
+                        }
                         if (box.width >= 120 && box.height >= 40 && isShown(widget)) return 'slider';
                     }
                     const text = (document.body?.innerText || '').slice(0, 3000);
@@ -2299,7 +2351,9 @@ class WorkBuddyBrowser:
             if state == "slider":
                 return False
             if state == "check_oopif":
-                oopif_state = self._inspect_datadome_oopif(ctx, allow_active_fe_skip=True)
+                oopif_state = self._inspect_datadome_oopif(
+                    ctx, allow_active_fe_skip=allow_active_fe_skip
+                )
                 if oopif_state == "restricted":
                     return True
                 if oopif_state == "slider":
@@ -2414,6 +2468,20 @@ class WorkBuddyBrowser:
             return "still_challenged"
         if self.is_ip_restricted_page(task):
             return "ip_restricted"
+        if isinstance(ctx, _CdpContext):
+            # The operator may have closed the Chrome window (or the whole
+            # process died) while paused. That must never be mistaken for a
+            # solved challenge, otherwise submit_github_signup runs against a
+            # dead browser and the task is lost.
+            proc = getattr(ctx, "_proc", None)
+            if proc is not None and proc.poll() is not None:
+                return "still_challenged"
+            try:
+                open_pages = [p for p in (ctx.pages or []) if not p.is_closed()]
+            except Exception:
+                open_pages = []
+            if not open_pages:
+                return "still_challenged"
         for page in reversed(ctx.pages):
             if page.is_closed():
                 continue
@@ -2512,6 +2580,8 @@ class WorkBuddyBrowser:
             if self.challenge_page(task):
                 return "工作窗口出现人机验证或访问暂时受限，请完成验证或切换节点后继续。"
             count = self._fill_github_signup(page, task["email"], password, task["username"], task=task)
+            if count == 0 and (self.challenge_page(task) or self.is_ip_restricted_page(task)):
+                return "工作窗口出现人机验证或访问暂时受限，请完成验证或切换节点后继续。"
             return f"已从 GitHub 首页经「{channel_label}」进入注册页，并按真人点击+粘贴节奏填写 {count} 个空栏。请在工作窗口核对提交。"
         if task["step"] == "email":
             self._page(task["id"], "github", GITHUB_URL + "/login", task=task)

@@ -117,9 +117,11 @@ def rank_nodes_for_workbuddy(nodes: list[dict]) -> list[dict]:
             delay_val = int(delay) if delay and int(delay) > 0 else 0
         except (TypeError, ValueError):
             delay_val = 0
+        is_iepl = 0 if re.search(r"iepl|专线|iplc", name, re.I) else 1
         return (
             _region_priority(region),
             1 if node.get("timed_out") else 0,
+            is_iepl,
             delay_val if delay_val > 0 else 10**9,
             idx,
         )
@@ -168,7 +170,7 @@ class SidecarProxyManager:
         self._proc: subprocess.Popen | None = None
         self._lock = threading.RLock()
         self.active_node: str = ""
-        self._loaded_yaml_sig: tuple[str, float, int] | None = None
+        self._loaded_yaml_sig: tuple | None = None
         self._atexit_registered = False
         self._config_path = self.runtime_dir / "config.yaml"
 
@@ -181,42 +183,83 @@ class SidecarProxyManager:
         if not configs:
             return ("", None, [], [])
         client_label, yaml_path = configs[0]
-        try:
-            data = yaml.safe_load(Path(yaml_path).read_text(encoding="utf-8", errors="ignore")) or {}
-        except Exception:
-            return (client_label, Path(yaml_path), [], [])
-        if not isinstance(data, dict):
-            return (client_label, Path(yaml_path), [], [])
+        primary_path = Path(yaml_path)
+        yaml_files: list[Path] = [primary_path]
 
-        group_names_in_yaml = {
-            str(g.get("name") or "").strip()
-            for g in (data.get("proxy-groups") or [])
-            if isinstance(g, dict) and g.get("name")
-        }
+        if not (os.environ.get("KEYVAULT_CLASH_CONFIG") or "").strip():
+            profiles_index = primary_path.parent / "profiles.yaml"
+            if profiles_index.is_file():
+                try:
+                    profiles_data = (
+                        yaml.safe_load(
+                            profiles_index.read_text(encoding="utf-8", errors="ignore")
+                        )
+                        or {}
+                    )
+                except Exception:
+                    profiles_data = {}
+                if isinstance(profiles_data, dict):
+                    for item in profiles_data.get("items") or []:
+                        if not isinstance(item, dict):
+                            continue
+                        if item.get("type") != "remote" or not item.get("file"):
+                            continue
+                        profile_path = (
+                            primary_path.parent / "profiles" / str(item["file"])
+                        )
+                        if profile_path.is_file():
+                            yaml_files.append(profile_path)
+
+            provider_dir = primary_path.parent / "proxy_provider"
+            if provider_dir.is_dir():
+                yaml_files.extend(sorted(provider_dir.glob("*.yaml")))
+
+        loaded: list[dict] = []
+        group_names_in_yaml: set[str] = set()
+        for path in yaml_files:
+            try:
+                data = yaml.safe_load(path.read_text(encoding="utf-8", errors="ignore")) or {}
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            loaded.append(data)
+            group_names_in_yaml.update(
+                str(g.get("name") or "").strip()
+                for g in (data.get("proxy-groups") or [])
+                if isinstance(g, dict) and g.get("name")
+            )
 
         raw_proxies: list[dict] = []
         node_summaries: list[dict] = []
         seen: set[str] = set()
-        for px in data.get("proxies") or []:
-            if not isinstance(px, dict):
-                continue
-            nname = str(px.get("name") or "").strip()
-            ptype = str(px.get("type") or "").strip()
-            if not nname or not ptype or px.get("server") in (None, "") or px.get("port") in (None, ""):
-                continue
-            if not is_valid_proxy_node_name(nname, group_names_in_yaml) or nname in seen:
-                continue
-            seen.add(nname)
-            raw_proxies.append(px)
-            node_summaries.append(
-                {
-                    "name": nname,
-                    "type": ptype,
-                    "region": classify_node_region(nname),
-                    "delay": None,
-                }
-            )
-        return (client_label, Path(yaml_path), raw_proxies, node_summaries)
+        invalid_servers = (None, "", "1.1.1.1", "2.2.2.2", "0.0.0.0")
+        for data in loaded:
+            for px in data.get("proxies") or []:
+                if not isinstance(px, dict):
+                    continue
+                nname = str(px.get("name") or "").strip()
+                ptype = str(px.get("type") or "").strip()
+                if (
+                    not nname
+                    or not ptype
+                    or px.get("server") in invalid_servers
+                    or px.get("port") in (None, "")
+                ):
+                    continue
+                if not is_valid_proxy_node_name(nname, group_names_in_yaml) or nname in seen:
+                    continue
+                seen.add(nname)
+                raw_proxies.append(px)
+                node_summaries.append(
+                    {
+                        "name": nname,
+                        "type": ptype,
+                        "region": classify_node_region(nname),
+                        "delay": None,
+                    }
+                )
+        return (client_label, primary_path, raw_proxies, node_summaries)
 
     # ------------------------------------------------------------------
     # Environment description (fast, never spawns the kernel)
@@ -327,14 +370,28 @@ class SidecarProxyManager:
         except Exception:
             return 0, None
 
-    def _yaml_signature(self, yaml_path: Path | None) -> tuple[str, float, int] | None:
+    def _yaml_signature(self, yaml_path: Path | None) -> tuple | None:
         if yaml_path is None:
             return None
         try:
             stat = yaml_path.stat()
-            return (str(yaml_path), float(stat.st_mtime), int(stat.st_size))
+            signature: list = [str(yaml_path), float(stat.st_mtime), int(stat.st_size)]
         except OSError:
             return None
+        profiles_index = Path(yaml_path).parent / "profiles.yaml"
+        try:
+            if profiles_index.is_file():
+                profiles_stat = profiles_index.stat()
+                signature.extend(
+                    [
+                        str(profiles_index),
+                        float(profiles_stat.st_mtime),
+                        int(profiles_stat.st_size),
+                    ]
+                )
+        except OSError:
+            pass
+        return tuple(signature)
 
     def _build_config(self, raw_proxies: list[dict]) -> dict:
         return {

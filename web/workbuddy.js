@@ -505,7 +505,7 @@ async function runWorkBuddyAutoLoop(skipInitialOpen = false) {
 
       if (res.ok && res.round_transitioned) {
         if (res.switched_node) {
-          if (nodeRotations >= 3) {
+          if (nodeRotations >= 12) {
             blockedTaskIds.add(targetTask.id);
             continue;
           }
@@ -650,7 +650,7 @@ async function workBuddyAction(action, value = "") {
 }
 
 async function prepareCurrentWorkBuddyRound() {
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 0; attempt < 12; attempt++) {
     const task = getFocusedWorkBuddyTask();
     if (!workbuddy.modalOpen || !task) return;
     const roundReady = (workbuddy.queue.round_items || []).some(it => it.status === "ready");

@@ -1087,9 +1087,12 @@ class WorkBuddyQueue:
 
             paused = task["status"] == "paused"
             if action == "resume" and paused:
+                # Resume probes the OOPIF DOM (``allow_active_fe_skip=False``):
+                # the challenge frame may have transitioned to "访问暂时受限"
+                # while paused, which must auto-rotate to a clean node.
                 if (
                     hasattr(self.browser, "is_ip_restricted_page")
-                    and self.browser.is_ip_restricted_page(dict(task)) is True
+                    and self.browser.is_ip_restricted_page({**dict(task), "status": "verified"}) is True
                 ):
                     rotated = self._rotate_round_to_clean_node(conn, round_active, task)
                     if rotated is not None:
