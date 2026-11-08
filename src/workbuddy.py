@@ -26,6 +26,24 @@ STEP_DELAY = 1
 DEFAULT_NODE_QUOTA = 2
 ROUND_SIZE = 2
 _ACTIVE = "status IN ('ready', 'paused', 'verified')"
+DEFAULT_GREETINGS = (
+    "hello",
+    "hi",
+    "你好",
+    "你好呀",
+    "hi there",
+    "hello there",
+    "hey, how can you help?",
+    "hi, what can you do?",
+    "hello! nice to meet you",
+    "hey there, quick test",
+    "good day!",
+    "你好，请问你能帮我做什么？",
+    "嗨，你好",
+    "你好，很高兴认识你",
+    "hi! how are you?",
+    "hello, can you help me?",
+)
 
 
 def _username(email):
@@ -924,7 +942,7 @@ class WorkBuddyQueue:
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (
                         batch, account_id, email,
                         task_username,
-                        last["greeting"] if last else secrets.choice(("hello", "hi", "你好", "你好呀")),
+                        last["greeting"] if last else secrets.choice(DEFAULT_GREETINGS),
                         last["greeting_attempted"] if last else 0,
                         task_step,
                         last["region"] if last else "",

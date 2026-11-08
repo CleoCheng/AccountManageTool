@@ -3078,3 +3078,195 @@ def test_github_account_suspended_detected_in_otp_and_workbuddy_login(
         _assert_no_runtime_enable(helper)
     finally:
         helper.close()
+
+
+# ---------------------------------------------------------------------------
+# 26. CLI OAuth: active-session proxy + web UA + CJK IME commit
+# ---------------------------------------------------------------------------
+class _FakeOAuthPage:
+    """Minimal page surface used by ``start_cli_oauth``."""
+
+    def __init__(self):
+        self.url = "about:blank"
+        self.goto_calls: list[str] = []
+        self.closed = False
+
+    def goto(self, url, wait_until=None, timeout=None):
+        self.goto_calls.append(str(url))
+        self.url = str(url)
+        return None
+
+    def bring_to_front(self):
+        return None
+
+    def is_closed(self):
+        return self.closed
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeOAuthContext:
+    def __init__(self):
+        # ``_context_for`` reuses a session only while it still has a live page.
+        self.pages: list = [_FakeOAuthPage()]
+
+    def new_page(self):
+        page = _FakeOAuthPage()
+        self.pages.append(page)
+        return page
+
+
+def test_workbuddy_cli_oauth_uses_active_session_proxy_and_web_ua(monkeypatch):
+    """CLI OAuth HTTP calls must reuse the live session proxy and Chrome UA.
+
+    A bare ``task["proxy_url"]`` is empty for most tasks, so falling back to it
+    would send the state/token/profile requests straight from the host IP. The
+    ``/console/account`` fallback is a Web-platform call and therefore must not
+    claim ``WorkBuddy/5.8.4`` while the session proxy says otherwise.
+    """
+    helper = WorkBuddyBrowser(Path("."))
+    tid = 501
+    task = {
+        "id": tid,
+        "email": "worker@example.org",
+        "username": "worker1234",
+        "proxy_url": "",
+    }
+    session_proxy = "http://127.0.0.1:8899"
+    session_ua = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+    )
+    ctx = _FakeOAuthContext()
+    helper.sessions[tid] = {
+        "context": ctx,
+        "tabs": {},
+        "proxy_url": session_proxy,
+        "fp": {"ua": session_ua},
+    }
+
+    token = (
+        "eyJhbGciOiJIUzI1NiJ9."
+        "eyJzdWIiOiJ3b3JrZXIxMjM0IiwiZXhwIjo0MTAyNDQ0ODAwfQ."
+        "c2lnbmF0dXJl"
+    )
+    calls: list[dict] = []
+
+    def _fake_http_json(
+        url, *, method="GET", data=None, headers=None, proxy_url="", timeout=12
+    ):
+        calls.append(
+            {
+                "url": str(url),
+                "method": method,
+                "headers": dict(headers or {}),
+                "proxy_url": proxy_url,
+            }
+        )
+        if wb.AUTH_STATE_PATH in url:
+            return {
+                "data": {
+                    "state": "state-1",
+                    "authUrl": "https://www.workbuddy.ai/auth/cli?state=state-1",
+                }
+            }
+        if wb.AUTH_TOKEN_PATH in url:
+            return {
+                "code": 0,
+                "data": {"accessToken": token, "refreshToken": "refresh-1"},
+            }
+        if wb.LOGIN_ACCOUNT_PATH in url:
+            # Empty nickname forces the ``/console/account`` web fallback.
+            return {"data": {"nickname": ""}}
+        if wb.PROFILE_PATH in url:
+            return {"nickname": "web-user"}
+        return {}
+
+    monkeypatch.setattr(wb, "_wb_http_json", _fake_http_json)
+    monkeypatch.setattr(wb.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(helper, "challenge_page", lambda _task: None)
+    monkeypatch.setattr(helper, "_trigger_workbuddy_login_iframe", lambda _page: True)
+
+    # 1) poll_cli_oauth: token + account + profile all go through the session proxy.
+    polled = helper.poll_cli_oauth("state-1", task)
+    assert polled["status"] == "ok", polled
+    assert polled["credential"]["proxy"] == session_proxy
+    assert [call["proxy_url"] for call in calls] == [session_proxy] * 3
+    assert calls[0]["url"].startswith(wb.WORKBUDDY_URL + wb.AUTH_TOKEN_PATH)
+
+    # 2) The Web-platform profile fallback carries the browser Chrome UA.
+    profile_calls = [call for call in calls if wb.PROFILE_PATH in call["url"]]
+    assert len(profile_calls) == 1
+    assert profile_calls[0]["headers"]["x-client-platform"] == "web"
+    assert profile_calls[0]["headers"]["User-Agent"] == session_ua
+    assert profile_calls[0]["headers"]["User-Agent"] != "WorkBuddy/5.8.4"
+
+    # 3) start_cli_oauth: the state request must also use the session proxy.
+    calls.clear()
+    started = helper.start_cli_oauth(task)
+    assert started["state"] == "state-1"
+    assert started["credential"]["proxy"] == session_proxy
+    state_calls = [call for call in calls if wb.AUTH_STATE_PATH in call["url"]]
+    assert len(state_calls) == 1
+    assert state_calls[0]["proxy_url"] == session_proxy
+    assert all(call["proxy_url"] == session_proxy for call in calls)
+    oauth_pages = [p for p in ctx.pages if p.goto_calls]
+    assert len(oauth_pages) == 1
+    assert oauth_pages[0].goto_calls == [
+        "https://www.workbuddy.ai/auth/cli?state=state-1"
+    ]
+    helper.sessions.clear()
+
+    # 4) CJK characters are committed through a trusted IME ``Input.insertText``
+    # even with human pacing on; a key event with ``keyCode === 0`` would be a
+    # bot signal and would not update Slate.js.
+    sent: list[tuple[str, dict]] = []
+
+    class _FakeKeyboardPage:
+        def send(self, method, params=None):
+            sent.append((method, dict(params or {})))
+            return {}
+
+    sleeps: list[float] = []
+
+    class _TimeShim:
+        def __getattr__(self, item):
+            return getattr(time, item)
+
+        def sleep(self, value):
+            sleeps.append(value)
+
+    monkeypatch.setattr(wb, "ACTION_DELAY", 1)
+    monkeypatch.setattr(wb, "time", _TimeShim())
+    monkeypatch.setattr(
+        wb,
+        "secrets",
+        types.SimpleNamespace(randbelow=lambda _n: 0, choice=lambda s: s[0]),
+    )
+
+    keyboard = wb._CdpKeyboard(_FakeKeyboardPage())
+    keyboard.insert_text("你好")
+    assert sent == [
+        ("Input.insertText", {"text": "你"}),
+        ("Input.insertText", {"text": "好"}),
+    ]
+    assert sleeps == [0.04, 0.04]
+
+    # Mixed ASCII + CJK: only the ASCII character uses key events, and every
+    # key event carries a real virtual key code.
+    sent.clear()
+    sleeps.clear()
+    keyboard.insert_text("a你")
+    assert [method for method, _ in sent] == [
+        "Input.dispatchKeyEvent",
+        "Input.dispatchKeyEvent",
+        "Input.insertText",
+    ]
+    assert sent[0][1]["windowsVirtualKeyCode"] == 65
+    assert sent[1][1]["windowsVirtualKeyCode"] == 65
+    assert sent[2][1] == {"text": "你"}
+    for method, params in sent:
+        if method == "Input.dispatchKeyEvent":
+            assert params.get("windowsVirtualKeyCode", 0) != 0
+    assert sleeps == [0.012, 0.032, 0.04]

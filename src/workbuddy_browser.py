@@ -360,6 +360,16 @@ class _CdpKeyboard:
         # flags the session as automated.
         for ch in text:
             key, code, vk, modifiers = _char_key_spec(ch)
+            if not code and not vk:
+                # Non-ASCII / CJK characters never come from a physical key:
+                # a real keyboard commits them through an IME. ``insertText``
+                # emulates that trusted ``inputType: "insertText"`` commit,
+                # whereas ``dispatchKeyEvent`` without a virtual key code makes
+                # Chromium report ``keyCode === 0`` (a classic bot signal) and
+                # often fails to update Slate.js.
+                self.page.send("Input.insertText", {"text": ch})
+                time.sleep(0.04 + secrets.randbelow(65) / 1000.0)
+                continue
             down_params: dict = {
                 "type": "keyDown",
                 "text": ch,
@@ -2599,6 +2609,13 @@ class WorkBuddyBrowser:
 
     def _trigger_workbuddy_login_iframe(self, page) -> bool:
         """Unhide WorkBuddy's same-origin login-iframe, check policy checkboxes, and click GitHub."""
+        if ACTION_DELAY > 0:
+            # The outer loop calls this on every iteration; without a cooldown
+            # the same GitHub link would be double-clicked while the broker
+            # redirect is still in flight, which WorkBuddy flags as a bot.
+            last_trig = float(getattr(page, "_last_wb_iframe_trigger_at", 0.0) or 0.0)
+            if time.time() - last_trig < 3.5 and urlsplit(page.url).path.rstrip("/") == "/login":
+                return True
         try:
             prep = page.evaluate("""() => {
                 const ifr = document.querySelector(
@@ -2621,22 +2638,27 @@ class WorkBuddyBrowser:
                     }
                 });
 
-                const checkboxes = Array.from(doc.querySelectorAll('input[type="checkbox"][id^="agree-policy-"]'));
-                let checkedCount = 0;
-                for (const cb of checkboxes) {
+                // Real trusted CDP mouse clicks need viewport coordinates: the
+                // checkbox lives inside the iframe, so offset its rect by the
+                // iframe's own rect in the top-level document.
+                const ir = ifr.getBoundingClientRect();
+                const uncheckedRects = [];
+                for (const cb of doc.querySelectorAll('input[type="checkbox"][id^="agree-policy-"]')) {
                     const label = cb.closest('label.custom-checkbox') || doc.querySelector(`label[for="${cb.id}"]`);
                     const visTarget = label || cb;
                     if (!visTarget.getClientRects().length) continue;
                     if (!cb.checked) {
-                        if (label) label.click();
-                        if (!cb.checked) {
-                            cb.checked = true;
-                            cb.dispatchEvent(new Event('change', {bubbles: true}));
-                        }
+                        const r = visTarget.getBoundingClientRect();
+                        uncheckedRects.push({
+                            id: cb.id,
+                            x: ir.x + r.x,
+                            y: ir.y + r.y,
+                            width: r.width,
+                            height: r.height,
+                        });
                     }
-                    if (cb.checked) checkedCount++;
                 }
-                return {found: true, ready: true, checkedCount};
+                return {found: true, ready: true, uncheckedRects};
             }""")
         except Exception:
             return False
@@ -2644,9 +2666,20 @@ class WorkBuddyBrowser:
         if not isinstance(prep, dict) or not prep.get("ready"):
             return False
 
-        _sleep_action_delay(1.0, 2.0)
+        # Trusted CDP mouse clicks on each unchecked policy checkbox, paced so
+        # two checkboxes are never clicked in the same millisecond.
+        for idx, rect in enumerate(prep.get("uncheckedRects") or []):
+            if idx > 0:
+                _sleep_action_delay(0.6, 1.2)
+            if not isinstance(rect, dict):
+                continue
+            if rect.get("width", 0) > 4 and rect.get("height", 0) > 4:
+                _human_click_rect(page, rect)
+
+        # Fallback in case a capture-phase listener called
+        # ``event.preventDefault()`` or the layout rect was 0x0.
         try:
-            clicked = bool(page.evaluate("""() => {
+            page.evaluate("""() => {
                 const ifr = document.querySelector(
                     'iframe[title="login-iframe"], iframe[src*="/auth/realms/"], iframe[src*="/protocol/openid-connect/"]'
                 );
@@ -2663,14 +2696,61 @@ class WorkBuddyBrowser:
                         }
                     }
                 }
+            }""")
+        except Exception:
+            pass
+
+        _sleep_action_delay(1.0, 2.0)
+        try:
+            gh_rect = page.evaluate("""() => {
+                const ifr = document.querySelector(
+                    'iframe[title="login-iframe"], iframe[src*="/auth/realms/"], iframe[src*="/protocol/openid-connect/"]'
+                );
+                if (!ifr) return null;
+                const doc = ifr.contentDocument || ifr.contentWindow?.document;
+                if (!doc) return null;
                 const gh = doc.querySelector('a#social-github, a[href*="/broker/github/"], #kc-social-providers a[id*="github"]');
-                if (!gh || !gh.getClientRects().length) return false;
-                gh.click();
-                return true;
-            }"""))
-            return clicked
+                if (!gh || !gh.getClientRects().length) return null;
+                const ir = ifr.getBoundingClientRect();
+                const gr = gh.getBoundingClientRect();
+                return {x: ir.x + gr.x, y: ir.y + gr.y, width: gr.width, height: gr.height};
+            }""")
         except Exception:
             return False
+
+        if not isinstance(gh_rect, dict):
+            return False
+        if gh_rect.get("width", 0) > 4 and gh_rect.get("height", 0) > 4:
+            _human_click_rect(page, gh_rect)
+            if ACTION_DELAY > 0:
+                time.sleep(0.25)
+
+        # The trusted click may not have navigated yet (e.g. the mock page has
+        # no layout). A plain ``gh.click()`` guarantees the broker redirect in
+        # both real browsers and stubbed tests.
+        loc = urlsplit(page.url)
+        if loc.netloc == "www.workbuddy.ai" and loc.path.rstrip("/") == "/login":
+            try:
+                page.evaluate("""() => {
+                    const ifr = document.querySelector(
+                        'iframe[title="login-iframe"], iframe[src*="/auth/realms/"], iframe[src*="/protocol/openid-connect/"]'
+                    );
+                    if (!ifr) return false;
+                    const doc = ifr.contentDocument || ifr.contentWindow?.document;
+                    if (!doc) return false;
+                    const gh = doc.querySelector('a#social-github, a[href*="/broker/github/"], #kc-social-providers a[id*="github"]');
+                    if (!gh) return false;
+                    gh.click();
+                    return true;
+                }""")
+            except Exception:
+                pass
+
+        try:
+            page._last_wb_iframe_trigger_at = time.time()
+        except Exception:
+            pass
+        return True
 
     def _handle_github_login_or_verify(self, page, task: dict, password: str = "") -> str:
         """Auto-fill GitHub /login or /sessions/verified-device when signing into an existing account."""
@@ -3497,6 +3577,9 @@ class WorkBuddyBrowser:
                     "message": "登录 WorkBuddy 过程中出现人机验证，请在窗口完成后点击继续。",
                 }
             if self._is_workbuddy_logged_in(tid, ctx):
+                # Natural dwell time on the post-OAuth landing page before the
+                # next automation step touches it.
+                _sleep_action_delay(1.0, 2.0)
                 return {
                     "status": "next_step",
                     "next": "region",
@@ -3527,7 +3610,13 @@ class WorkBuddyBrowser:
                             )
                         if auth_btn is not None:
                             enabled = False
-                            enabled_deadline = time.time() + 2.0
+                            # GitHub keeps the OAuth Authorize button disabled
+                            # for 2-3s as anti-clickjacking protection; waiting
+                            # longer respects it instead of clicking a dead
+                            # button and retrying in a tight loop.
+                            enabled_deadline = time.time() + (
+                                4.5 if ACTION_DELAY > 0 else 2.0
+                            )
                             while time.time() < enabled_deadline:
                                 try:
                                     enabled = bool(
@@ -3547,10 +3636,13 @@ class WorkBuddyBrowser:
                                     pass
                                 _sleep_action_delay(1.0, 2.0)
                                 self._human_click(p, auth_btn)
+                                # Slow proxy redirects must not cause a second
+                                # click on the (now navigated) button.
+                                timeout = 4.5 if ACTION_DELAY > 0 else 1.5
                                 try:
-                                    p.wait_for_url("**/www.workbuddy.ai/**", timeout=1.5)
+                                    p.wait_for_url("**/www.workbuddy.ai/**", timeout=timeout)
                                 except Exception:
-                                    time.sleep(1.5)
+                                    time.sleep(timeout)
                     elif (
                         loc.path.rstrip("/") in ("/login", "/session")
                         or loc.path.startswith("/sessions/verified-device")
@@ -3570,7 +3662,9 @@ class WorkBuddyBrowser:
                             p.locator("button.select-account-button:not([disabled])")
                         )
                         if sel_btn is not None:
+                            _sleep_action_delay(1.0, 2.0)
                             self._human_click(p, sel_btn)
+                            time.sleep(1.0 if ACTION_DELAY > 0 else 0.1)
                             continue
                     if loc.path.startswith(
                         "/auth/realms/copilot/login-actions/first-broker-login"
@@ -3579,7 +3673,9 @@ class WorkBuddyBrowser:
                             p, ['input[type="submit"]', 'button[type="submit"]']
                         )
                         if sub_btn is not None:
+                            _sleep_action_delay(1.0, 2.0)
                             self._human_click(p, sub_btn)
+                            time.sleep(1.0 if ACTION_DELAY > 0 else 0.1)
                             continue
                     gh_btn = self._first_visible(
                         p.get_by_text(
@@ -3704,29 +3800,61 @@ class WorkBuddyBrowser:
                 except Exception:
                     disabled = False
                 if disabled:
+                    # Prefer a trusted CDP mouse click on the visible non-CN
+                    # region span; the JS ``span.click()`` fallback below stays
+                    # as a last resort.
                     try:
-                        page.evaluate("""() => {
+                        rect = page.evaluate("""() => {
                             const isCn = (text) => /中国|中国大陆|China|CN\\b/i.test(text || '');
                             for (const span of document.querySelectorAll('div.mt-2 span.cursor-pointer')) {
                                 if (!span.getClientRects().length) continue;
                                 const text = (span.innerText || span.textContent || '').trim();
-                                if (text && !isCn(text)) { span.click(); return true; }
+                                if (!text || isCn(text)) continue;
+                                const r = span.getBoundingClientRect();
+                                return {x: r.x, y: r.y, width: r.width, height: r.height};
                             }
-                            const select = document.querySelector('.t-select select, select');
-                            if (select instanceof HTMLSelectElement) {
-                                const option = Array.from(select.options).find(
-                                    opt => opt.value && !isCn(opt.value) && !isCn(opt.textContent)
-                                );
-                                if (option) {
-                                    select.value = option.value;
-                                    select.dispatchEvent(new Event('change', {bubbles: true}));
-                                    return true;
-                                }
-                            }
-                            return false;
+                            return null;
                         }""")
                     except Exception:
-                        pass
+                        rect = None
+                    if (
+                        isinstance(rect, dict)
+                        and rect.get("width", 0) > 4
+                        and rect.get("height", 0) > 4
+                    ):
+                        _human_click_rect(page, rect)
+                    try:
+                        still_disabled = bool(
+                            btn.evaluate(
+                                "el => !!el.disabled || el.getAttribute('aria-disabled') === 'true'"
+                            )
+                        )
+                    except Exception:
+                        still_disabled = True
+                    if still_disabled:
+                        try:
+                            page.evaluate("""() => {
+                                const isCn = (text) => /中国|中国大陆|China|CN\\b/i.test(text || '');
+                                for (const span of document.querySelectorAll('div.mt-2 span.cursor-pointer')) {
+                                    if (!span.getClientRects().length) continue;
+                                    const text = (span.innerText || span.textContent || '').trim();
+                                    if (text && !isCn(text)) { span.click(); return true; }
+                                }
+                                const select = document.querySelector('.t-select select, select');
+                                if (select instanceof HTMLSelectElement) {
+                                    const option = Array.from(select.options).find(
+                                        opt => opt.value && !isCn(opt.value) && !isCn(opt.textContent)
+                                    );
+                                    if (option) {
+                                        select.value = option.value;
+                                        select.dispatchEvent(new Event('change', {bubbles: true}));
+                                        return true;
+                                    }
+                                }
+                                return false;
+                            }""")
+                        except Exception:
+                            pass
                     _sleep_action_delay(1.0, 2.0)
                 self._human_click(page, btn)
                 nav_deadline = time.time() + 3.0
@@ -3737,6 +3865,8 @@ class WorkBuddyBrowser:
                     ):
                         break
                     time.sleep(0.2)
+                # Let /app settle naturally before the greeting step drives it.
+                _sleep_action_delay(1.0, 2.0)
             return {
                 "status": "next_step",
                 "next": "greeting",
@@ -3763,7 +3893,7 @@ class WorkBuddyBrowser:
         _sleep_action_delay(1.0, 2.0)
         # Best-effort: pick a non-CN region when the dialog offers a choice.
         try:
-            page.evaluate("""() => {
+            pick_rect = page.evaluate("""() => {
                 const isCn = (text) => /中国|中国大陆|China|CN\\b/i.test(text || '');
                 const select = document.querySelector('select');
                 if (select instanceof HTMLSelectElement) {
@@ -3783,11 +3913,31 @@ class WorkBuddyBrowser:
                     const text = (el.innerText || el.textContent || '').trim();
                     return text && !isCn(text) && /美国|日本|新加坡|United States|Japan|Singapore/i.test(text);
                 });
-                if (pick) { pick.click(); return true; }
-                return false;
+                if (!pick) return false;
+                const r = pick.getBoundingClientRect();
+                return {x: r.x, y: r.y, width: r.width, height: r.height};
             }""")
         except Exception:
-            pass
+            pick_rect = None
+        if isinstance(pick_rect, dict):
+            if pick_rect.get("width", 0) > 4 and pick_rect.get("height", 0) > 4:
+                _human_click_rect(page, pick_rect)
+            else:
+                # No usable layout rect: fall back to the untrusted JS click.
+                try:
+                    page.evaluate("""() => {
+                        const isCn = (text) => /中国|中国大陆|China|CN\\b/i.test(text || '');
+                        const candidates = Array.from(document.querySelectorAll(
+                            '[role="radio"], [role="option"], label, li'
+                        )).filter(el => !!el.getClientRects().length);
+                        const pick = candidates.find(el => {
+                            const text = (el.innerText || el.textContent || '').trim();
+                            return text && !isCn(text) && /美国|日本|新加坡|United States|Japan|Singapore/i.test(text);
+                        });
+                        if (pick) pick.click();
+                    }""")
+                except Exception:
+                    pass
         _sleep_action_delay(1.0, 2.0)
         confirm_btn = self._first_visible(
             page.get_by_role(
@@ -3923,6 +4073,42 @@ class WorkBuddyBrowser:
             "message": "已发送招呼并完成等待响应，正在保存凭据。",
         }
 
+    def _resolve_active_proxy_url(self, tid: int, task: dict | None) -> str:
+        """The proxy actually bound to the live session, never the bare host IP."""
+        sess = self.sessions.get(int(tid)) if isinstance(self.sessions, dict) else None
+        if isinstance(sess, dict):
+            sess_px = str(sess.get("proxy_url") or "").strip()
+            if sess_px:
+                return sess_px
+        if isinstance(task, dict):
+            task_px = str(task.get("proxy_url") or "").strip()
+            if task_px:
+                return task_px
+        try:
+            _, fp_px, _ = self._resolve_task_fp(int(tid), task)
+            return str(fp_px or "").strip()
+        except Exception:
+            return ""
+
+    def _resolve_web_user_agent(self, tid: int, task: dict | None) -> str:
+        """The browser session's Chrome UA, so Web API calls match the browser."""
+        sess = self.sessions.get(int(tid)) if isinstance(self.sessions, dict) else None
+        if isinstance(sess, dict) and isinstance(sess.get("fp"), dict):
+            ua = str(sess["fp"].get("ua") or sess["fp"].get("user_agent") or "").strip()
+            if ua:
+                return ua
+        try:
+            fp, _, _ = self._resolve_task_fp(int(tid), task)
+            ua = str((fp or {}).get("ua") or (fp or {}).get("user_agent") or "").strip()
+            if ua:
+                return ua
+        except Exception:
+            pass
+        return (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+        )
+
     def _normalize_credential(self, task: dict, raw: dict) -> dict | None:
         tok = str(raw.get("accessToken") or "").strip()
         if not tok or tok.count(".") != 2:
@@ -3940,7 +4126,12 @@ class WorkBuddyBrowser:
             or task.get("username")
             or str(task.get("email") or "").split("@")[0]
         ).strip()
-        proxy_url = str(task.get("proxy_url") or "").strip()
+        tid = int(task.get("id") or 0)
+        proxy_url = (
+            self._resolve_active_proxy_url(tid, task)
+            if tid
+            else str(task.get("proxy_url") or "").strip()
+        )
         return {
             "uid": uid,
             "nickname": nickname,
@@ -3977,7 +4168,8 @@ class WorkBuddyBrowser:
         st = str(state or "").strip()
         if not st:
             return {"status": "empty"}
-        proxy_url = str(task.get("proxy_url") or "").strip()
+        tid = int(task.get("id") or 0)
+        proxy_url = self._resolve_active_proxy_url(tid, task)
         headers = self._wb_headers()
         token_url = f"{WORKBUDDY_URL}{AUTH_TOKEN_PATH}?state={urllib.parse.quote(st)}"
         try:
@@ -4017,7 +4209,10 @@ class WorkBuddyBrowser:
                     "Authorization": f"Bearer {tok}",
                     "Accept": "application/json, text/plain, */*",
                     "x-client-platform": "web",
-                    "User-Agent": "WorkBuddy/5.8.4",
+                    # A Web-platform request must carry the browser session's
+                    # real Chrome UA; ``WorkBuddy/5.8.4`` would contradict
+                    # ``x-client-platform: web`` and flag the account.
+                    "User-Agent": self._resolve_web_user_agent(tid, task),
                 }
                 prof_data = _wb_http_json(
                     WORKBUDDY_URL + PROFILE_PATH,
@@ -4056,7 +4251,10 @@ class WorkBuddyBrowser:
 
     def start_cli_oauth(self, task: dict) -> dict:
         tid = int(task["id"])
-        proxy_url = str(task.get("proxy_url") or "").strip()
+        # ``task["proxy_url"]`` is often empty (the node lives on the session
+        # fingerprint); resolving from the active session keeps the state
+        # request off the bare host IP.
+        proxy_url = self._resolve_active_proxy_url(tid, task)
         state_url = f"{WORKBUDDY_URL}{AUTH_STATE_PATH}?platform=CLI"
         payload = _wb_http_json(
             state_url,
