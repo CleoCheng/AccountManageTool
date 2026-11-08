@@ -1238,3 +1238,116 @@ def test_start_resumes_from_account_custom_fields(api):
     assert task["step"] == "workbuddy"
 
 
+def test_auto_ip_reuses_previous_node_even_after_cancel_or_quota_full(api):
+    api._workbuddy.discover_nodes_fn = lambda **_: {
+        "ports": [{"url": "http://127.0.0.1:7890"}],
+        "nodes": ["🇸🇬 Singapore | 01", "🇯🇵 Japan | 01"],
+    }
+    acc = add_mail(api, "sticky_user@ggb6.com")
+    started = api.start_workbuddy_queue([acc["id"]], proxy_node="🇯🇵 Japan | 01")
+    assert started["ok"] is True
+    cur = started["queue"]["current"]
+    assert cur["proxy_node"] == "🇯🇵 Japan | 01"
+
+    # Advance or cancel: cancel the task
+    res_cancel = api.workbuddy_action(cur["id"], cur["revision"], "cancel")
+    assert res_cancel["ok"] is True
+
+    # Fill "🇯🇵 Japan | 01" quota to 2/2 with two other emails
+    with api._workbuddy._connect() as conn, conn:
+        for other_email in ("other1@ggb6.com", "other2@ggb6.com"):
+            conn.execute(
+                "INSERT INTO node_registrations (node_name, email, status, created_at) VALUES (?, ?, 'done', 0)",
+                ("🇯🇵 Japan | 01", other_email),
+            )
+
+    # Start acc again WITHOUT specifying proxy_node
+    started2 = api.start_workbuddy_queue([acc["id"]])
+    assert started2["ok"] is True
+    cur2 = started2["queue"]["current"]
+    # Verify it automatically selects "🇯🇵 Japan | 01" (its historical node!) instead of "🇸🇬 Singapore | 01"!
+    assert cur2["proxy_node"] == "🇯🇵 Japan | 01"
+
+
+def test_auto_ip_falls_back_to_same_country_when_previous_node_blocked(api):
+    api._workbuddy.discover_nodes_fn = lambda **_: {
+        "ports": [{"url": "http://127.0.0.1:7890"}],
+        "nodes": [
+            "🇺🇸 United States | 01",
+            "🇸🇬 Singapore | 01",
+            "🇸🇬 新加坡实验性 IEPL 专线 1",
+            "🇯🇵 Japan | 01",
+        ],
+    }
+    acc = add_mail(api, "same_country@ggb6.com")
+    started = api.start_workbuddy_queue([acc["id"]], proxy_node="🇸🇬 Singapore | 01")
+    assert started["ok"] is True
+    cur = started["queue"]["current"]
+    assert cur["proxy_node"] == "🇸🇬 Singapore | 01"
+
+    # Previous attempt at step == "github" hits restriction and is cancelled -> blocked = 1
+    api._workbuddy.browser.is_ip_restricted_page.return_value = True
+    assert api.workbuddy_action(cur["id"], cur["revision"], "cancel")["ok"] is True
+    api._workbuddy.browser.is_ip_restricted_page.return_value = False
+
+    quotas = api.get_workbuddy_node_quotas()
+    sg01_quota = next(n for n in quotas["nodes"] if n["node_name"] == "🇸🇬 Singapore | 01")
+    assert sg01_quota["blocked"] is True
+
+    # Now start acc again WITHOUT specifying proxy_node
+    started2 = api.start_workbuddy_queue([acc["id"]])
+    assert started2["ok"] is True
+    cur2 = started2["queue"]["current"]
+    # Verify that instead of jumping to "🇺🇸 United States | 01" or "🇯🇵 Japan | 01", it stays in Singapore and selects "🇸🇬 新加坡实验性 IEPL 专线 1"!
+    assert cur2["proxy_node"] == "🇸🇬 新加坡实验性 IEPL 专线 1"
+
+
+def test_preflight_preserves_sticky_node_for_post_github_steps(api, monkeypatch):
+    api._workbuddy.discover_nodes_fn = lambda **_: {
+        "ports": [{"url": "http://127.0.0.1:17899"}],
+        "nodes": ["🇸🇬 新加坡实验性 IEPL 专线 1", "🇯🇵 Japan | 01"],
+    }
+    api._workbuddy.browser._is_real_browser = True
+
+    acc = api.save_account({
+        "account_type": "域名邮箱",
+        "account": "sticky_post_gh@ggb6.com",
+        "password": "pass",
+        "custom_fields": {
+            "wb_reg_status": "进行中",
+            "wb_reg_step": "workbuddy",
+            "github_username": "stickygh99",
+            "proxy_node": "🇸🇬 新加坡实验性 IEPL 专线 1",
+        },
+    })["account"]
+
+    def mock_activate_proxy_node(platform, px, node, preflight=False):
+        return {
+            "ok": True,
+            "switched": True,
+            "restricted": True,
+            "reachable": True,
+            "proxy_url": "http://127.0.0.1:17899",
+        }
+
+    monkeypatch.setattr("src.proxy_service.activate_proxy_node", mock_activate_proxy_node)
+
+    started = api.start_workbuddy_queue([acc["id"]])
+    assert started["ok"] is True
+    cur = started["queue"]["current"]
+    assert cur["step"] == "workbuddy"
+    assert cur["proxy_node"] == "🇸🇬 新加坡实验性 IEPL 专线 1"
+
+    res = act(api, "open_round")
+    assert res["ok"] is True
+
+    # Verify proxy_node remains "🇸🇬 新加坡实验性 IEPL 专线 1" (not rotated to "🇯🇵 Japan | 01" and not marked blocked!)
+    cur_after = api.get_workbuddy_queue()["current"]
+    assert cur_after["proxy_node"] == "🇸🇬 新加坡实验性 IEPL 专线 1"
+
+    quotas = api.get_workbuddy_node_quotas()
+    sg_quota = next(n for n in quotas["nodes"] if n["node_name"] == "🇸🇬 新加坡实验性 IEPL 专线 1")
+    assert sg_quota["blocked"] is False
+
+
+

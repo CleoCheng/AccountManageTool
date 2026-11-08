@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from src.browser_service import generate_fingerprint_config
 from src.github_mail import read_github_code
-from src.proxy_service import detect_proxy_environment
+from src.proxy_service import classify_node_region, detect_proxy_environment
 from src.workbuddy_browser import WorkBuddyBrowser
 
 
@@ -356,6 +356,50 @@ class WorkBuddyQueue:
         final_px = px_url or usage_map[node_name].get("proxy_url") or default_proxy_url
         return node_name, final_px
 
+    def _resolve_entry_history(self, conn, entry: dict) -> tuple[str, str, str]:
+        last = entry.get("last")
+        acc_obj = entry.get("account") or {}
+        cf = acc_obj.get("custom_fields") if isinstance(acc_obj.get("custom_fields"), dict) else {}
+        fp_cfg = acc_obj.get("fp_config") if isinstance(acc_obj.get("fp_config"), dict) else {}
+        last_step = last["step"] if (last and last["step"] in STEPS) else STEPS[0]
+        cf_step = str(cf.get("wb_reg_step") or "").strip()
+        entry_step = cf_step if (cf_step in STEPS and STEPS.index(cf_step) > STEPS.index(last_step)) else last_step
+
+        prev_node = ""
+        prev_px = ""
+
+        # Priority 1: Latest tasks row for email that progressed past github (step != 'github') with non-empty proxy_node
+        adv_row = conn.execute(
+            "SELECT proxy_node, proxy_url FROM tasks WHERE email = ? AND step != ? AND proxy_node != '' ORDER BY id DESC LIMIT 1",
+            (entry["email"], STEPS[0]),
+        ).fetchone()
+        if adv_row and str(adv_row["proxy_node"] or "").strip():
+            prev_node = str(adv_row["proxy_node"]).strip()
+            prev_px = str(adv_row["proxy_url"] or "").strip()
+
+        # Priority 2: Account's persisted proxy_node in custom_fields or fp_config
+        if not prev_node:
+            cf_node = str(cf.get("proxy_node") or fp_cfg.get("proxy_node") or "").strip()
+            if cf_node:
+                prev_node = cf_node
+                prev_px = str(fp_cfg.get("proxy") or cf.get("proxy") or "").strip()
+
+        # Priority 3: Latest node_registrations row for email
+        if not prev_node:
+            nr_row = conn.execute(
+                "SELECT node_name FROM node_registrations WHERE email = ? ORDER BY CASE WHEN status = 'done' THEN 0 ELSE 1 END, created_at DESC LIMIT 1",
+                (entry["email"],),
+            ).fetchone()
+            if nr_row and str(nr_row["node_name"] or "").strip():
+                prev_node = str(nr_row["node_name"]).strip()
+
+        # Priority 4: Latest tasks row (last["proxy_node"], last["proxy_url"]) if last and str(last["proxy_node"] or "").strip()
+        if not prev_node and last and str(last["proxy_node"] or "").strip():
+            prev_node = str(last["proxy_node"]).strip()
+            prev_px = str(last["proxy_url"] or "").strip()
+
+        return prev_node, prev_px, entry_step
+
     def _allocate_round(
         self,
         conn,
@@ -370,12 +414,19 @@ class WorkBuddyQueue:
         first = pending_entries[0]
         second = pending_entries[1] if len(pending_entries) >= 2 else None
 
-        def _prev_node(email: str) -> str:
-            row = conn.execute(
-                "SELECT node_name FROM node_registrations WHERE email = ? LIMIT 1",
-                (email,),
-            ).fetchone()
-            return str(row["node_name"]) if row else ""
+        prev1, prev1_px, step1 = self._resolve_entry_history(conn, first)
+        if second:
+            prev2, prev2_px, step2 = self._resolve_entry_history(conn, second)
+        else:
+            prev2, prev2_px, step2 = "", "", STEPS[0]
+
+        def _has_nr(email: str, n_name: str) -> bool:
+            return bool(
+                conn.execute(
+                    "SELECT 1 FROM node_registrations WHERE node_name = ? AND email = ? LIMIT 1",
+                    (n_name, email),
+                ).fetchone()
+            )
 
         def _free_slots(n_name: str) -> int:
             info = usage_map.get(n_name)
@@ -387,16 +438,17 @@ class WorkBuddyQueue:
                 return 0
             return max(0, int(info.get("quota_limit") or DEFAULT_NODE_QUOTA) - int(info.get("used_count") or 0))
 
-        prev1 = _prev_node(first["email"])
-        prev2 = _prev_node(second["email"]) if second else ""
-
         if explicit_node:
             pair = [first, second] if second else [first]
             chosen_px = explicit_proxy_url or default_proxy_url
             for ent in pair:
-                same = (_prev_node(ent["email"]) == explicit_node)
+                ent_prev = prev1 if ent is first else prev2
+                same = _has_nr(ent["email"], explicit_node) or (ent_prev == explicit_node)
                 if not same and _free_slots(explicit_node) < 1:
-                    info = usage_map[explicit_node]
+                    info = usage_map.get(explicit_node) or {
+                        "quota_limit": DEFAULT_NODE_QUOTA,
+                        "used_count": 0,
+                    }
                     raise ValueError(
                         f"订阅节点「{explicit_node}」已达到 {info['quota_limit']} 个账号上限或已标记受限（已用 {info['used_count']}/{info['quota_limit']}），未主动解限禁止复用该节点！"
                     )
@@ -405,15 +457,112 @@ class WorkBuddyQueue:
                 )
             return pair, explicit_node, chosen_px
 
-        if prev1 and not ((usage_map.get(prev1) or {}).get("blocked") and not (usage_map.get(prev1) or {}).get("unlocked")):
-            px = explicit_proxy_url or (usage_map.get(prev1) or {}).get("proxy_url") or default_proxy_url
-            _, px = self._reserve_node_slot(conn, first["email"], prev1, px, default_proxy_url, usage_map, True)
-            if second and (prev2 == prev1 or (not prev2 and _free_slots(prev1) >= 1)):
+        def _can_reuse_prev_node(n_name: str, step: str) -> bool:
+            if not n_name:
+                return False
+            if env_nodes and n_name not in env_nodes:
+                return False
+            info = usage_map.get(n_name) or {}
+            is_blocked = bool(info.get("blocked") and not info.get("unlocked"))
+            if not is_blocked:
+                return True
+            if is_blocked and step != STEPS[0]:
+                return True
+            return False
+
+        # Branch A: prev1 can be reused directly
+        if prev1 and _can_reuse_prev_node(prev1, step1):
+            px = explicit_proxy_url or prev1_px or (usage_map.get(prev1) or {}).get("proxy_url") or default_proxy_url
+            has_nr1 = _has_nr(first["email"], prev1)
+            _, px = self._reserve_node_slot(
+                conn, first["email"], prev1, px, default_proxy_url, usage_map, is_same_email=has_nr1
+            )
+            if second and (prev2 == prev1):
+                has_nr2 = _has_nr(second["email"], prev1)
                 _, px = self._reserve_node_slot(
-                    conn, second["email"], prev1, px, default_proxy_url, usage_map, prev2 == prev1
+                    conn, second["email"], prev1, px, default_proxy_url, usage_map, is_same_email=has_nr2
                 )
                 return [first, second], prev1, px
+            elif second and not prev2:
+                info1 = usage_map.get(prev1) or {}
+                is_blocked1 = bool(info1.get("blocked") and not info1.get("unlocked"))
+                if not is_blocked1 and _free_slots(prev1) >= 1:
+                    _, px = self._reserve_node_slot(
+                        conn, second["email"], prev1, px, default_proxy_url, usage_map, is_same_email=False
+                    )
+                    return [first, second], prev1, px
             return [first], prev1, px
+
+        # Branch B: first HAS a prev1, but _can_reuse_prev_node(prev1, step1) is False
+        if prev1:
+            if env_nodes:
+                target_country = self._node_country_code(prev1)
+                blocked_regions = {
+                    self._node_region_key(k)
+                    for k, v in usage_map.items()
+                    if isinstance(v, dict) and v.get("blocked") and not v.get("unlocked")
+                }
+                ordered_nodes = sorted(
+                    env_nodes,
+                    key=lambda c: (
+                        0 if (target_country and self._node_country_code(c) == target_country) else 1,
+                        1 if self._node_region_key(c) in blocked_regions else 0,
+                    ),
+                )
+                can_pair = False
+                if second:
+                    if not prev2:
+                        can_pair = True
+                    elif self._node_country_code(prev2) == target_country and not _can_reuse_prev_node(prev2, step2):
+                        can_pair = True
+
+                chosen_node = ""
+                pair: list[dict] = []
+                if can_pair:
+                    for cand in ordered_nodes:
+                        info = usage_map.get(cand)
+                        if info and info.get("blocked") and not info.get("unlocked"):
+                            continue
+                        used = int((info or {}).get("used_count") or 0)
+                        limit = int((info or {}).get("quota_limit") or DEFAULT_NODE_QUOTA)
+                        if (info and info.get("unlocked")) or (limit - used >= ROUND_SIZE):
+                            chosen_node = cand
+                            pair = [first, second]
+                            break
+                if not chosen_node:
+                    for cand in ordered_nodes:
+                        if _free_slots(cand) >= 1:
+                            chosen_node = cand
+                            pair = [first]
+                            break
+                if not chosen_node:
+                    raise ValueError(
+                        "所有可用订阅节点均已达到每节点 2 个账号的注册上限（或已标记受限）！请先在「节点配额与解限」中主动解限，或切换新订阅节点。"
+                    )
+                chosen_px = explicit_proxy_url or (usage_map.get(chosen_node) or {}).get("proxy_url") or default_proxy_url
+                for ent in pair:
+                    same = _has_nr(ent["email"], chosen_node)
+                    _, chosen_px = self._reserve_node_slot(
+                        conn, ent["email"], chosen_node, chosen_px, default_proxy_url, usage_map, same
+                    )
+                return pair, chosen_node, chosen_px
+
+        # Branch C: not prev1
+        if second and prev2 and _can_reuse_prev_node(prev2, step2):
+            info2 = usage_map.get(prev2) or {}
+            is_blocked2 = bool(info2.get("blocked") and not info2.get("unlocked"))
+            needed_slots = 1 if _has_nr(second["email"], prev2) else 2
+            if not is_blocked2 and _free_slots(prev2) >= needed_slots:
+                px = explicit_proxy_url or prev2_px or info2.get("proxy_url") or default_proxy_url
+                has_nr2 = _has_nr(second["email"], prev2)
+                has_nr1 = _has_nr(first["email"], prev2)
+                _, px = self._reserve_node_slot(
+                    conn, second["email"], prev2, px, default_proxy_url, usage_map, is_same_email=has_nr2
+                )
+                _, px = self._reserve_node_slot(
+                    conn, first["email"], prev2, px, default_proxy_url, usage_map, is_same_email=has_nr1
+                )
+                return [first, second], prev2, px
 
         if env_nodes:
             blocked_regions = {
@@ -504,6 +653,22 @@ class WorkBuddyQueue:
         m = re.match(r"^([^\d\-#]+)", raw)
         return ((m.group(1).strip().rstrip("_") if m else raw[:6])).casefold()
 
+    @staticmethod
+    def _node_country_code(node_name: str) -> str:
+        raw = str(node_name or "").strip()
+        if not raw:
+            return ""
+        region_label = classify_node_region(raw)
+        for code in ("SG", "JP", "TW", "US", "HK", "KR"):
+            if f"({code})" in region_label:
+                return code
+        low = raw.lower()
+        if "🇬🇧" in raw or re.search(r"\b(uk|gb|united kingdom|britain|london)\b", low) or "英国" in raw:
+            return "UK"
+        if "🇩🇪" in raw or re.search(r"\b(de|germany|frankfurt)\b", low) or "德国" in raw:
+            return "DE"
+        return ""
+
     def _sync_account_step(
         self,
         account_id: int,
@@ -557,6 +722,8 @@ class WorkBuddyQueue:
             from src.proxy_service import activate_proxy_node
             env_nodes = self._healthy_env_nodes(env)
             max_preflight_tries = min(12, max(4, len(env_nodes)))
+            all_post_github = all(t["step"] != STEPS[0] for t in round_tasks)
+            orig_country = self._node_country_code(cur_node)
             for _ in range(max_preflight_tries):
                 try:
                     sw = activate_proxy_node("WorkBuddy", cur_px, cur_node, preflight=True)
@@ -566,7 +733,7 @@ class WorkBuddyQueue:
                 if (
                     isinstance(sw, dict)
                     and sw.get("ok")
-                    and not sw.get("restricted")
+                    and (not sw.get("restricted") or all_post_github)
                     and sw.get("reachable", True) is not False
                 ):
                     if sw.get("proxy_url") and sw["proxy_url"] != cur_px:
@@ -600,12 +767,20 @@ class WorkBuddyQueue:
                 }
                 if bad_region:
                     blocked_regions.add(bad_region)
-                candidates.sort(
-                    key=lambda c: (
-                        1 if self._node_region_key(c) in blocked_regions else 0,
-                        1 if (bad_region and self._node_region_key(c) == bad_region) else 0,
+                if all_post_github or any(t["step"] != STEPS[0] for t in round_tasks):
+                    candidates.sort(
+                        key=lambda c: (
+                            0 if (orig_country and self._node_country_code(c) == orig_country) else 1,
+                            1 if self._node_region_key(c) in blocked_regions else 0,
+                        )
                     )
-                )
+                else:
+                    candidates.sort(
+                        key=lambda c: (
+                            1 if self._node_region_key(c) in blocked_regions else 0,
+                            1 if (bad_region and self._node_region_key(c) == bad_region) else 0,
+                        )
+                    )
                 new_node = ""
                 for cand in candidates:
                     if not cand:

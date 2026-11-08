@@ -847,7 +847,7 @@ function renderWorkBuddyQuotaModal() {
       <div class="wb-quota-mode-option ${isAuto ? "active" : ""}" onclick="chooseWorkBuddyBatchNode('', '${escapeHtml(defaultPort)}')">
         <div>
           <strong>⚡ 自动轮换绑定订阅节点（推荐）</strong>
-          <p>批量启动时自动分配可用订阅节点，每个节点最多注册 2 个 GitHub + WorkBuddy 账号，满额自动切换下一节点。</p>
+          <p>优先检测历史注册记录：已有记录的邮箱自动沿用原节点/同国家 IP 继续注册（防止跨国切换封号）；全新邮箱自动分配干净节点，每节点限 2 个账号。</p>
         </div>
         <span class="wb-mode-check">${isAuto ? "✓ 当前生效" : "点击启用"}</span>
       </div>
