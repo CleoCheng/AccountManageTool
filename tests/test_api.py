@@ -65,6 +65,23 @@ def test_2fa_secret_auto_strip_spaces_and_uppercase(tmp_path: Path):
     assert saved["account"]["initial_secret_key"] == "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
 
 
+def test_domain_email_batch_import_uses_selected_category(tmp_path: Path):
+    api = AccountApi(data_dir=tmp_path / "data")
+
+    result = api.batch_import(
+        "mailbox01@other.example----PasswordOne\nmailbox02@other.example----PasswordTwo",
+        "域名邮箱",
+    )
+
+    assert result == {"ok": True, "imported": 2}
+    items = api.get_dashboard(account_type="域名邮箱")["accounts"]
+    assert [item["account"] for item in items] == [
+        "mailbox01@other.example",
+        "mailbox02@other.example",
+    ]
+    assert api.get_dashboard()["settings"]["domain_email_login_url"] == "https://mail.ggb6.com"
+
+
 def test_api_health_status_lifecycle_and_dashboard_filter(tmp_path: Path):
     data_dir = tmp_path / "data"
     api = AccountApi(data_dir=data_dir)

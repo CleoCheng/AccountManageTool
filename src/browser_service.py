@@ -1221,7 +1221,6 @@ def build_browser_launch_args(account: dict, profile_dir: str | Path, exe_path: 
         "--disable-background-networking",
         "--disable-component-update",
         "--disable-domain-reliability",
-        "--disable-blink-features=AutomationControlled",
         "--disk-cache-size=52428800",
         "--media-cache-size=20971520",
         "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",

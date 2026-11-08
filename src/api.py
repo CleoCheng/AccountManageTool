@@ -1,11 +1,13 @@
+import base64
 import json
 import time
 from pathlib import Path
 from src.browser_service import launch_isolated_browser
 from src.db_service import DatabaseService, compute_usage_info
-from src.parser import parse_account_text
+from src.parser import parse_account_text, parse_domain_email_file, parse_domain_email_text
 from src.proxy_service import detect_proxy_environment
 from src.totp_service import generate_totp, mask_secret, normalize_secret
+from src.workbuddy import WorkBuddyQueue
 
 
 DEFAULT_SETTINGS = {
@@ -14,16 +16,50 @@ DEFAULT_SETTINGS = {
     "default_account_type": "ChatGPT",
     "default_device_tag": "主机",
     "totp_interval": 30,
+    "domain_email_login_url": "https://mail.ggb6.com",
+    "last_filter_type": "All",
 }
 
 
 class AccountApi:
-    def __init__(self, data_dir: str | Path):
+    def __init__(self, data_dir: str | Path, auto_sync_account_data: bool = False):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.db = DatabaseService(self.data_dir / "accounts.db")
+        self._workbuddy = WorkBuddyQueue(self.db, self.data_dir)
         self.settings_path = self.data_dir / "settings.json"
         self._ensure_settings()
+        self.auto_sync_result: dict | None = None
+        if auto_sync_account_data:
+            self.auto_sync_result = self._auto_sync_account_data_silent()
+
+    def _auto_sync_account_data_silent(self) -> dict | None:
+        try:
+            folder = self.data_dir.parent / "accountData"
+            if not folder.exists() or not folder.is_dir():
+                return None
+            imported_total = 0
+            skipped_total = 0
+            files_scanned = 0
+            for p in sorted(folder.iterdir()):
+                if p.is_file() and p.suffix.lower() in (".xlsx", ".csv"):
+                    try:
+                        raw_bytes = p.read_bytes()
+                        recs = parse_domain_email_file(raw_bytes, filename=p.name)
+                        if recs:
+                            res = self.db.batch_import_domain_emails(recs)
+                            imported_total += res.get("imported", 0)
+                            skipped_total += res.get("skipped", 0)
+                        files_scanned += 1
+                    except Exception:
+                        continue
+            return {
+                "files_scanned": files_scanned,
+                "imported": imported_total,
+                "skipped": skipped_total,
+            }
+        except Exception:
+            return None
 
     def _ensure_settings(self) -> dict:
         if not self.settings_path.exists():
@@ -71,6 +107,7 @@ class AccountApi:
             "settings": settings,
             "dicts": dicts,
             "attributes": attributes,
+            "workbuddy": self._workbuddy.snapshot(),
             "server_time": now,
             "remaining": 30 - (now % 30),
         }
@@ -102,10 +139,13 @@ class AccountApi:
     def set_node_lock(self, account_id: int, locked: bool) -> dict:
         return self.db.set_account_node_lock(int(account_id), bool(locked))
 
-    def smart_parse(self, raw_text: str) -> dict:
+    def smart_parse(self, raw_text: str, account_type: str = "") -> dict:
         import re
         from src.parser import _is_likely_base32_secret
-        records = parse_account_text(raw_text)
+        try:
+            records = parse_domain_email_text(raw_text) if account_type == "域名邮箱" else parse_account_text(raw_text)
+        except ValueError as exc:
+            return {"records": [], "count": 0, "error": str(exc)}
         if not records and raw_text and raw_text.strip():
             stripped = raw_text.strip()
             m_new = re.match(r"^(?:新2FA|new\s*2fa)\s*[-|]*\s*(.+)$", stripped, flags=re.IGNORECASE)
@@ -217,6 +257,11 @@ class AccountApi:
         account = self.db.get_account(int(account_id))
         if not account:
             return {"ok": False, "error": "账号不存在"}
+        if account["account_type"] == "域名邮箱":
+            import webbrowser
+            from src.github_mail import MAIL_URL
+            opened = webbrowser.open(MAIL_URL)
+            return {"ok": opened, "mailbox": True, "error": "" if opened else "无法打开默认浏览器"}
         return bs.launch_isolated_browser(self.data_dir, account)
 
     def regenerate_fingerprint(self, account_id: int) -> dict:
@@ -225,12 +270,124 @@ class AccountApi:
             return {"ok": False, "error": "账号不存在"}
         return {"ok": True, "account": updated}
 
-    def batch_import(self, raw_text: str) -> dict:
-        records = parse_account_text(raw_text)
+    def batch_import(self, raw_text: str, account_type: str = "") -> dict:
+        try:
+            records = parse_domain_email_text(raw_text) if account_type == "域名邮箱" else parse_account_text(raw_text)
+        except ValueError as exc:
+            return {"ok": False, "imported": 0, "error": str(exc)}
         if not records:
             return {"ok": False, "imported": 0, "error": "未识别到有效账号数据"}
+        if account_type == "域名邮箱" or all(r.get("account_type") == "域名邮箱" for r in records):
+            res = self.db.batch_import_domain_emails(records)
+            out = {"ok": True, "imported": res["imported"]}
+            if res.get("skipped"):
+                out["skipped"] = res["skipped"]
+            return out
         count = self.db.batch_add_accounts(records)
         return {"ok": True, "imported": count}
+
+    def import_domain_email_file(self, base64_data: str, filename: str = "") -> dict:
+        raw_str = (base64_data or "").strip()
+        if not raw_str:
+            return {"ok": False, "imported": 0, "error": "文件内容为空"}
+        if "," in raw_str and raw_str.lower().startswith("data:"):
+            raw_str = raw_str.split(",", 1)[1]
+        try:
+            raw_bytes = base64.b64decode(raw_str)
+            records = parse_domain_email_file(raw_bytes, filename=filename)
+        except Exception as exc:
+            return {"ok": False, "imported": 0, "error": f"解析表格失败: {exc}"}
+        if not records:
+            return {"ok": False, "imported": 0, "error": "表格中未识别到有效的域名邮箱账号与密码"}
+        res = self.db.batch_import_domain_emails(records)
+        return {
+            "ok": True,
+            "imported": res["imported"],
+            "skipped": res["skipped"],
+            "total": len(records),
+            "filename": filename,
+        }
+
+    def import_account_data_files(self) -> dict:
+        folder = self.data_dir.parent / "accountData"
+        if not folder.is_dir():
+            return {"ok": False, "imported": 0, "error": f"未找到目录: {folder}"}
+        files = sorted(
+            [f for f in folder.iterdir() if f.is_file() and f.suffix.lower() in (".xlsx", ".csv")],
+            key=lambda x: x.name.lower(),
+        )
+        if not files:
+            return {"ok": False, "imported": 0, "error": "accountData 目录下未找到 .xlsx 或 .csv 文件"}
+        all_records: list[dict] = []
+        parsed_names: list[str] = []
+        for f in files:
+            try:
+                recs = parse_domain_email_file(f.read_bytes(), filename=f.name)
+                if recs:
+                    all_records.extend(recs)
+                    parsed_names.append(f.name)
+            except Exception as exc:
+                return {"ok": False, "imported": 0, "error": f"读取 {f.name} 失败: {exc}"}
+        if not all_records:
+            return {"ok": False, "imported": 0, "error": "accountData 表格中未发现有效邮箱数据"}
+        res = self.db.batch_import_domain_emails(all_records)
+        return {
+            "ok": True,
+            "imported": res["imported"],
+            "skipped": res["skipped"],
+            "total": len(all_records),
+            "files": parsed_names,
+        }
+
+    def get_workbuddy_queue(self) -> dict:
+        return self._workbuddy.snapshot()
+
+    def start_workbuddy_queue(
+        self,
+        account_ids: list[int],
+        proxy_url: str = "",
+        proxy_node: str = "",
+    ) -> dict:
+        return self._workbuddy.start(account_ids, proxy_url=proxy_url, proxy_node=proxy_node)
+
+    def workbuddy_action(self, task_id: int, revision: int, action: str, value: str = "") -> dict:
+        return self._workbuddy.action(task_id, revision, action, value)
+
+    def get_workbuddy_node_quotas(self) -> dict:
+        return self._workbuddy.get_node_quotas()
+
+    def set_workbuddy_node_unlock(self, node_name: str, unlocked: bool = True, proxy_url: str = "") -> dict:
+        return self._workbuddy.set_node_unlock(node_name, unlocked=bool(unlocked), proxy_url=proxy_url)
+
+    def reset_workbuddy_node_quota(self, node_name: str) -> dict:
+        return self._workbuddy.reset_node_quota(node_name)
+
+    def export_workbuddy_json(
+        self,
+        account_ids: list[int] | None = None,
+        save_to_account_data: bool = True,
+    ) -> dict:
+        res = self.db.export_workbuddy_credentials_json(account_ids)
+        if res.get("ok") and save_to_account_data:
+            try:
+                out_dir = self.data_dir.parent / "accountData"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                out_file = out_dir / "workbuddy-accounts-export.json"
+                out_file.write_text(res["json_text"], encoding="utf-8")
+                res["saved_path"] = str(out_file)
+            except Exception:
+                res["saved_path"] = ""
+        return res
+
+    def _shutdown(self) -> None:
+        try:
+            self._workbuddy.close()
+        finally:
+            try:
+                from src.sidecar_proxy import shutdown_sidecar_proxy
+                shutdown_sidecar_proxy()
+            except Exception:
+                pass
 
     def delete_account(self, account_id: int) -> dict:
         deleted = self.db.delete_account(int(account_id))

@@ -18,12 +18,14 @@ const state = {
   revealedFields: {}, // `${id}_${field}` -> boolean
   lastTotpSlot: Math.floor(Date.now() / 30000),
   parsedBatchRecords: [],
+  importAccountType: "",
   // Proxy Node Selector & Lock State
   proxyEnv: null,
   nodeModalAccountId: null,
   selectedRegion: "全部",
-  selectedProxyUrl: "http://127.0.0.1:17898",
+  selectedProxyUrl: "http://127.0.0.1:17899",
   selectedNodeName: "",
+  _initialFilterRestored: false,
   // System Settings State
   currentDictTab: "account_type",
   editingDictId: null,
@@ -34,6 +36,22 @@ async function callApi(method, ...args) {
     return await window.pywebview.api[method](...args);
   }
   throw new Error("pywebview API not ready");
+}
+
+function syncDomainEmailLoginHint(accountType) {
+  const hint = document.getElementById("domain-email-login-hint");
+  if (!hint) return;
+
+  const isDomainEmail = accountType === "域名邮箱";
+  hint.style.display = isDomainEmail ? "block" : "none";
+  if (!isDomainEmail) return;
+
+  const url = state.settings?.domain_email_login_url || "https://mail.ggb6.com";
+  const link = hint.querySelector("a");
+  if (link) {
+    link.href = url;
+    link.textContent = url.replace(/^https?:\/\//i, "");
+  }
 }
 
 function initApp() {
@@ -66,7 +84,16 @@ async function loadDashboard() {
       state.antigravityFilter,
       state.deviceFilter
     );
+    if (!state._initialFilterRestored) {
+      state._initialFilterRestored = true;
+      const savedFilter = data.settings?.last_filter_type;
+      if (savedFilter && savedFilter !== state.filterType) {
+        state.filterType = savedFilter;
+        return await loadDashboard();
+      }
+    }
     state.accounts = data.accounts || [];
+    updateWorkBuddyQueue(data.workbuddy);
     state.stats = data.stats || { total: 0, google: 0, chatgpt: 0, types: {}, devices: {}, other: 0, active: 0, deactivated: 0, available: 0, unavailable: 0, health: {}, antigravity: {} };
     if (data.dicts) {
       state.dicts = data.dicts;
@@ -296,6 +323,7 @@ function setFilterType(type) {
   syncCustomSelect(platSel);
   renderFilterDropdowns();
   syncTopBarPills();
+  callApi("save_settings", { last_filter_type: state.filterType }).catch(() => {});
   loadDashboard();
 }
 
@@ -574,6 +602,8 @@ function renderAccounts() {
     });
   }
 
+  renderWorkBuddyToolbar(accountsToDisplay);
+
   if (!accountsToDisplay || accountsToDisplay.length === 0) {
     container.innerHTML = "";
     emptyState.style.display = "block";
@@ -593,6 +623,28 @@ function renderAccounts() {
   container.innerHTML = accountsToDisplay
     .map((item) => renderCardItem(item, remaining))
     .join("");
+}
+
+
+function renderWorkBuddyItemBadges(item) {
+  if (!item) return "";
+  const cf = item.custom_fields || {};
+  const parts = [];
+  if (item.account_type === "域名邮箱") {
+    const done = cf.wb_reg_status === "已完成" || (typeof isWorkBuddyCompleted === "function" && isWorkBuddyCompleted(item));
+    if (done) {
+      parts.push('<span class="u-wb-badge wb-done" title="已完成 WorkBuddy 国际版注册">✅ 已完成注册</span>');
+    } else if (cf.wb_reg_status === "进行中") {
+      const stepTxt = cf.wb_reg_step_label ? ` · ${escapeHtml(cf.wb_reg_step_label)}` : "";
+      parts.push(`<span class="u-wb-badge wb-progress" title="注册进行中，支持勾选或从任务进度继续">🔄 进行中${stepTxt}</span>`);
+    } else {
+      parts.push('<span class="u-wb-badge wb-pending" title="尚未完成 WorkBuddy 国际版注册">⏳ 未完成注册</span>');
+    }
+  }
+  if (cf.wb_credential && cf.wb_credential.accessToken) {
+    parts.push('<span class="u-wb-badge wb-cred" title="已保存 WorkBuddy2API 登录凭据，可勾选导出 JSON">🔑 凭据已存</span>');
+  }
+  return parts.join("");
 }
 
 function renderCardItem(item, remaining) {
@@ -836,6 +888,7 @@ function renderCardItem(item, remaining) {
       <!-- Line 1: Header (Account Identity & 1-Click Health Status Badge) -->
       <div class="u-row-top">
         <div class="u-identity">
+          ${renderWorkBuddyCheckbox(item)}
           <span class="u-platform ${escapeHtml(item.account_type)}">${escapeHtml(item.account_type)}</span>
           <span class="u-fp-badge" title="${escapeHtml(fpInfo.tooltip)}">${escapeHtml(fpInfo.code)}</span>
           <span class="u-email" onclick="copyFieldValue(null, ${item.id}, 'account', '账号邮箱')" title="点击直接复制账号: ${escapeHtml(displayAcc)}">
@@ -858,7 +911,8 @@ function renderCardItem(item, remaining) {
           ${pwdFlagHtml}
           ${twofaFlagHtml}
         </div>
-        <div class="u-sec-right" style="display:flex;align-items:center;gap:6px;">
+        <div class="u-sec-right" style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+          ${renderWorkBuddyItemBadges(item)}
           ${showDevBadge ? devBadgeHtml : ""}
           ${showAgBadge ? agBadgeHtml : ""}
         </div>
@@ -1040,6 +1094,7 @@ function renderTableView(remaining, list = state.accounts) {
         <tr class="ag-row-${showAgBadge ? agMeta.key : "none"}">
           <td>
             <div class="tb-col-platform">
+              ${renderWorkBuddyCheckbox(item)}
               <span class="tb-idx">${idx + 1}</span>
               <span class="u-platform ${escapeHtml(item.account_type)}">${escapeHtml(item.account_type)}</span>
             </div>
@@ -1061,6 +1116,7 @@ function renderTableView(remaining, list = state.accounts) {
           </td>
           <td>
             <div class="tb-col-status">
+              ${renderWorkBuddyItemBadges(item)}
               ${showDevBadge ? devBadgeTableHtml : ""}
               ${healthBadgeHtml}
             </div>
@@ -1137,6 +1193,10 @@ async function onClickLaunchBrowser(accountId, btnEl = null) {
   const item = state.accounts.find((a) => a.id === accountId);
   if (!item) return;
   const fp = item.fp_config || {};
+  if (item.account_type === "域名邮箱") {
+    await executeLaunchBrowser(accountId, btnEl);
+    return;
+  }
   // If account hasn't locked/bound a node yet, open the Node Selector & Lock modal first!
   if (!fp.proxy_node && !fp.node_locked) {
     await openNodeModal(accountId);
@@ -1152,11 +1212,15 @@ async function executeLaunchBrowser(accountId, btnEl = null) {
     btnEl.disabled = true;
     btnEl.innerHTML = "<span>🚀 正在启动...</span>";
   }
-  showToast("🚀 正在配置独立指纹环境并启动浏览器...", 2800);
+  showToast("正在打开浏览器...", 2800);
 
   try {
     const res = await callApi("launch_browser", accountId);
     if (res && res.ok) {
+      if (res.mailbox) {
+        showToast("已在默认浏览器打开域名邮箱");
+        return;
+      }
       const fp = res.fp_config || {};
       const nodeStr = fp.proxy_node ? ` · 节点:${fp.proxy_node}` : "";
       showToast(`🌐 已启动 [${fp.profile_code || "FP"}] (${fp.gpu_short || "GPU"}${nodeStr}) · 自动登录助手已就绪`);
@@ -1687,7 +1751,8 @@ function openAddModal() {
   resetFeedbackText();
   resetFormFields();
 
-  const defType = state.settings?.default_account_type || "ChatGPT";
+  const defType = state.filterType === "域名邮箱" ? "域名邮箱" : (state.settings?.default_account_type || "ChatGPT");
+  state.importAccountType = defType === "域名邮箱" ? defType : "";
   syncAccountTypeRadios(defType);
   renderAccountModalDynamicFields(defType, {
     health_status: "可用",
@@ -1709,6 +1774,7 @@ function openEditModal(accountId) {
   resetFeedbackText();
 
   document.getElementById("field-id").value = item.id;
+  state.importAccountType = item.account_type === "域名邮箱" ? item.account_type : "";
   syncAccountTypeRadios(item.account_type || "ChatGPT");
   renderAccountModalDynamicFields(item.account_type || "ChatGPT", {
     health_status: item.health_status,
@@ -1848,7 +1914,9 @@ function normalizeSecretString(val) {
   return String(val || "").replace(/[\s\-]+/g, "").toUpperCase();
 }
 
+let smartParseRevision = 0;
 async function onSmartPasteInput(rawText) {
+  const revision = ++smartParseRevision;
   const fb = document.getElementById("smart-parse-feedback");
   const batchBanner = document.getElementById("batch-banner");
 
@@ -1860,7 +1928,8 @@ async function onSmartPasteInput(rawText) {
   }
 
   try {
-    const res = await callApi("smart_parse", rawText);
+    const res = await callApi("smart_parse", rawText, state.importAccountType);
+    if (revision !== smartParseRevision) return;
     if (res && res.only_secret) {
       batchBanner.style.display = "none";
       const sObj = res.only_secret;
@@ -1889,7 +1958,7 @@ async function onSmartPasteInput(rawText) {
     if (records.length === 0) {
       batchBanner.style.display = "none";
       fb.className = "smart-parse-feedback";
-      fb.textContent = "未识别到标准分隔格式，请在下方手动填写或检查粘贴内容";
+      fb.textContent = res.error || "未识别到标准分隔格式，请在下方手动填写或检查粘贴内容";
       return;
     }
 
@@ -1974,7 +2043,7 @@ async function submitAccountForm(e) {
   const dynVals = getCurrentDynamicFormValues();
   const custom_fields = {};
   (state.attributes || []).forEach((attr) => {
-    if (!attr.is_system && dynVals[attr.attr_key] !== undefined) {
+    if (!["health_status", "device_tag", "antigravity_tier"].includes(attr.attr_key) && dynVals[attr.attr_key] !== undefined) {
       custom_fields[attr.attr_key] = dynVals[attr.attr_key];
     }
   });
@@ -1989,7 +2058,7 @@ async function submitAccountForm(e) {
     password_modified: document.getElementById("field-password-modified").checked ? 1 : 0,
     twofa_modified: document.getElementById("field-twofa-modified").checked ? 1 : 0,
     account: document.getElementById("field-account").value.trim(),
-    password: document.getElementById("field-password").value.trim(),
+    password: accType === "域名邮箱" ? document.getElementById("field-password").value : document.getElementById("field-password").value.trim(),
     secret_key: normalizeSecretString(document.getElementById("field-secret").value),
     initial_secret_key: normalizeSecretString(document.getElementById("field-initial-secret").value),
     purchase_date: document.getElementById("field-purchase-date").value.trim(),
@@ -2019,7 +2088,7 @@ async function confirmBatchImport() {
   const rawText = document.getElementById("smart-paste-input").value;
   if (!rawText.trim()) return;
   try {
-    const res = await callApi("batch_import", rawText);
+    const res = await callApi("batch_import", rawText, state.importAccountType);
     if (res.ok) {
       closeAccountModal();
       showToast(`✓ 成功批量导入 ${res.imported} 条账号记录`);
@@ -2049,6 +2118,12 @@ async function confirmDeleteAccount(accountId) {
 // Export Modal
 async function openExportModal() {
   try {
+    const titleEl = document.getElementById("export-modal-title");
+    const subEl = document.getElementById("export-modal-sub");
+    const dlBtn = document.getElementById("btn-download-export-json");
+    if (titleEl) titleEl.textContent = "导出账号备份";
+    if (subEl) subEl.textContent = "已按原标准 `----` 分隔格式还原，可直接复制备份";
+    if (dlBtn) dlBtn.style.display = "none";
     const res = await callApi("export_text", state.filterType);
     document.getElementById("export-textarea").value = res.text || "";
     document.getElementById("export-modal").style.display = "flex";
@@ -2162,6 +2237,7 @@ function renderDictPane(dictType) {
     device_tag: "📱 设备标记字典表",
     health_status: "🟢 可用状态字典表",
     antigravity_tier: "💎 Pro 选项字典表",
+    wb_reg_status: "💼 WorkBuddy 注册状态字典表",
   };
   const subs = {
     account_type: "配置支持的账号平台（如 ChatGPT, Google, WorkBuddy, Qcoder 等）",
@@ -2852,6 +2928,7 @@ function syncAccountTypeRadios(selectedType = "ChatGPT") {
           { dict_key: "ChatGPT", dict_label: "ChatGPT", color_class: "chatgpt", icon: "🤖" },
           { dict_key: "Google", dict_label: "Google", color_class: "google", icon: "🔍" },
           { dict_key: "WorkBuddy", dict_label: "WorkBuddy", color_class: "workbuddy", icon: "💼" },
+          { dict_key: "域名邮箱", dict_label: "域名邮箱", color_class: "domain-email", icon: "✉️" },
           { dict_key: "Qcoder", dict_label: "Qcoder", color_class: "qcoder", icon: "⚡" },
         ];
 
@@ -2873,6 +2950,8 @@ function syncAccountTypeRadios(selectedType = "ChatGPT") {
       `;
     })
     .join("");
+
+  syncDomainEmailLoginHint(selectedType);
 }
 
 function renderAccountModalDynamicFields(accountType, currentValues = {}) {
@@ -3043,13 +3122,17 @@ function getCurrentDynamicFormValues() {
 function onAccountTypeRadioChange(newType) {
   const currentValues = getCurrentDynamicFormValues();
   renderAccountModalDynamicFields(newType, currentValues);
+  syncDomainEmailLoginHint(newType);
+  state.importAccountType = newType === "域名邮箱" ? newType : "";
+  const raw = document.getElementById("smart-paste-input").value;
+  if (raw.trim()) onSmartPasteInput(raw);
 }
 
 function renderCustomDrawerRows(item) {
   if (!item || !item.custom_fields) return "";
   const rows = [];
   (state.attributes || []).forEach((attr) => {
-    if (!attr.is_system && isAttributeApplicable(attr, item.account_type)) {
+    if (!["health_status", "device_tag", "antigravity_tier"].includes(attr.attr_key) && isAttributeApplicable(attr, item.account_type)) {
       const val = item.custom_fields[attr.attr_key];
       if (val) {
         rows.push(`

@@ -1,4 +1,4 @@
-from src.parser import parse_account_text, normalize_date_str
+from src.parser import parse_account_text, parse_domain_email_file, normalize_date_str
 
 
 def test_parse_chatgpt_3_field():
@@ -13,6 +13,15 @@ def test_parse_chatgpt_3_field():
     assert item["initial_secret_key"] == ""
     assert item["twofa_modified"] == 0
     assert item["recovery_email"] == ""
+
+
+def test_parse_domain_email_credentials():
+    items = parse_account_text("mailbox01@ggb6.com----MailboxPass#2026!")
+    assert len(items) == 1
+    item = items[0]
+    assert item["account_type"] == "域名邮箱"
+    assert item["account"] == "mailbox01@ggb6.com"
+    assert item["password"] == "MailboxPass#2026!"
 
 
 def test_parse_google_6_field_with_line_wrap():
@@ -154,3 +163,65 @@ Device-PC
     assert item["secret_key"] == "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
     assert item["twofa_modified"] == 1
     assert item["note"] == "Device-PC"
+
+
+def test_parse_ggb6_csv_and_xlsx_default_unfinished_status():
+    import io
+    import zipfile
+
+    csv_raw = (
+        "email,password,name,webmail\r\n"
+        "liam.simpson@ggb6.com,Pass#2026!,Liam Simpson,https://mail.ggb6.com\r\n"
+    ).encode("utf-8-sig")
+    csv_items = parse_domain_email_file(csv_raw, filename="ggb6-mailboxes.csv")
+    assert len(csv_items) == 1
+    assert csv_items[0]["account_type"] == "域名邮箱"
+    assert csv_items[0]["account"] == "liam.simpson@ggb6.com"
+    assert csv_items[0]["password"] == "Pass#2026!"
+    assert csv_items[0]["note"] == "Liam Simpson"
+    assert csv_items[0]["custom_fields"]["wb_reg_status"] == "未完成"
+    assert csv_items[0]["custom_fields"]["webmail"] == "https://mail.ggb6.com"
+
+    # Build minimal valid .xlsx workbook in memory
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(
+            "xl/sharedStrings.xml",
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            "<si><t>email</t></si>"
+            "<si><t>password</t></si>"
+            "<si><t>name</t></si>"
+            "<si><t>webmail</t></si>"
+            "<si><t>emma.stone@ggb6.com</t></si>"
+            "<si><t>ExcelPass#99</t></si>"
+            "<si><t>Emma Stone</t></si>"
+            "<si><t>https://mail.ggb6.com</t></si>"
+            "</sst>",
+        )
+        zf.writestr(
+            "xl/worksheets/sheet1.xml",
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            "<sheetData>"
+            '<row r="1">'
+            '<c r="A1" t="s"><v>0</v></c>'
+            '<c r="B1" t="s"><v>1</v></c>'
+            '<c r="C1" t="s"><v>2</v></c>'
+            '<c r="D1" t="s"><v>3</v></c>'
+            "</row>"
+            '<row r="2">'
+            '<c r="A2" t="s"><v>4</v></c>'
+            '<c r="B2" t="s"><v>5</v></c>'
+            '<c r="C2" t="s"><v>6</v></c>'
+            '<c r="D2" t="s"><v>7</v></c>'
+            "</row>"
+            "</sheetData></worksheet>",
+        )
+    xlsx_items = parse_domain_email_file(buf.getvalue(), filename="mailboxes.xlsx")
+    assert len(xlsx_items) == 1
+    assert xlsx_items[0]["account_type"] == "域名邮箱"
+    assert xlsx_items[0]["account"] == "emma.stone@ggb6.com"
+    assert xlsx_items[0]["password"] == "ExcelPass#99"
+    assert xlsx_items[0]["note"] == "Emma Stone"
+    assert xlsx_items[0]["custom_fields"]["wb_reg_status"] == "未完成"

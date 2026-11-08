@@ -53,11 +53,12 @@ def main() -> None:
     data_dir.mkdir(parents=True, exist_ok=True)
     runtime_dir.mkdir(parents=True, exist_ok=True)
 
-    api = AccountApi(data_dir=data_dir)
+    api = AccountApi(data_dir=data_dir, auto_sync_account_data=True)
 
     if "--verify-init" in sys.argv:
         dash = api.get_dashboard()
         print(f"OK: data_dir={data_dir} total_accounts={dash['stats']['total']}")
+        api._shutdown()
         return
 
     title = "KeyVault · 全平台账号与凭据管家"
@@ -75,11 +76,14 @@ def main() -> None:
 
     window.events.shown += lambda: set_windows_app_icon(title, icon_path)
 
-    webview.start(
-        private_mode=False,
-        storage_path=str(runtime_dir),
-        debug=False,
-    )
+    try:
+        webview.start(
+            private_mode=False,
+            storage_path=str(runtime_dir),
+            debug=False,
+        )
+    finally:
+        api._shutdown()
 
 
 if __name__ == "__main__":

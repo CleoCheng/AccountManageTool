@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>KeyVault · 全平台账号与凭据管家</title>
-  <link rel="stylesheet" href="style.css" />
+  <link rel="stylesheet" href="style.css?v=20261105_2" />
 </head>
 <body>
   <div class="app-shell">
@@ -159,6 +159,25 @@
 
     <!-- Main Account List Container -->
     <main class="content-area">
+      <section id="workbuddy-toolbar" class="workbuddy-toolbar" style="display: none;" aria-label="员工开户">
+        <input type="file" id="domain-email-file-input" accept=".xlsx,.csv" style="display: none;" onchange="onDomainEmailFileSelected(this)" />
+        <label class="workbuddy-check">
+          <input type="checkbox" id="workbuddy-select-all" onchange="selectAllWorkBuddy(this.checked)" />
+          全选当前结果
+        </label>
+        <span id="workbuddy-selected-count">已选 0 个邮箱</span>
+        <button type="button" class="btn btn-ghost btn-xs" id="workbuddy-pick-2" onclick="quickSelectPendingWorkBuddy(2)" title="一键勾选前 2 个待注册邮箱（刚好开启 1 轮双指纹浏览器）">⚡ 勾选2个待注册</button>
+        <button type="button" class="btn btn-ghost btn-xs" id="workbuddy-pick-10" onclick="quickSelectPendingWorkBuddy(10)" title="一键勾选前 10 个待注册邮箱（自动分 5 轮双浏览器注册）">⚡ 勾选10个待注册</button>
+        <span class="workbuddy-toolbar-actions">
+          <button class="btn btn-ghost" id="workbuddy-import-folder" onclick="importAccountDataFolder()" title="一键读取并导入 accountData 目录下的 Excel/CSV 邮箱表格">📥 导入 accountData</button>
+          <button class="btn btn-ghost" id="workbuddy-import-excel" onclick="triggerDomainEmailFileSelect()" title="选择本地 .xlsx 或 .csv 域名邮箱文件导入">📂 导入 Excel/CSV</button>
+          <button class="btn btn-secondary" id="workbuddy-quota-btn" onclick="openWorkBuddyQuotaModal()" title="配置订阅节点绑定策略与每节点 2 账号配额解限">🌐 节点配额与解限</button>
+          <button class="btn btn-secondary" id="workbuddy-export-cred" onclick="exportSelectedWorkBuddyJson()" title="勾选导出兼容 WorkBuddy2API 的登录凭据 JSON">📤 导出全部凭据 (JSON)</button>
+          <button class="btn btn-secondary" id="workbuddy-progress" onclick="openWorkBuddyModal()" style="display: none;">查看任务进度</button>
+          <button class="btn btn-primary" id="workbuddy-start" onclick="startWorkBuddyQueue()" disabled>批量注册WorkBuddy</button>
+        </span>
+        <p>每次启动分配全新临时指纹浏览器并绑定订阅节点（每节点限注册 2 个，用完即销毁） · 注册完成自动保存 WorkBuddy2API 登录凭据</p>
+      </section>
       <div id="accounts-container" class="accounts-grid"></div>
 
       <!-- Empty State -->
@@ -175,13 +194,26 @@
     </main>
   </div>
 
+  <div class="modal-backdrop" id="workbuddy-modal" style="display: none;">
+    <section class="modal-card" role="dialog" aria-modal="true" aria-labelledby="workbuddy-title">
+      <div class="modal-header">
+        <div>
+          <h2 id="workbuddy-title">WorkBuddy 员工开户</h2>
+          <p class="modal-subtitle">在工作窗口处理官方页面，回到这里确认结果。收起后可从任务进度继续。</p>
+        </div>
+        <button class="modal-close" onclick="closeWorkBuddyModal()" aria-label="收起任务窗口">×</button>
+      </div>
+      <div class="modal-body" id="workbuddy-body"></div>
+    </section>
+  </div>
+
   <!-- Add / Edit Account Modal -->
   <div class="modal-backdrop" id="account-modal" style="display: none;">
     <div class="modal-card">
       <div class="modal-header">
         <div>
           <h2 id="modal-title">添加账号 · 智能快递式识别</h2>
-          <p class="modal-subtitle">支持粘贴 3段式 (ChatGPT)、6段式 (Google) 或带日期/新2FA的多行块，系统自动拆解填入下方表单</p>
+          <p class="modal-subtitle">域名邮箱支持 账号----密码，每行一个。也支持 ChatGPT、Google 和带日期/新2FA 的多行块。</p>
         </div>
         <button class="modal-close" onclick="closeAccountModal()">×</button>
       </div>
@@ -197,6 +229,7 @@
               智能识别粘贴区（类似快递地址智能填写）
             </span>
             <div class="smart-paste-actions">
+              <button type="button" class="btn-link" onclick="triggerDomainEmailFileSelect()">📂 选择 Excel/CSV 表格导入</button>
               <button type="button" class="btn-link" onclick="pasteFromClipboard()">从剪贴板粘贴并识别</button>
               <button type="button" class="btn-link text-muted" onclick="clearSmartPaste()">清空识别框</button>
             </div>
@@ -246,6 +279,10 @@
                   <span class="radio-pill">WorkBuddy</span>
                 </label>
                 <label class="type-radio">
+                  <input type="radio" name="account_type" value="域名邮箱" id="type-domain-email" />
+                  <span class="radio-pill">✉️ 域名邮箱</span>
+                </label>
+                <label class="type-radio">
                   <input type="radio" name="account_type" value="Qcoder" id="type-qcoder" />
                   <span class="radio-pill">Qcoder</span>
                 </label>
@@ -277,6 +314,10 @@
             <div class="form-group">
               <label for="field-account">主账号 / 登录邮箱 <span class="req">*</span></label>
               <input type="text" id="field-account" required placeholder="例如: example@icloud.com" />
+              <span class="field-hint" id="domain-email-login-hint" style="display: none;">
+                域名邮箱登录地址为
+                <a href="https://mail.ggb6.com" target="_blank" rel="noopener noreferrer">mail.ggb6.com</a>
+              </span>
             </div>
 
             <div class="form-group">
@@ -368,17 +409,35 @@
     <div class="modal-card modal-sm">
       <div class="modal-header">
         <div>
-          <h2>导出账号备份</h2>
-          <p class="modal-subtitle">已按原标准 `----` 分隔格式还原，可直接复制备份</p>
+          <h2 id="export-modal-title">导出账号备份</h2>
+          <p class="modal-subtitle" id="export-modal-sub">已按原标准 `----` 分隔格式还原，可直接复制备份</p>
         </div>
         <button class="modal-close" onclick="closeExportModal()">×</button>
       </div>
       <div class="modal-body">
-        <textarea id="export-textarea" rows="10" readonly></textarea>
+        <textarea id="export-textarea" rows="12" readonly></textarea>
         <div class="modal-footer">
           <button type="button" class="btn btn-ghost" onclick="closeExportModal()">关闭</button>
+          <button type="button" class="btn btn-secondary" id="btn-download-export-json" onclick="downloadExportJsonFile()" style="display: none;">💾 下载 JSON 文件</button>
           <button type="button" class="btn btn-primary" onclick="copyExportText()">一键复制全部导出内容</button>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- WorkBuddy Subscription Node Quota & Unlock Modal -->
+  <div class="modal-backdrop" id="workbuddy-quota-modal" style="display: none;" onclick="if(event.target === this) closeWorkBuddyQuotaModal()">
+    <div class="modal-card" onclick="event.stopPropagation()">
+      <div class="modal-header">
+        <div>
+          <h2>订阅节点绑定与配额解限</h2>
+          <p class="modal-subtitle">每个订阅节点最多注册 2 个 GitHub 与 WorkBuddy 国际版账号；达到上限后未主动解限禁止复用</p>
+        </div>
+        <button class="modal-close" onclick="closeWorkBuddyQuotaModal()">×</button>
+      </div>
+      <div class="modal-body" id="workbuddy-quota-body"></div>
+      <div class="modal-footer" style="padding: 12px 20px; border-top: 1px solid rgba(255,255,255,0.08);">
+        <button type="button" class="btn btn-primary" onclick="closeWorkBuddyQuotaModal()">完成</button>
       </div>
     </div>
   </div>
@@ -775,6 +834,7 @@
   </div>
 
 
-  <script src="app.js"></script>
+  <script src="app.js?v=20261105_2"></script>
+  <script src="workbuddy.js?v=20261105_2"></script>
 </body>
 </html>

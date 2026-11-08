@@ -1,4 +1,6 @@
 import re
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from datetime import date, datetime
 import json
 import sqlite3
@@ -21,6 +23,7 @@ VALID_DEVICE_TAGS = ["主机", "iPhone", "Pad"]
 DEFAULT_ATTRIBUTES = [
     # (attr_key, attr_label, attr_type, bound_platforms, dict_type, sort_order, is_system, is_required, is_filter)
     ("health_status", "可用状态", "select", "All", "health_status", 10, 1, 1, 1),
+    ("wb_reg_status", "WorkBuddy注册", "select", '["域名邮箱"]', "wb_reg_status", 15, 1, 0, 1),
     ("device_tag", "设备标记", "select", '["Google"]', "device_tag", 20, 1, 0, 1),
     ("antigravity_tier", "Pro 选项", "select", '["Google"]', "antigravity_tier", 30, 1, 0, 1),
 ]
@@ -30,7 +33,8 @@ DEFAULT_DICTS = [
     ("account_type", "ChatGPT", "ChatGPT", "ChatGPT", "chatgpt", "🤖", 1, 1, 1),
     ("account_type", "Google", "Google", "Google", "google", "🔍", 2, 0, 1),
     ("account_type", "WorkBuddy", "WorkBuddy", "WorkBuddy", "workbuddy", "💼", 3, 0, 0),
-    ("account_type", "Qcoder", "Qcoder", "Qcoder", "qcoder", "⚡", 4, 0, 0),
+    ("account_type", "域名邮箱", "域名邮箱", "https://mail.ggb6.com", "domain-email", "✉️", 4, 0, 1),
+    ("account_type", "Qcoder", "Qcoder", "Qcoder", "qcoder", "⚡", 5, 0, 0),
     # 设备标记
     ("device_tag", "主机", "主机", "主机", "host", "🖥️", 1, 1, 1),
     ("device_tag", "iPhone", "iPhone", "iPhone", "iphone", "📱", 2, 0, 1),
@@ -46,6 +50,10 @@ DEFAULT_DICTS = [
     ("antigravity_tier", "无", "无", "无", "none", "⚪", 1, 1, 1),
     ("antigravity_tier", "蓝色Pro", "Pro", "蓝色Pro", "blue", "💎", 2, 0, 1),
     ("antigravity_tier", "金色Pro", "Pro", "金色Pro", "gold", "👑", 3, 0, 1),
+    # 域名邮箱 WorkBuddy 注册状态
+    ("wb_reg_status", "未完成", "未完成", "未完成", "wb-pending", "⏳", 1, 1, 1),
+    ("wb_reg_status", "进行中", "进行中", "进行中", "wb-progress", "🔄", 2, 0, 1),
+    ("wb_reg_status", "已完成", "已完成", "已完成", "wb-done", "✅", 3, 0, 1),
 ]
 
 
@@ -97,12 +105,13 @@ class DatabaseService:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        return conn
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            yield conn
 
     def _init_db(self) -> None:
         with self._connect() as conn:
@@ -279,6 +288,11 @@ class DatabaseService:
             item["custom_fields"] = json.loads(raw_cf) if isinstance(raw_cf, str) else (raw_cf or {})
         except Exception:
             item["custom_fields"] = {}
+        if not isinstance(item["custom_fields"], dict):
+            item["custom_fields"] = {}
+        if item.get("account_type") == "域名邮箱":
+            if item["custom_fields"].get("wb_reg_status") not in ("已完成", "进行中", "未完成"):
+                item["custom_fields"]["wb_reg_status"] = "未完成"
 
         raw_fp = item.get("fp_config_json") or ""
         try:
@@ -364,7 +378,9 @@ class DatabaseService:
 
         device_tag = (data.get("device_tag") or "主机").strip()
         account = (data.get("account") or "").strip()
-        password = (data.get("password") or "").strip()
+        password = data.get("password") or ""
+        if account_type != "域名邮箱":
+            password = password.strip()
         password_modified = 1 if data.get("password_modified") in (1, True, "1", "true") else 0
         recovery_email = (data.get("recovery_email") or "").strip()
         secret_key = normalize_secret(data.get("secret_key") or "")
@@ -379,11 +395,18 @@ class DatabaseService:
         note = (data.get("note") or "").strip()
         raw_custom = data.get("custom_fields")
         if isinstance(raw_custom, dict):
-            custom_fields_json = json.dumps(raw_custom, ensure_ascii=False)
+            cf_dict = dict(raw_custom)
         elif isinstance(data.get("custom_fields_json"), str) and data.get("custom_fields_json").strip():
-            custom_fields_json = data.get("custom_fields_json").strip()
+            try:
+                parsed_cf = json.loads(data.get("custom_fields_json").strip())
+                cf_dict = dict(parsed_cf) if isinstance(parsed_cf, dict) else {}
+            except Exception:
+                cf_dict = {}
         else:
-            custom_fields_json = "{}"
+            cf_dict = {}
+        if account_type == "域名邮箱" and cf_dict.get("wb_reg_status") not in ("已完成", "未完成"):
+            cf_dict["wb_reg_status"] = "未完成"
+        custom_fields_json = json.dumps(cf_dict, ensure_ascii=False)
         return (
             account_type,
             health_status,
@@ -461,7 +484,10 @@ class DatabaseService:
         merged = dict(existing)
         merged.update(data)
         if "custom_fields" in data:
-            merged["custom_fields"] = data["custom_fields"]
+            if isinstance(data["custom_fields"], dict):
+                merged["custom_fields"] = {**(existing.get("custom_fields") or {}), **data["custom_fields"]}
+            else:
+                merged["custom_fields"] = data["custom_fields"]
             merged.pop("custom_fields_json", None)
         elif "custom_fields_json" in data:
             merged["custom_fields_json"] = data["custom_fields_json"]
@@ -962,3 +988,289 @@ class DatabaseService:
                 (bound_str, int(attr_id)),
             )
         return {"ok": True, "attribute": self.get_attribute(int(attr_id))}
+
+    # -------------------------------------------------------------
+    # Domain Email Import, WorkBuddy Registration Status & JSON Export
+    # -------------------------------------------------------------
+    def batch_import_domain_emails(self, items: list[dict]) -> dict:
+        imported = 0
+        skipped = 0
+        with self._connect() as conn:
+            existing_emails = {
+                (r["account"] or "").strip().casefold()
+                for r in conn.execute(
+                    "SELECT account FROM accounts WHERE account_type = '域名邮箱'"
+                ).fetchall()
+            }
+            for data in items:
+                account = (data.get("account") or "").strip()
+                if not account:
+                    continue
+                key = account.casefold()
+                if key in existing_emails:
+                    skipped += 1
+                    continue
+                existing_emails.add(key)
+                row_data = dict(data)
+                row_data["account_type"] = "域名邮箱"
+                fields = self._prepare_fields(row_data)
+                cur = conn.execute(
+                    """
+                    INSERT INTO accounts (
+                        account_type, health_status, antigravity_tier, device_tag, account, password, password_modified, recovery_email,
+                        secret_key, initial_secret_key, twofa_modified,
+                        purchase_date, deactivated_date, reg_year, reg_region, note, custom_fields_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    fields,
+                )
+                new_id = cur.lastrowid
+                fp = generate_fingerprint_config(new_id, account)
+                conn.execute(
+                    "UPDATE accounts SET fp_config_json = ? WHERE id = ?",
+                    (json.dumps(fp, ensure_ascii=False), new_id),
+                )
+                imported += 1
+        return {"imported": imported, "skipped": skipped}
+
+    def save_workbuddy_credential(self, account_id: int, credential: dict) -> dict | None:
+        existing = self.get_account(int(account_id))
+        if not existing or not isinstance(credential, dict):
+            return existing
+        cf = dict(existing.get("custom_fields") or {})
+        cf["wb_credential"] = credential
+        if credential.get("uid"):
+            cf["wb_uid"] = str(credential["uid"])
+        updated = self.update_account(int(account_id), {"custom_fields": cf})
+        # Sync linked WorkBuddy record if present
+        if existing.get("account_type") == "域名邮箱":
+            with self._connect() as conn:
+                wb_row = conn.execute(
+                    "SELECT id FROM accounts WHERE account_type = 'WorkBuddy' AND LOWER(account) = LOWER(?)",
+                    (existing["account"],),
+                ).fetchone()
+            if wb_row:
+                wb_acc = self.get_account(wb_row["id"])
+                if wb_acc:
+                    wb_cf = dict(wb_acc.get("custom_fields") or {})
+                    wb_cf["wb_credential"] = credential
+                    if credential.get("uid"):
+                        wb_cf["wb_uid"] = str(credential["uid"])
+                    self.update_account(wb_row["id"], {"custom_fields": wb_cf})
+        return updated
+
+    def update_workbuddy_progress(
+        self,
+        account_id: int,
+        step: str,
+        step_label: str = "",
+        username: str = "",
+        proxy_url: str = "",
+        proxy_node: str = "",
+    ) -> dict | None:
+        existing = self.get_account(int(account_id))
+        if not existing:
+            return None
+        cf = dict(existing.get("custom_fields") or {})
+        if cf.get("wb_reg_status") == "已完成":
+            return existing
+
+        cf["wb_reg_status"] = "进行中"
+        cf["wb_reg_step"] = str(step or "")
+        cf["wb_reg_step_label"] = str(step_label or step or "")
+        if username:
+            cf["github_username"] = str(username)
+        if proxy_node:
+            cf["proxy_node"] = str(proxy_node)
+
+        upd_payload: dict = {"custom_fields": cf}
+        if proxy_url:
+            upd_payload["proxy"] = proxy_url
+        if proxy_node:
+            upd_payload["proxy_node"] = proxy_node
+        return self.update_account(int(account_id), upd_payload)
+
+    def mark_workbuddy_registered(
+        self,
+        account_id: int,
+        username: str,
+        region: str = "",
+        credential: dict | None = None,
+        proxy_url: str = "",
+        proxy_node: str = "",
+    ) -> dict | None:
+        existing = self.get_account(int(account_id))
+        if not existing:
+            return None
+        cf = dict(existing.get("custom_fields") or {})
+        cf["wb_reg_status"] = "已完成"
+        cf.pop("wb_reg_step", None)
+        cf.pop("wb_reg_step_label", None)
+        cf["github_username"] = username
+        if region:
+            cf["wb_region"] = region
+        if proxy_node:
+            cf["proxy_node"] = proxy_node
+        if isinstance(credential, dict) and credential:
+            cf["wb_credential"] = credential
+            if credential.get("uid"):
+                cf["wb_uid"] = str(credential["uid"])
+
+        upd_payload: dict = {"custom_fields": cf}
+        if region:
+            upd_payload["reg_region"] = region
+        if proxy_url:
+            upd_payload["proxy"] = proxy_url
+        if proxy_node:
+            upd_payload["proxy_node"] = proxy_node
+        updated_mail = self.update_account(int(account_id), upd_payload)
+
+        # Also upsert a paired WorkBuddy account entry so it appears in WorkBuddy platform list
+        wb_cf = {
+            "wb_reg_status": "已完成",
+            "github_username": username,
+            "source_email_id": int(account_id),
+        }
+        if region:
+            wb_cf["wb_region"] = region
+        if proxy_node:
+            wb_cf["proxy_node"] = proxy_node
+        if isinstance(credential, dict) and credential:
+            wb_cf["wb_credential"] = credential
+            if credential.get("uid"):
+                wb_cf["wb_uid"] = str(credential["uid"])
+
+        note_parts = [f"GitHub: {username}"]
+        if isinstance(credential, dict) and credential.get("uid"):
+            note_parts.append(f"UID: {credential['uid']}")
+        if proxy_node:
+            note_parts.append(f"节点: {proxy_node}")
+        wb_note = " | ".join(note_parts)
+
+        with self._connect() as conn:
+            wb_row = conn.execute(
+                "SELECT id FROM accounts WHERE account_type = 'WorkBuddy' AND LOWER(account) = LOWER(?)",
+                (existing["account"],),
+            ).fetchone()
+
+        if wb_row:
+            prev_wb = self.get_account(wb_row["id"]) or {}
+            merged_wb_cf = {**(prev_wb.get("custom_fields") or {}), **wb_cf}
+            self.update_account(
+                wb_row["id"],
+                {
+                    "password": existing["password"],
+                    "reg_region": region or prev_wb.get("reg_region", ""),
+                    "note": wb_note,
+                    "custom_fields": merged_wb_cf,
+                    "proxy": proxy_url,
+                    "proxy_node": proxy_node,
+                },
+            )
+        else:
+            created_wb = self.add_account(
+                {
+                    "account_type": "WorkBuddy",
+                    "account": existing["account"],
+                    "password": existing["password"],
+                    "reg_region": region,
+                    "note": wb_note,
+                    "custom_fields": wb_cf,
+                    "proxy": proxy_url,
+                }
+            )
+            if proxy_node:
+                self.bind_account_proxy_node(
+                    created_wb["id"],
+                    proxy_url=proxy_url,
+                    proxy_node=proxy_node,
+                    locked=False,
+                )
+        return updated_mail
+
+    def export_workbuddy_credentials_json(self, account_ids: list[int] | None = None) -> dict:
+        if account_ids:
+            wanted = {int(i) for i in account_ids if int(i) > 0}
+            candidates = [a for a in self.list_accounts() if a["id"] in wanted]
+        else:
+            candidates = [
+                a for a in self.list_accounts()
+                if a["account_type"] in ("WorkBuddy", "域名邮箱")
+            ]
+
+        rows: list[dict] = []
+        seen_keys: set[str] = set()
+        missing_token_emails: list[str] = []
+
+        for acc in candidates:
+            cf = acc.get("custom_fields") or {}
+            cred = cf.get("wb_credential")
+            if not isinstance(cred, dict) or not cred:
+                # Check if paired record has the credential
+                if acc["account_type"] == "域名邮箱":
+                    paired = [
+                        x for x in self.list_accounts(account_type="WorkBuddy")
+                        if x["account"].casefold() == acc["account"].casefold()
+                    ]
+                    if paired:
+                        cred = (paired[0].get("custom_fields") or {}).get("wb_credential")
+                elif acc["account_type"] == "WorkBuddy":
+                    paired = [
+                        x for x in self.list_accounts(account_type="域名邮箱")
+                        if x["account"].casefold() == acc["account"].casefold()
+                    ]
+                    if paired:
+                        cred = (paired[0].get("custom_fields") or {}).get("wb_credential")
+
+            if not isinstance(cred, dict) or not cred:
+                if account_ids:
+                    missing_token_emails.append(acc["account"])
+                continue
+
+            dedup_key = str(cred.get("uid") or acc["account"]).strip().casefold()
+            if dedup_key in seen_keys:
+                continue
+            seen_keys.add(dedup_key)
+
+            export_row = {
+                "uid": str(cred.get("uid") or ""),
+                "nickname": str(cred.get("nickname") or cf.get("github_username") or acc["account"].split("@")[0]),
+                "domain": str(cred.get("domain") or "www.workbuddy.ai"),
+                "realm": str(cred.get("realm") or "intl"),
+                "platform": str(cred.get("platform") or "CLI"),
+                "product": str(cred.get("product") or "workbuddy"),
+                "enterpriseId": str(cred.get("enterpriseId") or ""),
+                "accessToken": str(cred.get("accessToken") or ""),
+                "refreshToken": str(cred.get("refreshToken") or ""),
+                "expiresAt": int(cred.get("expiresAt") or 0),
+                "addedAt": str(cred.get("addedAt") or datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                "source": str(cred.get("source") or "oauth"),
+                "apiKey": False,
+                "proxySlot": str(cred.get("proxySlot") or ""),
+                "proxy": str(cred.get("proxy") or (acc.get("fp_config") or {}).get("proxy") or ""),
+                "enabled": bool(cred.get("enabled", True)),
+                "tasksEnabled": bool(cred.get("tasksEnabled", True)),
+                "weight": int(cred.get("weight") or 1),
+                "note": str(cred.get("note") or acc.get("note") or acc["account"]),
+            }
+            if not export_row["accessToken"] or export_row["accessToken"].count(".") != 2:
+                missing_token_emails.append(acc["account"])
+                continue
+            rows.append(export_row)
+
+        doc = {
+            "format": "workbuddy-accounts",
+            "version": 1,
+            "exportedAt": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "count": len(rows),
+            "accounts": rows,
+        }
+        return {
+            "ok": len(rows) > 0,
+            "count": len(rows),
+            "missing_token_emails": missing_token_emails,
+            "document": doc,
+            "json_text": json.dumps(doc, ensure_ascii=False, indent=2),
+            "error": "" if rows else "所选账号尚未保存 WorkBuddy 登录凭据，请先完成注册与凭据授权。",
+        }
+

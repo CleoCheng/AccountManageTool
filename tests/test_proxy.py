@@ -130,3 +130,62 @@ def test_resolve_leaf_active_proxy_node():
     assert _resolve_leaf_node(mock_px, "Google") == "🇸🇬 Singapore | 04"
     assert _resolve_leaf_node(mock_px, "OpenAI") == "🇸🇬 Singapore | 04"
     assert _resolve_leaf_node(mock_px, "DIRECT") == "DIRECT"
+
+
+def test_activate_proxy_node_delegates_to_isolated_sidecar_without_touching_verge(monkeypatch):
+    import src.proxy_service as ps
+    import src.sidecar_proxy as sidecar_module
+
+    def _forbidden(*args, **kwargs):
+        raise AssertionError("Must never touch Clash Verge controller!")
+
+    monkeypatch.setattr(ps, "find_active_mihomo_pipe", _forbidden)
+    monkeypatch.setattr(ps, "_call_controller", _forbidden)
+
+    calls = []
+
+    class _StubSidecar:
+        def switch_node(self, node_name, *, preflight=False, preflight_timeout=6.0):
+            calls.append({"node": node_name, "preflight": preflight})
+            return {
+                "ok": True,
+                "switched": True,
+                "node": node_name,
+                "proxy_url": "http://127.0.0.1:17899",
+                "groups": ["KEYVAULT_PROXY"],
+                "preflight_ok": True,
+                "reachable": True,
+                "restricted": False,
+            }
+
+    stub = _StubSidecar()
+    manager_calls = []
+
+    def _get_manager():
+        manager_calls.append(True)
+        return stub
+
+    monkeypatch.setattr(sidecar_module, "get_sidecar_proxy_manager", _get_manager)
+
+    res = ps.activate_proxy_node(
+        "WorkBuddy", "http://127.0.0.1:17899", "🇸🇬 Singapore | 01", preflight=True
+    )
+    assert calls == [{"node": "🇸🇬 Singapore | 01", "preflight": True}]
+    assert manager_calls == [True]
+    assert res["ok"] is True
+    assert res["switched"] is True
+    assert res["groups"] == ["KEYVAULT_PROXY"]
+    assert res["proxy_url"] == "http://127.0.0.1:17899"
+    assert res["preflight_ok"] is True
+
+    # The legacy Clash Verge controller helpers must remain untouched.
+    assert ps.find_active_mihomo_pipe is _forbidden
+    assert ps._call_controller is _forbidden
+
+    # A blank node never reaches the sidecar at all.
+    calls.clear()
+    manager_calls.clear()
+    blank = ps.activate_proxy_node("WorkBuddy", "http://127.0.0.1:17899", "   ")
+    assert blank == {"ok": True, "switched": False, "proxy_url": "http://127.0.0.1:17899"}
+    assert calls == []
+    assert manager_calls == []

@@ -1,5 +1,9 @@
+import csv
 from datetime import datetime
+import io
 import re
+import xml.etree.ElementTree as ET
+import zipfile
 from src.totp_service import normalize_secret
 
 
@@ -10,6 +14,12 @@ def _is_likely_base32_secret(val: str) -> bool:
 
 def _is_likely_year(val: str) -> bool:
     return bool(re.fullmatch(r"(199\d|20[0-3]\d)", val.strip()))
+
+
+def _is_domain_email_account(val: str) -> bool:
+    """Return True for credentials belonging to the configured domain mailbox."""
+    local, separator, domain = (val or "").strip().rpartition("@")
+    return bool(separator and local and domain.lower() == "ggb6.com")
 
 
 def normalize_date_str(val: str, default_year: int | None = None) -> str:
@@ -95,6 +105,9 @@ def parse_single_line(line: str, default_year: int | None = None) -> dict | None
     result = _default_record()
     result["account"] = parts[0] if len(parts) >= 1 else ""
     result["password"] = parts[1] if len(parts) >= 2 else ""
+    is_domain_email = _is_domain_email_account(result["account"])
+    if is_domain_email:
+        result["account_type"] = "域名邮箱"
 
     if len(parts) == 3:
         third = parts[2]
@@ -104,6 +117,8 @@ def parse_single_line(line: str, default_year: int | None = None) -> dict | None
             result["secret_key"] = normalize_secret(third)
         if result["account"].lower().endswith("@gmail.com") and result["recovery_email"]:
             result["account_type"] = "Google"
+        if is_domain_email:
+            result["account_type"] = "域名邮箱"
         return result
 
     if len(parts) >= 6:
@@ -115,6 +130,8 @@ def parse_single_line(line: str, default_year: int | None = None) -> dict | None
         result["reg_region"] = parts[5]
         if len(parts) > 6:
             result["note"] = " | ".join(parts[6:])
+        if is_domain_email:
+            result["account_type"] = "域名邮箱"
         return result
 
     # Heuristic fallback for 2, 4, or 5 fields
@@ -143,6 +160,9 @@ def parse_single_line(line: str, default_year: int | None = None) -> dict | None
         result["recovery_email"] or result["reg_year"] or result["reg_region"]
     ):
         result["account_type"] = "Google"
+
+    if is_domain_email:
+        result["account_type"] = "域名邮箱"
 
     if extra_notes:
         result["note"] = " | ".join(extra_notes)
@@ -233,11 +253,215 @@ def _parse_structured_block(block_text: str, default_year: int | None = None) ->
     return record
 
 
+_DOMAIN_EMAIL_HEADERS = {
+    "email": "email",
+    "账号": "email",
+    "邮箱": "email",
+    "邮箱账号": "email",
+    "account": "email",
+    "password": "password",
+    "密码": "password",
+    "邮箱密码": "password",
+    "授权码": "password",
+    "name": "name",
+    "姓名": "name",
+    "名称": "name",
+    "昵称": "name",
+    "webmail": "webmail",
+    "登录地址": "webmail",
+    "邮箱地址": "webmail",
+    "wb_reg_status": "wb_reg_status",
+    "注册状态": "wb_reg_status",
+    "workbuddy注册": "wb_reg_status",
+}
+
+
+def _col_letter_to_idx(cell_ref: str) -> int:
+    idx = 0
+    for ch in cell_ref:
+        if ch.isalpha():
+            idx = idx * 26 + (ord(ch.upper()) - ord("A") + 1)
+        else:
+            break
+    return max(0, idx - 1)
+
+
+def _read_xlsx_rows(raw_bytes: bytes) -> list[list[str]]:
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw_bytes)) as zf:
+            shared_strings: list[str] = []
+            if "xl/sharedStrings.xml" in zf.namelist():
+                ss_root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+                for si in ss_root.iter():
+                    if si.tag.endswith("}si") or si.tag == "si":
+                        chunks = [
+                            t.text or ""
+                            for t in si.iter()
+                            if (t.tag.endswith("}t") or t.tag == "t")
+                        ]
+                        shared_strings.append("".join(chunks))
+
+            sheet_names = sorted(
+                n for n in zf.namelist()
+                if n.startswith("xl/worksheets/sheet") and n.endswith(".xml")
+            )
+            if not sheet_names:
+                raise ValueError("Excel 文件中未找到工作表。")
+            ws_root = ET.fromstring(zf.read(sheet_names[0]))
+            rows: list[list[str]] = []
+            for row_el in ws_root.iter():
+                if not (row_el.tag.endswith("}row") or row_el.tag == "row"):
+                    continue
+                row_vals: list[str] = []
+                for c_el in row_el:
+                    if not (c_el.tag.endswith("}c") or c_el.tag == "c"):
+                        continue
+                    ref = c_el.attrib.get("r", "")
+                    col_idx = _col_letter_to_idx(ref) if ref else len(row_vals)
+                    while len(row_vals) <= col_idx:
+                        row_vals.append("")
+                    c_type = c_el.attrib.get("t", "")
+                    val = ""
+                    if c_type == "inlineStr":
+                        chunks = [
+                            t.text or ""
+                            for t in c_el.iter()
+                            if (t.tag.endswith("}t") or t.tag == "t")
+                        ]
+                        val = "".join(chunks)
+                    else:
+                        v_el = next(
+                            (ch for ch in c_el if ch.tag.endswith("}v") or ch.tag == "v"),
+                            None,
+                        )
+                        raw_v = (v_el.text or "") if v_el is not None else ""
+                        if c_type == "s" and raw_v.isdigit():
+                            s_idx = int(raw_v)
+                            val = shared_strings[s_idx] if 0 <= s_idx < len(shared_strings) else raw_v
+                        else:
+                            val = raw_v
+                    row_vals[col_idx] = val
+                rows.append(row_vals)
+            return rows
+    except zipfile.BadZipFile as exc:
+        raise ValueError("无法解析 Excel (.xlsx) 文件，请确认文件未损坏。") from exc
+
+
+def _rows_to_domain_email_records(rows: list[list[str]]) -> list[dict]:
+    non_empty = [(idx + 1, r) for idx, r in enumerate(rows) if any((c or "").strip() for c in r)]
+    if not non_empty:
+        return []
+
+    first_line_no, first_row = non_empty[0]
+    mapped_cols = [
+        _DOMAIN_EMAIL_HEADERS.get((c or "").strip().lstrip("\ufeff").lower(), "")
+        for c in first_row
+    ]
+    has_header = "email" in mapped_cols and "password" in mapped_cols
+    if has_header:
+        col_map = {name: i for i, name in enumerate(mapped_cols) if name}
+        data_rows = non_empty[1:]
+    else:
+        col_map = {"email": 0, "password": 1, "name": 2, "webmail": 3}
+        data_rows = non_empty
+
+    records: list[dict] = []
+    for line_no, r in data_rows:
+        def _cell(key: str) -> str:
+            pos = col_map.get(key, -1)
+            return r[pos] if 0 <= pos < len(r) else ""
+
+        email = (_cell("email") or "").strip()
+        password = _cell("password") or ""
+        name = (_cell("name") or "").strip()
+        webmail = (_cell("webmail") or "").strip() or "https://mail.ggb6.com"
+        raw_status = (_cell("wb_reg_status") or "").strip()
+        wb_status = "已完成" if raw_status in ("已完成", "done", "completed", "1", "true", "True") else "未完成"
+
+        if not email or "@" not in email or not password.strip():
+            raise ValueError(f"第 {line_no} 行邮箱或密码缺失，请检查表格格式（email,password,name,webmail）。")
+
+        record = _default_record()
+        record.update(
+            account_type="域名邮箱",
+            account=email,
+            password=password,
+            note=name,
+            custom_fields={
+                "wb_reg_status": wb_status,
+                "holder_name": name,
+                "webmail": webmail,
+            },
+        )
+        records.append(record)
+    return records
+
+
+def parse_domain_email_file(raw_bytes: bytes, filename: str = "") -> list[dict]:
+    if not raw_bytes:
+        return []
+    fname_low = (filename or "").lower()
+    if fname_low.endswith(".xlsx") or raw_bytes.startswith(b"PK\x03\x04"):
+        return _rows_to_domain_email_records(_read_xlsx_rows(raw_bytes))
+
+    text = None
+    for enc in ("utf-8-sig", "utf-8", "gb18030"):
+        try:
+            text = raw_bytes.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    if text is None:
+        raise ValueError("文件编码无法识别，请使用 UTF-8 或标准 Excel (.xlsx / .csv) 格式。")
+
+    if fname_low.endswith(".csv"):
+        rows = list(csv.reader(io.StringIO(text)))
+        return _rows_to_domain_email_records(rows)
+    return parse_domain_email_text(text)
+
+
+def parse_domain_email_text(raw_text: str) -> list[dict]:
+    cleaned = (raw_text or "").lstrip("\ufeff")
+    non_empty_lines = [ln for ln in cleaned.splitlines() if ln.strip()]
+    if not non_empty_lines:
+        return []
+
+    first_line = non_empty_lines[0].strip()
+    if "----" not in first_line and "," in first_line:
+        rows = list(csv.reader(io.StringIO(cleaned)))
+        return _rows_to_domain_email_records(rows)
+
+    records = []
+    for number, line in enumerate(cleaned.splitlines(), 1):
+        if not line.strip():
+            continue
+        account, separator, password = line.partition("----")
+        if not separator or not account.strip() or not password.strip():
+            raise ValueError(f"第 {number} 行格式不完整，请按 账号----密码 或 CSV(email,password,name,webmail) 填写。")
+        record = _default_record()
+        record.update(
+            account_type="域名邮箱",
+            account=account.strip(),
+            password=password,
+            custom_fields={
+                "wb_reg_status": "未完成",
+                "webmail": "https://mail.ggb6.com",
+            },
+        )
+        records.append(record)
+    return records
+
+
 def parse_account_text(raw_text: str, default_year: int | None = None) -> list[dict]:
     if not raw_text or not raw_text.strip():
         return []
 
-    normalized = raw_text.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = raw_text.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+    first_non_empty = next((ln.strip() for ln in normalized.split("\n") if ln.strip()), "")
+    if "----" not in first_non_empty and "," in first_non_empty:
+        first_cols = [c.strip().lower() for c in first_non_empty.split(",")]
+        if ("email" in first_cols and "password" in first_cols) or ("邮箱" in first_cols and "密码" in first_cols):
+            return parse_domain_email_text(normalized)
 
     # Case 1: Numbered blocks (e.g. '1.\n1021\n...')
     if re.search(r"(?m)^\s*\d+\.\s*$", normalized):
