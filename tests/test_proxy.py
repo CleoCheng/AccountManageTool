@@ -1,10 +1,34 @@
 from pathlib import Path
 from src.proxy_service import (
+    classify_node_region,
     find_clash_config_files,
     is_valid_proxy_node_name,
     parse_clash_yaml_summary,
 )
 from src.db_service import DatabaseService
+
+
+def test_classify_node_region_us_relays_never_misclassified_as_japan():
+    # ``US`` sits adjacent to ``by`` in these relay names, so a naive ``\bUS\b``
+    # or ``\bJP\b`` check would misclassify them.
+    assert classify_node_region("US | MiyaIP-2 HY2") == "🇺🇸 美国 (US)"
+    assert classify_node_region("USbyJPTT | MiyaIP-2 HY2") == "🇺🇸 美国 (US)"
+    assert classify_node_region("USbyJP-54 | MiyaIP-2 HY2") == "🇺🇸 美国 (US)"
+    assert classify_node_region("🇺🇸 United States | 01") == "🇺🇸 美国 (US)"
+    assert classify_node_region("MiyaIP-US-Residential") == "🇺🇸 美国 (US)"
+
+    # Genuine JP/SG/HK nodes must stay correctly classified.
+    assert classify_node_region("🇯🇵 Japan | 01") == "🇯🇵 日本 (JP)"
+    assert classify_node_region("JP | Tokyo") == "🇯🇵 日本 (JP)"
+    assert classify_node_region("🇸🇬 Singapore | 01") == "🇸🇬 新加坡 (SG)"
+    assert classify_node_region("SG | 02") == "🇸🇬 新加坡 (SG)"
+    assert classify_node_region("🇭🇰 Hong Kong | 01") == "🇭🇰 香港 (HK)"
+    assert classify_node_region("🌍 Unknown | 01") == "🌍 其他地区"
+
+    # Convenience regions.
+    assert classify_node_region("🇬🇧 United Kingdom | 01") == "🇬🇧 英国 (UK)"
+    assert classify_node_region("🇩🇪 Germany | Frankfurt") == "🇩🇪 德国 (DE)"
+    assert classify_node_region("🇨🇦 Canada | Toronto") == "🇨🇦 加拿大 (CA)"
 
 
 def test_filter_valid_proxy_node_names():

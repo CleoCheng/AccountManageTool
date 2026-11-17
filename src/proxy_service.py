@@ -84,16 +84,63 @@ def is_valid_proxy_node_name(name: str, extra_group_names: set[str] | None = Non
     return True
 
 
+_US_ABBREV_RE = re.compile(r"(?:^|[\s|_\-\[\(])US(?:by|\b|[\s|_\-\[\]\)\d])", re.IGNORECASE)
+_UK_ABBREV_RE = re.compile(r"\b(?:UK|GB)\b", re.IGNORECASE)
+_DE_ABBREV_RE = re.compile(r"\bDE\b", re.IGNORECASE)
+_CA_ABBREV_RE = re.compile(r"\bCA\b", re.IGNORECASE)
+
+
 def classify_node_region(name: str) -> str:
+    """Map a relay/node name to a display region.
+
+    US is checked first on purpose: relay names such as ``USbyJPTT`` or
+    ``USbyJP-54`` embed the JP relay hop in the name, but the exit is American.
+    A plain ``\\bJP\\b`` check would otherwise misclassify them as Japan.
+    """
     low = name.lower()
+    if (
+        any(
+            k in low
+            for k in (
+                "united states",
+                "america",
+                "美国",
+                "洛杉矶",
+                "圣何塞",
+                "西雅图",
+                "硅谷",
+                "usby",
+                "miyaip",
+            )
+        )
+        or "🇺🇸" in name
+        or _US_ABBREV_RE.search(name)
+    ):
+        return "🇺🇸 美国 (US)"
     if any(k in low for k in ("singapore", "新加坡", "狮城")) or "🇸🇬" in name or re.search(r"\bSG\b", name):
         return "🇸🇬 新加坡 (SG)"
-    if any(k in low for k in ("united states", "america", "美国", "洛杉矶", "圣何塞", "西雅图", "硅谷")) or "🇺🇸" in name or re.search(r"\bUS\b", name):
-        return "🇺🇸 美国 (US)"
     if any(k in low for k in ("japan", "日本", "东京", "大阪")) or "🇯🇵" in name or re.search(r"\bJP\b", name):
         return "🇯🇵 日本 (JP)"
     if any(k in low for k in ("taiwan", "台湾", "台北", "新北")) or "🇹🇼" in name or "🇨🇳" in name or re.search(r"\bTW\b", name):
         return "🇨🇳 台湾 (TW)"
+    if (
+        any(k in low for k in ("united kingdom", "britain", "england", "london", "英国", "伦敦"))
+        or "🇬🇧" in name
+        or _UK_ABBREV_RE.search(name)
+    ):
+        return "🇬🇧 英国 (UK)"
+    if (
+        any(k in low for k in ("germany", "frankfurt", "德国", "法兰克福"))
+        or "🇩🇪" in name
+        or _DE_ABBREV_RE.search(name)
+    ):
+        return "🇩🇪 德国 (DE)"
+    if (
+        any(k in low for k in ("canada", "toronto", "vancouver", "加拿大", "多伦多"))
+        or "🇨🇦" in name
+        or _CA_ABBREV_RE.search(name)
+    ):
+        return "🇨🇦 加拿大 (CA)"
     if any(k in low for k in ("hong kong", "hongkong", "香港")) or "🇭🇰" in name or re.search(r"\bHK\b", name):
         return "🇭🇰 香港 (HK)"
     if any(k in low for k in ("korea", "韩国", "首尔")) or "🇰🇷" in name or re.search(r"\bKR\b", name):

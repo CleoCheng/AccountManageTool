@@ -22,6 +22,36 @@ def _is_domain_email_account(val: str) -> bool:
     return bool(separator and local and domain.lower() == "ggb6.com")
 
 
+_CLAUDE_HINT_RE = re.compile(r"claude|anthropic", re.IGNORECASE)
+
+
+def _claude_hint_text(record: dict) -> str:
+    """Hint sources: username, recovery email and notes (never the password)."""
+    return " ".join(
+        str(record.get(key) or "") for key in ("account", "recovery_email", "note")
+    )
+
+
+def _apply_account_type_override(record: dict, account_type: str = "") -> dict:
+    """Apply an explicit account type unless the row is a domain mailbox."""
+    explicit = (account_type or "").strip()
+    if explicit and explicit != "域名邮箱" and record.get("account_type") != "域名邮箱":
+        record["account_type"] = explicit
+    return record
+
+
+def _apply_claude_hint(record: dict, account_type: str = "") -> dict:
+    """Tag default ChatGPT rows as Claude when the source clearly says Claude.
+
+    Only the username, recovery email and notes are inspected — a password that
+    happens to contain ``claude`` must never change the category.
+    """
+    if not (account_type or "").strip() and record.get("account_type") == "ChatGPT":
+        if _CLAUDE_HINT_RE.search(_claude_hint_text(record)):
+            record["account_type"] = "Claude"
+    return _apply_account_type_override(record, account_type)
+
+
 def normalize_date_str(val: str, default_year: int | None = None) -> str:
     val = (val or "").strip()
     if not val:
@@ -74,7 +104,11 @@ def _default_record() -> dict:
     }
 
 
-def parse_single_line(line: str, default_year: int | None = None) -> dict | None:
+def parse_single_line(
+    line: str,
+    default_year: int | None = None,
+    account_type: str = "",
+) -> dict | None:
     line = line.strip()
     if not line:
         return None
@@ -119,7 +153,7 @@ def parse_single_line(line: str, default_year: int | None = None) -> dict | None
             result["account_type"] = "Google"
         if is_domain_email:
             result["account_type"] = "域名邮箱"
-        return result
+        return _apply_claude_hint(result, account_type)
 
     if len(parts) >= 6:
         # Format B: Account ---- Password ---- Recovery ---- 2FA ---- Year ---- Region
@@ -132,7 +166,7 @@ def parse_single_line(line: str, default_year: int | None = None) -> dict | None
             result["note"] = " | ".join(parts[6:])
         if is_domain_email:
             result["account_type"] = "域名邮箱"
-        return result
+        return _apply_claude_hint(result, account_type)
 
     # Heuristic fallback for 2, 4, or 5 fields
     extra_notes = []
@@ -167,10 +201,14 @@ def parse_single_line(line: str, default_year: int | None = None) -> dict | None
     if extra_notes:
         result["note"] = " | ".join(extra_notes)
 
-    return result
+    return _apply_claude_hint(result, account_type)
 
 
-def _parse_structured_block(block_text: str, default_year: int | None = None) -> dict | None:
+def _parse_structured_block(
+    block_text: str,
+    default_year: int | None = None,
+    account_type: str = "",
+) -> dict | None:
     lines = [ln.strip() for ln in block_text.split("\n") if ln.strip()]
     if not lines:
         return None
@@ -224,7 +262,9 @@ def _parse_structured_block(block_text: str, default_year: int | None = None) ->
 
         # Main credential line containing '---' or '|' or '@'
         if "---" in ln or "|" in ln or ("@" in ln and not record["account"]):
-            parsed_cred = parse_single_line(ln, default_year=default_year)
+            parsed_cred = parse_single_line(
+                ln, default_year=default_year, account_type=account_type
+            )
             if parsed_cred and parsed_cred["account"]:
                 record["account_type"] = parsed_cred["account_type"]
                 record["account"] = parsed_cred["account"]
@@ -250,7 +290,7 @@ def _parse_structured_block(block_text: str, default_year: int | None = None) ->
     if notes:
         record["note"] = " | ".join(notes)
 
-    return record
+    return _apply_claude_hint(record, account_type)
 
 
 _DOMAIN_EMAIL_HEADERS = {
@@ -452,7 +492,11 @@ def parse_domain_email_text(raw_text: str) -> list[dict]:
     return records
 
 
-def parse_account_text(raw_text: str, default_year: int | None = None) -> list[dict]:
+def parse_account_text(
+    raw_text: str,
+    default_year: int | None = None,
+    account_type: str = "",
+) -> list[dict]:
     if not raw_text or not raw_text.strip():
         return []
 
@@ -470,7 +514,9 @@ def parse_account_text(raw_text: str, default_year: int | None = None) -> list[d
         for blk in blocks:
             if not blk.strip():
                 continue
-            rec = _parse_structured_block(blk, default_year=default_year)
+            rec = _parse_structured_block(
+                blk, default_year=default_year, account_type=account_type
+            )
             if rec and rec["account"]:
                 records.append(rec)
         if records:
@@ -478,7 +524,9 @@ def parse_account_text(raw_text: str, default_year: int | None = None) -> list[d
 
     # Case 2: Single structured block containing '新2FA' or standalone MMDD date line
     if re.search(r"(?i)新2FA|new\s*2fa", normalized) or re.search(r"(?m)^\s*\d{4}(?:\s*[-|]+\s*\d{4})?\s*$", normalized):
-        rec = _parse_structured_block(normalized, default_year=default_year)
+        rec = _parse_structured_block(
+            normalized, default_year=default_year, account_type=account_type
+        )
         if rec and rec["account"]:
             return [rec]
 
@@ -488,7 +536,9 @@ def parse_account_text(raw_text: str, default_year: int | None = None) -> list[d
 
     records = []
     for line in stitched.split("\n"):
-        parsed = parse_single_line(line, default_year=default_year)
+        parsed = parse_single_line(
+            line, default_year=default_year, account_type=account_type
+        )
         if parsed and parsed["account"]:
             records.append(parsed)
     return records

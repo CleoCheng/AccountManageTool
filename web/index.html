@@ -45,6 +45,7 @@
               <option value="All">全部平台</option>
               <option value="ChatGPT">ChatGPT</option>
               <option value="Google">Google</option>
+              <option value="Claude">Claude</option>
               <option value="WorkBuddy">WorkBuddy</option>
               <option value="Qcoder">Qcoder</option>
             </select>
@@ -108,6 +109,7 @@
               <option value="All">全部平台</option>
               <option value="ChatGPT">ChatGPT</option>
               <option value="Google">Google</option>
+              <option value="Claude">✴️ Claude</option>
               <option value="WorkBuddy">WorkBuddy</option>
               <option value="Qcoder">Qcoder</option>
             </select>
@@ -169,6 +171,9 @@
         <button type="button" class="btn btn-ghost btn-xs" id="workbuddy-pick-2" onclick="quickSelectPendingWorkBuddy(2)" title="一键勾选前 2 个待注册邮箱（刚好开启 1 轮双指纹浏览器）">⚡ 勾选2个待注册</button>
         <button type="button" class="btn btn-ghost btn-xs" id="workbuddy-pick-10" onclick="quickSelectPendingWorkBuddy(10)" title="一键勾选前 10 个待注册邮箱（自动分 5 轮双浏览器注册）">⚡ 勾选10个待注册</button>
         <span class="workbuddy-toolbar-actions">
+          <button type="button" class="btn btn-ghost" id="btn-toggle-auto-mail-poll" onclick="toggleAutoMailCodePolling()" title="开启或关闭后台静默自动查信（默认关闭，按需手动点击刷新或点单张卡片查信）">⏸️ 静默刷新: 关</button>
+          <button type="button" class="btn btn-secondary" id="btn-refresh-mail-codes" onclick="refreshDomainEmailCodes()" title="立即连接 mail.ggb6.com 检查最新收件箱验证码">📥 刷新收件箱验证码</button>
+          <button type="button" class="btn btn-ghost danger" id="btn-reset-email-nodes" onclick="confirmResetDomainEmailNodes()" title="重置域名邮箱绑定的代理节点与收码计数，让所有节点重新可用">🔄 重置代理节点绑定</button>
           <button class="btn btn-ghost" id="workbuddy-import-folder" onclick="importAccountDataFolder()" title="一键读取并导入 accountData 目录下的 Excel/CSV 邮箱表格">📥 导入 accountData</button>
           <button class="btn btn-ghost" id="workbuddy-import-excel" onclick="triggerDomainEmailFileSelect()" title="选择本地 .xlsx 或 .csv 域名邮箱文件导入">📂 导入 Excel/CSV</button>
           <button class="btn btn-secondary" id="workbuddy-quota-btn" onclick="openWorkBuddyQuotaModal()" title="配置订阅节点绑定策略与每节点 2 账号配额解限">🌐 节点配额与解限</button>
@@ -176,7 +181,7 @@
           <button class="btn btn-secondary" id="workbuddy-progress" onclick="openWorkBuddyModal()" style="display: none;">查看任务进度</button>
           <button class="btn btn-primary" id="workbuddy-start" onclick="startWorkBuddyQueue()" disabled>批量注册WorkBuddy</button>
         </span>
-        <p>每次启动分配全新临时指纹浏览器并绑定订阅节点（每节点限注册 2 个，用完即销毁） · 注册完成自动保存 WorkBuddy2API 登录凭据</p>
+        <p>点击「🌐 启动浏览器」一键打开带专属隔离指纹与代理的注册窗口 · 点击卡片「邮件码」或上方刷新按需查信（静默刷新默认关闭，可按需开启）· 每 2 个邮箱收到验证码自动换下一节点</p>
       </section>
       <div id="accounts-container" class="accounts-grid"></div>
 
@@ -213,7 +218,7 @@
       <div class="modal-header">
         <div>
           <h2 id="modal-title">添加账号 · 智能快递式识别</h2>
-          <p class="modal-subtitle">域名邮箱支持 账号----密码，每行一个。也支持 ChatGPT、Google 和带日期/新2FA 的多行块。</p>
+          <p class="modal-subtitle">域名邮箱支持 账号----密码，每行一个。也支持 ChatGPT、Google、Claude 和带日期/新2FA 的多行块。</p>
         </div>
         <button class="modal-close" onclick="closeAccountModal()">×</button>
       </div>
@@ -237,7 +242,7 @@
           <textarea
             id="smart-paste-input"
             rows="3"
-            placeholder="在此直接粘贴整串账号（支持 ---- 或 | 分隔，单条自动拆解、带 1021/1019----1029 日期块、新2FA 或多行批量导入）"
+            placeholder="在此直接粘贴整串账号（支持 ---- 或 | 分隔，支持 ChatGPT、Google、Claude，单条自动拆解、带 1021/1019----1029 日期块、新2FA 或多行批量导入）"
             oninput="onSmartPasteInput(this.value)"
           ></textarea>
           <div class="smart-parse-feedback" id="smart-parse-feedback">
@@ -273,6 +278,10 @@
                 <label class="type-radio">
                   <input type="radio" name="account_type" value="Google" id="type-google" />
                   <span class="radio-pill"><span class="badge-dot dot-google"></span>Google</span>
+                </label>
+                <label class="type-radio">
+                  <input type="radio" name="account_type" value="Claude" id="type-claude" />
+                  <span class="radio-pill"><span class="badge-dot dot-claude"></span>Claude</span>
                 </label>
                 <label class="type-radio">
                   <input type="radio" name="account_type" value="WorkBuddy" id="type-workbuddy" />
@@ -474,6 +483,17 @@
           <button type="button" class="btn btn-secondary" onclick="unlockCurrentAccountNode()">
             🔓 解锁节点以修改
           </button>
+        </div>
+
+        <!-- Claude-specific guidance banner -->
+        <div class="node-claude-hint" id="node-claude-hint" style="display: none;">
+          <div class="claude-hint-icon">✴️</div>
+          <div class="claude-hint-text">
+            <strong>Claude 专属隔离与代理推荐</strong>
+            <p>• 优先推荐纯净美国住宅 / ISP 节点（如 <code>MiyaIP</code>），保障高风控会话长效稳定</p>
+            <p>• 支持 KeyVault Sidecar (<code>127.0.0.1:17899</code>) 与 Clash Verge 固定监听端口 (<code>127.0.0.1:7897</code>)</p>
+            <p>• 启动时自动锁定时区 <code>America/Los_Angeles</code>、语言 <code>en-US, en</code> 并严格阻断 WebRTC/STUN 直连泄露</p>
+          </div>
         </div>
 
         <!-- Port Selection & Custom Proxy URL -->

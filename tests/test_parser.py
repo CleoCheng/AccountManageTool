@@ -225,3 +225,48 @@ def test_parse_ggb6_csv_and_xlsx_default_unfinished_status():
     assert xlsx_items[0]["password"] == "ExcelPass#99"
     assert xlsx_items[0]["note"] == "Emma Stone"
     assert xlsx_items[0]["custom_fields"]["wb_reg_status"] == "未完成"
+
+
+def test_parse_explicit_account_type_applies_to_records():
+    raw = (
+        "claude_one@example.com----ClaudePass#1----JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\n"
+        "claude_two@example.com|ClaudePass#2|GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
+    )
+    items = parse_account_text(raw, account_type="Claude")
+    assert len(items) == 2
+    assert [i["account_type"] for i in items] == ["Claude", "Claude"]
+    assert items[0]["account"] == "claude_one@example.com"
+    assert items[1]["secret_key"] == "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
+
+    # Google 6-field rows also accept the explicit category (except ggb6 mail).
+    google_raw = "bob@gmail.com----pw----rec@example.org----gezdgnbvgy3tqojqgezdgnbvgy3tqojq----2024----US"
+    google_items = parse_account_text(google_raw, account_type="Claude")
+    assert google_items[0]["account_type"] == "Claude"
+    assert google_items[0]["reg_region"] == "US"
+
+    # Domain mailboxes always stay 域名邮箱, whatever the explicit category.
+    ggb6 = parse_account_text("mailbox01@ggb6.com----MailboxPass#2026!", account_type="Claude")
+    assert ggb6[0]["account_type"] == "域名邮箱"
+
+
+def test_parse_claude_hints_without_explicit_account_type():
+    hinted = parse_account_text(
+        "claude_user@example.com----ClaudePass#2026----JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
+    )
+    assert hinted[0]["account_type"] == "Claude"
+
+    anthropic = parse_account_text("anthropic_user@example.com----pw----GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ")
+    assert anthropic[0]["account_type"] == "Claude"
+
+    # Unhinted rows keep their existing ChatGPT / Google / 域名邮箱 behaviour.
+    plain = parse_account_text(
+        "alice_demo01@example.com----DemoPass#2026!----JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
+    )
+    assert plain[0]["account_type"] == "ChatGPT"
+    google = parse_account_text(
+        "bob_google99@gmail.com----GoogleDemo#888----recovery_demo@example.org"
+        "----gezdgnbvgy3tqojqgezdgnbvgy3tqojq----2024----US"
+    )
+    assert google[0]["account_type"] == "Google"
+    domain = parse_account_text("mailbox01@ggb6.com----MailboxPass#2026!")
+    assert domain[0]["account_type"] == "域名邮箱"

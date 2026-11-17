@@ -18,7 +18,12 @@ from urllib.parse import quote, urlencode, urlsplit
 
 from websockets.sync.client import connect as _ws_connect
 
-from src.browser_service import find_chromium_executable, generate_fingerprint_config
+from src.browser_service import (
+    _write_chromium_preferences,
+    find_chromium_executable,
+    generate_fingerprint_config,
+    resolve_browser_env_config,
+)
 from src.github_mail import MAIL_URL, read_github_code
 from src.proxy_service import activate_proxy_node
 
@@ -632,7 +637,15 @@ class _CdpLocator:
 class _CdpPage:
     """A single Chrome page target driven over raw CDP (never Runtime.enable)."""
 
-    def __init__(self, context: "_CdpContext", target_id: str, ws_url: str, target_url: str = ""):
+    def __init__(
+        self,
+        context: "_CdpContext",
+        target_id: str,
+        ws_url: str,
+        target_url: str = "",
+        timezone: str = "",
+        locale: str = "",
+    ):
         self._context = context
         self.target_id = target_id
         self._ws_url = ws_url
@@ -644,6 +657,8 @@ class _CdpPage:
         self._nav_loader_id = ""
         self._last_mouse = (0.0, 0.0)
         self._isolated_world: tuple[str, int] | None = None
+        self.timezone = str(timezone or "")
+        self.locale = str(locale or "")
         self.keyboard = _CdpKeyboard(self)
 
     # -- low level -----------------------------------------------------
@@ -667,6 +682,22 @@ class _CdpPage:
             self._client.send("Network.enable")
         except Exception:
             pass
+        # Match the spoofed OS timezone/locale natively in Blink. Never enable
+        # the V8 Runtime domain: it would expose the inspector to DataDome.
+        tz = self.timezone or self._context.timezone
+        loc = self.locale or self._context.locale
+        if tz:
+            try:
+                self._client.send(
+                    "Emulation.setTimezoneOverride", {"timezoneId": tz}
+                )
+            except Exception:
+                pass
+        if loc:
+            try:
+                self._client.send("Emulation.setLocaleOverride", {"locale": loc})
+            except Exception:
+                pass
         return self._client
 
     def send(self, method: str, params: dict | None = None) -> dict:
@@ -1017,10 +1048,19 @@ class _NetResponse:
 class _CdpContext:
     """A dedicated Chrome process with an isolated profile, driven over CDP."""
 
-    def __init__(self, proc: subprocess.Popen, debug_port: int, session_dir: Path):
+    def __init__(
+        self,
+        proc: subprocess.Popen,
+        debug_port: int,
+        session_dir: Path,
+        timezone: str = "",
+        locale: str = "",
+    ):
         self._proc = proc
         self.debug_port = int(debug_port)
         self.session_dir = Path(session_dir)
+        self.timezone = str(timezone or "")
+        self.locale = str(locale or "")
         self._pages: list[_CdpPage] = []
         self._handlers: dict[str, list] = {"request": [], "response": []}
         self.net_log: deque = deque(maxlen=4000)
@@ -1084,7 +1124,14 @@ class _CdpContext:
                 continue
             known.add(target_id)
             self._pages.append(
-                _CdpPage(self, target_id, str(target.get("webSocketDebuggerUrl") or ""), target_url)
+                _CdpPage(
+                    self,
+                    target_id,
+                    str(target.get("webSocketDebuggerUrl") or ""),
+                    target_url,
+                    timezone=self.timezone,
+                    locale=self.locale,
+                )
             )
 
     # -- public API ----------------------------------------------------
@@ -1104,6 +1151,8 @@ class _CdpContext:
             str(data.get("id")),
             str(data.get("webSocketDebuggerUrl") or ""),
             str(data.get("url") or "about:blank"),
+            timezone=self.timezone,
+            locale=self.locale,
         )
         self._pages.append(page)
         return page
@@ -1434,6 +1483,12 @@ class WorkBuddyBrowser:
         win_w = 916 + (seed % 28)
         win_h = 928 + ((seed // 31) % 36)
 
+        env_cfg = resolve_browser_env_config(fp, {"account_type": "WorkBuddy"})
+        if env_cfg.get("enabled"):
+            # Write the matched locale into the fresh profile before Chrome
+            # starts so the very first paint is not the host's zh-CN.
+            _write_chromium_preferences(Path(session_dir), env_cfg)
+
         args = [
             exe,
             f"--user-data-dir={session_dir}",
@@ -1443,10 +1498,15 @@ class WorkBuddyBrowser:
             "--no-default-browser-check",
             "--disable-save-password-bubble",
             "--disable-sync",
+            "--disable-quic",
             "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
             f"--window-position={win_x},{win_y}",
             f"--window-size={win_w},{win_h}",
         ]
+        if env_cfg.get("enabled"):
+            # Locale flags must precede the target URL (``about:blank``).
+            args.append(f"--lang={env_cfg['locale']}")
+            args.append(f"--accept-lang={','.join(env_cfg['languages'])}")
         if self.headless:
             args.append("--headless=new")
         if proxy_url:
@@ -1454,6 +1514,12 @@ class WorkBuddyBrowser:
         if self.extra_chromium_args:
             args.extend(self.extra_chromium_args)
         args.append("about:blank")
+
+        launch_env = os.environ.copy()
+        if env_cfg.get("enabled"):
+            launch_env["TZ"] = env_cfg["timezone"]
+            launch_env["LANG"] = f"{env_cfg['locale'].replace('-', '_')}.UTF-8"
+            launch_env["LC_ALL"] = launch_env["LANG"]
 
         creationflags = 0
         if sys.platform == "win32" and self.headless:
@@ -1467,6 +1533,7 @@ class WorkBuddyBrowser:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 creationflags=creationflags,
+                env=launch_env,
             )
         except Exception as exc:
             raise ValueError(f"无法启动系统 Chrome / Edge: {exc}") from exc
@@ -1482,7 +1549,13 @@ class WorkBuddyBrowser:
             except Exception:
                 pass
             raise ValueError("启动 Chrome 调试端口超时，请重试。")
-        return _CdpContext(proc, debug_port, session_dir)
+        return _CdpContext(
+            proc,
+            debug_port,
+            session_dir,
+            timezone=str(env_cfg.get("timezone") or ""),
+            locale=str(env_cfg.get("locale") or ""),
+        )
 
     def _context_for(self, task_id, task=None):
         tid = int(task_id)

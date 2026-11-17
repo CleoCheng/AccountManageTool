@@ -19,6 +19,8 @@
   --bg-google: rgba(245, 158, 11, 0.12);
   --color-chatgpt: #10b981;
   --bg-chatgpt: rgba(16, 185, 129, 0.12);
+  --color-claude: #d97757;
+  --color-claude-soft: rgba(217, 119, 87, 0.14);
   --color-danger: #ef4444;
   --bg-danger: rgba(239, 68, 68, 0.12);
   --color-totp: #38bdf8;
@@ -49,6 +51,8 @@
   --bg-google: rgba(245, 158, 11, 0.12);
   --color-chatgpt: #059669;
   --bg-chatgpt: rgba(16, 185, 129, 0.12);
+  --color-claude: #d97757;
+  --color-claude-soft: rgba(217, 119, 87, 0.14);
   --color-danger: #dc2626;
   --bg-danger: rgba(220, 38, 38, 0.09);
   --color-totp: #0284c7;
@@ -277,6 +281,10 @@ body.light-theme .brand-logo {
 
 .dot-google {
   background-color: var(--color-google);
+}
+
+.dot-claude {
+  background-color: var(--color-claude);
 }
 
 .dot-domain-email {
@@ -796,6 +804,12 @@ select.health-filter-select option {
   color: var(--color-google);
 }
 
+.u-platform.Claude {
+  background: var(--color-claude-soft);
+  color: var(--color-claude);
+  border-color: rgba(217, 119, 87, 0.4);
+}
+
 .u-platform.Other {
   background: var(--bg-elevated);
   color: var(--text-secondary);
@@ -942,6 +956,35 @@ select.health-filter-select option {
   font-variant-numeric: tabular-nums;
 }
 
+/* Mail verification code rendered directly inside the 2FA code slot */
+.u-totp-box.mail-code-box {
+  padding: 2px 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+}
+
+.u-totp-box.mail-code-box.has-code {
+  border-color: rgba(34, 197, 94, 0.4);
+  background: rgba(34, 197, 94, 0.1);
+}
+
+.mail-code-label {
+  color: #22c55e;
+  font-weight: 700;
+}
+
+.mail-code-val {
+  color: #22c55e;
+  font-weight: 700;
+  letter-spacing: 0.8px;
+}
+
+.pending-mail-code {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
 .u-copy-group {
   display: flex;
   align-items: center;
@@ -1036,6 +1079,70 @@ select.health-filter-select option {
 .u-node-pill:hover {
   border-color: var(--border-focus);
   color: var(--text-primary);
+}
+
+/* Claude Guidance Banner in Node Modal */
+.node-claude-hint {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  border-radius: var(--radius-md);
+  background: var(--color-claude-soft);
+  border: 1px solid rgba(217, 119, 87, 0.35);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.node-claude-hint .claude-hint-icon {
+  font-size: 20px;
+  line-height: 1;
+  color: var(--color-claude);
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.node-claude-hint .claude-hint-text strong {
+  color: var(--color-claude);
+  display: block;
+  margin-bottom: 4px;
+  font-size: 12.5px;
+}
+
+.node-claude-hint .claude-hint-text p {
+  color: var(--text-secondary);
+  margin: 2px 0;
+}
+
+.node-claude-hint .claude-hint-text code {
+  font-family: "Cascadia Mono", "Consolas", monospace;
+  font-size: 11px;
+  padding: 1px 4px;
+  background: rgba(0, 0, 0, 0.2);
+  border-radius: 3px;
+  color: var(--text-primary);
+}
+
+.node-badge-recommend {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(217, 119, 87, 0.2);
+  color: var(--color-claude);
+  border: 1px solid rgba(217, 119, 87, 0.4);
+  margin-left: 6px;
+  flex-shrink: 0;
+}
+
+.u-node-pill.unbound-warn {
+  border-color: rgba(239, 68, 68, 0.45);
+  color: #f87171;
+  background: rgba(239, 68, 68, 0.1);
 }
 
 .node-lock-banner {
@@ -3471,7 +3578,13 @@ body.light-theme .modal-dict-card {
   color: var(--accent-primary);
 }
 
-/* Custom platform badges styling for WorkBuddy / Qcoder */
+/* Custom platform badges styling for WorkBuddy / Qcoder / Claude */
+.u-platform.Claude {
+  background: rgba(217, 119, 87, 0.18);
+  border-color: rgba(217, 119, 87, 0.4);
+  color: var(--color-claude);
+}
+
 .u-platform.WorkBuddy {
   background: rgba(99, 102, 241, 0.18);
   border-color: rgba(99, 102, 241, 0.4);
@@ -4230,4 +4343,50 @@ body.light-theme .u-wb-badge.wb-cred,
   color: var(--text-secondary);
   overflow-wrap: anywhere;
 }
+
+/* Mail Verification Code in Card 2FA Slot is styled by .u-totp-box.mail-code-box above */
+
+/* Table View Mail Code Cell */
+.tb-mail-code-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tb-mail-code-cell .tb-mail-code-val {
+  font-family: "Cascadia Mono", "Consolas", monospace;
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  color: #22c55e;
+  cursor: pointer;
+}
+
+.tb-mail-code-cell .tb-mail-code-val:hover {
+  text-decoration: underline;
+}
+
+.tb-mail-code-cell .tb-mail-code-pending {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-style: italic;
+}
+
+.tb-mail-code-cell .tb-mail-code-pending:hover {
+  color: var(--color-primary, #3b82f6);
+}
+
+.btn-ghost.danger,
+.btn.danger {
+  color: var(--color-danger);
+  border-color: rgba(239, 68, 68, 0.35);
+}
+
+.btn-ghost.danger:hover,
+.btn.danger:hover {
+  background: var(--bg-danger);
+  border-color: var(--color-danger);
+}
+
 

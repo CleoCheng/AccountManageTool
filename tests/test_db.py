@@ -249,6 +249,12 @@ def test_device_tags_and_system_dicts(tmp_path: Path):
     assert any(d["dict_key"] == "iPhone" for d in devices)
     assert any(d["dict_key"] == "Pad" for d in devices)
 
+    # Claude is a built-in system account type, pre-seeded on every DB init.
+    claude_dict = [d for d in types if d["dict_key"] == "Claude"][0]
+    assert claude_dict["is_system"] == 1
+    assert claude_dict["icon"] == "✴️"
+    assert claude_dict["dict_label"] == "Claude"
+
     a1 = svc.add_account({
         "account_type": "WorkBuddy",
         "account": "wb_user@workbuddy.ai",
@@ -270,23 +276,30 @@ def test_device_tags_and_system_dicts(tmp_path: Path):
 
     save_res = svc.save_system_dict({
         "dict_type": "account_type",
-        "dict_key": "Claude",
-        "dict_label": "Claude",
-        "color_class": "claude",
+        "dict_key": "Perplexity",
+        "dict_label": "Perplexity",
+        "color_class": "perplexity",
         "icon": "🤖",
         "sort_order": 10,
     })
     assert save_res["ok"] is True
-    assert save_res["dict"]["dict_key"] == "Claude"
+    assert save_res["dict"]["dict_key"] == "Perplexity"
 
     del_wb = [d for d in svc.list_system_dicts("account_type") if d["dict_key"] == "WorkBuddy"][0]
     del_wb_res = svc.delete_system_dict(del_wb["id"])
     assert del_wb_res["ok"] is False
     assert "正在使用" in del_wb_res["error"]
 
-    del_claude = [d for d in svc.list_system_dicts("account_type") if d["dict_key"] == "Claude"][0]
-    del_claude_res = svc.delete_system_dict(del_claude["id"])
-    assert del_claude_res["ok"] is True
+    del_perplexity = [
+        d for d in svc.list_system_dicts("account_type") if d["dict_key"] == "Perplexity"
+    ][0]
+    del_perplexity_res = svc.delete_system_dict(del_perplexity["id"])
+    assert del_perplexity_res["ok"] is True
+
+    # Built-in system dictionaries can never be deleted, even when unused.
+    del_claude_res = svc.delete_system_dict(claude_dict["id"])
+    assert del_claude_res["ok"] is False
+    assert "系统" in del_claude_res["error"]
 
 
 def test_attributes_and_custom_fields(tmp_path: Path):

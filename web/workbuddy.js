@@ -180,6 +180,16 @@ function renderWorkBuddyToolbar(visibleAccounts) {
     btnExport.textContent = count ? ("📤 导出勾选凭据 (" + count + ")") : "📤 导出全部凭据 (JSON)";
   }
 
+  const btnAutoPoll = document.getElementById("btn-toggle-auto-mail-poll");
+  if (btnAutoPoll) btnAutoPoll.style.display = domainView ? "" : "none";
+  const btnRefreshCodes = document.getElementById("btn-refresh-mail-codes");
+  if (btnRefreshCodes) btnRefreshCodes.style.display = domainView ? "" : "none";
+  const btnResetNodes = document.getElementById("btn-reset-email-nodes");
+  if (btnResetNodes) btnResetNodes.style.display = domainView ? "" : "none";
+  if (domainView && typeof syncAutoMailPollButton === "function") {
+    syncAutoMailPollButton();
+  }
+
   const progress = document.getElementById("workbuddy-progress");
   progress.style.display = workbuddy.queue.items.length ? "" : "none";
   progress.textContent = workbuddy.queue.current ? "继续当前任务" : "查看上次结果";

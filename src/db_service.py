@@ -1,4 +1,5 @@
 import re
+import time
 from collections.abc import Iterator
 from contextlib import closing, contextmanager
 from datetime import date, datetime
@@ -35,6 +36,7 @@ DEFAULT_DICTS = [
     ("account_type", "WorkBuddy", "WorkBuddy", "WorkBuddy", "workbuddy", "💼", 3, 0, 0),
     ("account_type", "域名邮箱", "域名邮箱", "https://mail.ggb6.com", "domain-email", "✉️", 4, 0, 1),
     ("account_type", "Qcoder", "Qcoder", "Qcoder", "qcoder", "⚡", 5, 0, 0),
+    ("account_type", "Claude", "Claude", "Claude", "claude", "✴️", 6, 0, 1),
     # 设备标记
     ("device_tag", "主机", "主机", "主机", "host", "🖥️", 1, 1, 1),
     ("device_tag", "iPhone", "iPhone", "iPhone", "iphone", "📱", 2, 0, 1),
@@ -304,6 +306,9 @@ class DatabaseService:
         fp_cfg.setdefault("proxy", "")
         fp_cfg.setdefault("proxy_node", "")
         fp_cfg.setdefault("node_locked", False)
+        for key in ("timezone", "locale", "accept_languages"):
+            if fp_cfg.get(key) is None:
+                fp_cfg[key] = ""
         item["fp_config"] = fp_cfg
         return item
 
@@ -442,7 +447,14 @@ class DatabaseService:
                 fields,
             )
             new_id = cur.lastrowid
-            fp = generate_fingerprint_config(new_id, fields[4], proxy=proxy)
+            fp = generate_fingerprint_config(
+                new_id,
+                fields[4],
+                proxy=proxy,
+                timezone=str(data.get("timezone") or "").strip(),
+                locale=str(data.get("locale") or "").strip(),
+                accept_languages=str(data.get("accept_languages") or "").strip(),
+            )
             conn.execute(
                 "UPDATE accounts SET fp_config_json = ? WHERE id = ?",
                 (json.dumps(fp, ensure_ascii=False), new_id),
@@ -469,7 +481,14 @@ class DatabaseService:
                     fields,
                 )
                 new_id = cur.lastrowid
-                fp = generate_fingerprint_config(new_id, account)
+                fp = generate_fingerprint_config(
+                    new_id,
+                    account,
+                    proxy=str(data.get("proxy") or "").strip(),
+                    timezone=str(data.get("timezone") or "").strip(),
+                    locale=str(data.get("locale") or "").strip(),
+                    accept_languages=str(data.get("accept_languages") or "").strip(),
+                )
                 conn.execute(
                     "UPDATE accounts SET fp_config_json = ? WHERE id = ?",
                     (json.dumps(fp, ensure_ascii=False), new_id),
@@ -505,6 +524,15 @@ class DatabaseService:
                 fp_cfg["proxy"] = (data.get("proxy") or "").strip()
             if "proxy_node" in data:
                 fp_cfg["proxy_node"] = (data.get("proxy_node") or "").strip()
+        # Explicit timezone/locale overrides live on the fingerprint config so
+        # the browser env resolver can honour them on every launch.
+        for key in ("timezone", "locale", "accept_languages"):
+            if key in data:
+                fp_cfg[key] = str(data.get(key) or "").strip()
+        for key in ("proxy", "proxy_node", "node_locked"):
+            fp_cfg.setdefault(key, "" if key != "node_locked" else False)
+        for key in ("timezone", "locale", "accept_languages"):
+            fp_cfg.setdefault(key, "")
 
         with self._connect() as conn:
             conn.execute(
@@ -583,6 +611,100 @@ class DatabaseService:
             row = conn.execute("SELECT * FROM accounts WHERE id = ?", (int(account_id),)).fetchone()
         return {"ok": True, "account": self._enrich_row(row)}
 
+    # -------------------------------------------------------------
+    # Domain Email Verification Codes & Node Allocation
+    # -------------------------------------------------------------
+    def record_email_verification_code(self, account_id: int, code_info: dict) -> dict | None:
+        existing = self.get_account(int(account_id))
+        if not existing or not isinstance(code_info, dict):
+            return existing
+        cf = dict(existing.get("custom_fields") or {})
+        cf["latest_code"] = str(code_info.get("code") or "")
+        cf["code_received_at"] = int(code_info.get("timestamp") or time.time())
+        cf["code_subject"] = str(code_info.get("subject") or "")
+        cf["has_received_code"] = True
+        return self.update_account(int(account_id), {"custom_fields": cf})
+
+    def get_node_code_stats(self) -> dict[str, int]:
+        stats: dict[str, int] = {}
+        for acc in self.list_accounts():
+            cf = acc.get("custom_fields") or {}
+            received = cf.get("has_received_code") is True or bool(
+                str(cf.get("latest_code") or "").strip()
+            )
+            if not received:
+                continue
+            node = str((acc.get("fp_config") or {}).get("proxy_node") or "").strip()
+            if node:
+                stats[node] = stats.get(node, 0) + 1
+        return stats
+
+    def allocate_clean_node_for_account(
+        self,
+        account_id: int,
+        available_nodes: list[str],
+        default_proxy_url: str = "http://127.0.0.1:17899",
+    ) -> str:
+        existing = self.get_account(int(account_id))
+        if not existing:
+            return ""
+        fp_cfg = existing.get("fp_config") or {}
+        locked_node = str(fp_cfg.get("proxy_node") or "").strip()
+        if fp_cfg.get("node_locked") and locked_node:
+            return locked_node
+
+        stats = self.get_node_code_stats()
+        chosen_node = ""
+        for node in available_nodes or []:
+            name = str(node or "").strip()
+            if not name:
+                continue
+            if stats.get(name, 0) < 2:
+                chosen_node = name
+                break
+        if not chosen_node:
+            return ""
+
+        if fp_cfg.get("node_locked"):
+            # A stale lock without a usable node must be released before rebinding.
+            self.set_account_node_lock(int(account_id), False)
+        self.bind_account_proxy_node(
+            int(account_id),
+            proxy_url=default_proxy_url,
+            proxy_node=chosen_node,
+            locked=True,
+        )
+        return chosen_node
+
+    def reset_domain_email_nodes(self, account_ids: list[int] | None = None) -> dict:
+        if account_ids:
+            wanted = {int(i) for i in account_ids if int(i) > 0}
+            candidates = [acc for acc in self.list_accounts() if acc["id"] in wanted]
+        else:
+            candidates = self.list_accounts(account_type="域名邮箱")
+
+        reset_count = 0
+        for acc in candidates:
+            fp_cfg = dict(acc.get("fp_config") or {})
+            fp_cfg["proxy_node"] = ""
+            fp_cfg["node_locked"] = False
+            cf = dict(acc.get("custom_fields") or {})
+            cf.pop("latest_code", None)
+            cf.pop("code_received_at", None)
+            cf.pop("code_subject", None)
+            cf.pop("has_received_code", None)
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE accounts SET fp_config_json = ?, custom_fields_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (
+                        json.dumps(fp_cfg, ensure_ascii=False),
+                        json.dumps(cf, ensure_ascii=False),
+                        int(acc["id"]),
+                    ),
+                )
+            reset_count += 1
+        return {"ok": True, "reset_count": reset_count}
+
     def regenerate_fingerprint(self, account_id: int, salt: str = "") -> dict | None:
         existing = self.get_account(account_id)
         if not existing:
@@ -595,6 +717,9 @@ class DatabaseService:
             proxy_node=old_fp.get("proxy_node", ""),
             node_locked=bool(old_fp.get("node_locked", False)),
             salt=salt,
+            timezone=str(old_fp.get("timezone") or ""),
+            locale=str(old_fp.get("locale") or ""),
+            accept_languages=str(old_fp.get("accept_languages") or ""),
         )
         with self._connect() as conn:
             conn.execute(
@@ -769,6 +894,7 @@ class DatabaseService:
             total = conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
             google = conn.execute("SELECT COUNT(*) FROM accounts WHERE account_type = 'Google'").fetchone()[0]
             chatgpt = conn.execute("SELECT COUNT(*) FROM accounts WHERE account_type = 'ChatGPT'").fetchone()[0]
+            claude = conn.execute("SELECT COUNT(*) FROM accounts WHERE account_type = 'Claude'").fetchone()[0]
             available = conn.execute(
                 "SELECT COUNT(*) FROM accounts WHERE health_status = '可用' AND (deactivated_date IS NULL OR deactivated_date = '')"
             ).fetchone()[0]
@@ -813,9 +939,10 @@ class DatabaseService:
             "total": total,
             "google": google,
             "chatgpt": chatgpt,
+            "claude": claude,
             "types": type_counts,
             "devices": device_counts,
-            "other": total - google - chatgpt,
+            "other": max(0, total - google - chatgpt - claude),
             "available": available,
             "unavailable": unavailable,
             "active": available,

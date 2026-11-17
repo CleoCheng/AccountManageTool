@@ -2,6 +2,12 @@ from pathlib import Path
 from src.api import AccountApi
 
 
+def _domain_email(api: AccountApi, email: str, password: str = "MailPass#2026") -> dict:
+    res = api.save_account({"account_type": "域名邮箱", "account": email, "password": password})
+    assert res["ok"] is True
+    return res["account"]
+
+
 def test_api_smart_parse_and_save_and_settings(tmp_path: Path):
     data_dir = tmp_path / "data"
     api = AccountApi(data_dir=data_dir)
@@ -272,3 +278,287 @@ def test_attribute_api(tmp_path: Path):
     })
     assert acc_res["ok"] is True
     assert acc_res["account"]["custom_fields"].get("backup_phone") == "+123456789"
+
+
+def test_launch_browser_domain_email_uses_isolated_browser(tmp_path: Path, monkeypatch):
+    import src.browser_service as bs
+
+    api = AccountApi(data_dir=tmp_path / "data")
+    acc = _domain_email(api, "launch01@staff.example")
+
+    opened = []
+    monkeypatch.setattr("webbrowser.open", lambda *a, **k: opened.append(a) or True)
+
+    launched = {}
+
+    def fake_launch(data_dir, account):
+        launched["data_dir"] = data_dir
+        launched["account"] = account
+        return {"ok": True, "profile_dir": str(data_dir / "browsers" / f"acc_{account['id']}"), "fp_config": account["fp_config"]}
+
+    monkeypatch.setattr(bs, "launch_isolated_browser", fake_launch)
+    monkeypatch.setattr(api, "allocate_node_for_domain_email", lambda account_id: "Node-A")
+
+    res = api.launch_browser(acc["id"])
+    assert res["ok"] is True
+    assert opened == []
+    assert launched["account"]["account_type"] == "域名邮箱"
+    assert "profile_dir" in res and "fp_config" in res
+
+
+def test_launch_browser_domain_email_allocates_node_when_unlocked(tmp_path: Path, monkeypatch):
+    import src.browser_service as bs
+
+    api = AccountApi(data_dir=tmp_path / "data")
+    acc = _domain_email(api, "launch02@staff.example")
+    calls = []
+
+    def fake_allocate(account_id):
+        calls.append(account_id)
+        api.db.bind_account_proxy_node(account_id, "http://127.0.0.1:17899", "Node-X", locked=True)
+        return "Node-X"
+
+    monkeypatch.setattr(api, "allocate_node_for_domain_email", fake_allocate)
+    monkeypatch.setattr(bs, "launch_isolated_browser", lambda d, a: {"ok": True, "fp_config": a["fp_config"]})
+
+    res = api.launch_browser(acc["id"])
+    assert calls == [acc["id"]]
+    assert res["fp_config"]["proxy_node"] == "Node-X"
+
+
+def test_launch_browser_domain_email_keeps_locked_node(tmp_path: Path, monkeypatch):
+    import src.browser_service as bs
+
+    api = AccountApi(data_dir=tmp_path / "data")
+    acc = _domain_email(api, "launch03@staff.example")
+    api.db.bind_account_proxy_node(acc["id"], "http://127.0.0.1:17899", "Node-Locked", locked=True)
+
+    monkeypatch.setattr(api, "allocate_node_for_domain_email", lambda account_id: (_ for _ in ()).throw(AssertionError("must not allocate")))
+    monkeypatch.setattr(bs, "launch_isolated_browser", lambda d, a: {"ok": True, "fp_config": a["fp_config"]})
+
+    res = api.launch_browser(acc["id"])
+    assert res["fp_config"]["proxy_node"] == "Node-Locked"
+
+
+def test_allocate_clean_node_skips_full_nodes(tmp_path: Path):
+    api = AccountApi(data_dir=tmp_path / "data")
+    full = [_domain_email(api, f"full{i}@staff.example") for i in range(2)]
+    for acc in full:
+        api.db.bind_account_proxy_node(acc["id"], "http://127.0.0.1:17899", "Node-Full", locked=True)
+        api.db.record_email_verification_code(acc["id"], {"code": "123456", "timestamp": 1})
+
+    fresh = _domain_email(api, "fresh@staff.example")
+    chosen = api.db.allocate_clean_node_for_account(
+        fresh["id"], ["Node-Full", "Node-Empty"], default_proxy_url="http://127.0.0.1:17899"
+    )
+    assert chosen == "Node-Empty"
+    updated = api.db.get_account(fresh["id"])
+    assert updated["fp_config"]["proxy_node"] == "Node-Empty"
+    assert updated["fp_config"]["node_locked"] is True
+
+
+def test_allocate_clean_node_keeps_existing_locked_binding(tmp_path: Path):
+    api = AccountApi(data_dir=tmp_path / "data")
+    acc = _domain_email(api, "locked@staff.example")
+    api.db.bind_account_proxy_node(acc["id"], "http://127.0.0.1:17899", "Node-Locked", locked=True)
+
+    chosen = api.db.allocate_clean_node_for_account(acc["id"], ["Node-Other"])
+    assert chosen == "Node-Locked"
+    assert api.db.get_account(acc["id"])["fp_config"]["proxy_node"] == "Node-Locked"
+
+
+def test_reset_domain_email_nodes_clears_proxy_and_codes(tmp_path: Path):
+    api = AccountApi(data_dir=tmp_path / "data")
+    acc = _domain_email(api, "reset01@staff.example")
+    other = _domain_email(api, "reset02@staff.example")
+    api.db.bind_account_proxy_node(acc["id"], "http://127.0.0.1:17899", "Node-R1", locked=True)
+    api.db.record_email_verification_code(acc["id"], {"code": "654321", "timestamp": 100, "subject": "Code"})
+    api.db.bind_account_proxy_node(other["id"], "http://127.0.0.1:17899", "Node-R2", locked=True)
+    api.db.record_email_verification_code(other["id"], {"code": "112233", "timestamp": 200, "subject": "Code"})
+
+    res = api.reset_domain_email_nodes([acc["id"]])
+    assert res == {"ok": True, "reset_count": 1}
+
+    reset = api.db.get_account(acc["id"])
+    assert reset["fp_config"]["proxy_node"] == ""
+    assert reset["fp_config"]["node_locked"] is False
+    for key in ("latest_code", "code_received_at", "code_subject", "has_received_code"):
+        assert key not in reset["custom_fields"]
+
+    untouched = api.db.get_account(other["id"])
+    assert untouched["fp_config"]["proxy_node"] == "Node-R2"
+    assert untouched["custom_fields"]["latest_code"] == "112233"
+
+    res_all = api.reset_domain_email_nodes()
+    assert res_all["ok"] is True
+    assert res_all["reset_count"] == 2
+    assert api.db.get_node_code_stats() == {}
+
+
+def test_get_domain_email_codes_records_and_returns_codes(tmp_path: Path, monkeypatch):
+    import src.api as api_module
+
+    api = AccountApi(data_dir=tmp_path / "data")
+    acc = _domain_email(api, "codes01@staff.example")
+    api.db.bind_account_proxy_node(acc["id"], "http://127.0.0.1:17899", "Node-C1", locked=True)
+
+    calls = []
+
+    def fake_fetch(email, password, max_age_seconds=1800):
+        calls.append((email, password))
+        return {"code": "998877", "from": "GitHub <noreply@github.com>", "subject": "Your launch code", "date": "today", "timestamp": 123456}
+
+    monkeypatch.setattr(api_module, "fetch_latest_mail_code", fake_fetch)
+
+    res = api.get_domain_email_codes([acc["id"]])
+    assert res["ok"] is True
+    assert calls == [("codes01@staff.example", "MailPass#2026")]
+    entry = res["codes"][acc["id"]]
+    assert entry["code"] == "998877"
+    assert entry["received_at"] == 123456
+    assert entry["subject"] == "Your launch code"
+    assert entry["proxy_node"] == "Node-C1"
+    assert res["node_stats"] == {"Node-C1": 1}
+
+    stored = api.db.get_account(acc["id"])["custom_fields"]
+    assert stored["latest_code"] == "998877"
+    assert stored["has_received_code"] is True
+    assert api.get_dashboard()["node_code_stats"] == {"Node-C1": 1}
+
+
+def test_get_domain_email_codes_ignores_missing_mail(tmp_path: Path, monkeypatch):
+    import src.api as api_module
+
+    api = AccountApi(data_dir=tmp_path / "data")
+    acc = _domain_email(api, "codes02@staff.example")
+    monkeypatch.setattr(api_module, "fetch_latest_mail_code", lambda *a, **k: None)
+
+    res = api.get_domain_email_codes()
+    assert res["ok"] is True
+    assert res["codes"] == {}
+    assert "latest_code" not in api.db.get_account(acc["id"])["custom_fields"]
+
+
+def test_get_domain_email_codes_only_polls_active_accounts_when_many_exist(tmp_path: Path, monkeypatch):
+    import json
+
+    import src.api as api_module
+
+    data_dir = tmp_path / "data"
+    api = AccountApi(data_dir=data_dir)
+    accounts = [_domain_email(api, f"active{i}@staff.example") for i in range(7)]
+    active1, active2, active3 = accounts[0], accounts[1], accounts[2]
+    idle = accounts[3:]
+
+    api.db.bind_account_proxy_node(active1["id"], "http://127.0.0.1:17899", "Node-Active", locked=True)
+    (data_dir / "browsers" / f"acc_{active2['id']}").mkdir(parents=True)
+    # DatabaseService._prepare_fields normalises 进行中 back to 未完成 on save,
+    # so persist the raw custom fields JSON to model an in-progress registration.
+    with api.db._connect() as conn:
+        conn.execute(
+            "UPDATE accounts SET custom_fields_json = ? WHERE id = ?",
+            (json.dumps({"wb_reg_status": "进行中"}, ensure_ascii=False), active3["id"]),
+        )
+
+    called_emails = []
+
+    def fake_fetch(email, password, max_age_seconds=1800):
+        called_emails.append(email)
+        return None
+
+    monkeypatch.setattr(api_module, "fetch_latest_mail_code", fake_fetch)
+
+    res = api.get_domain_email_codes()
+    assert res["ok"] is True
+    assert set(called_emails) == {
+        active1["account"],
+        active2["account"],
+        active3["account"],
+    }
+    for acc in idle:
+        assert acc["account"] not in called_emails
+
+
+def test_get_domain_email_codes_skips_all_when_many_and_none_active(tmp_path: Path, monkeypatch):
+    import src.api as api_module
+
+    api = AccountApi(data_dir=tmp_path / "data")
+    for i in range(7):
+        _domain_email(api, f"idle{i}@staff.example")
+
+    calls = []
+    monkeypatch.setattr(
+        api_module,
+        "fetch_latest_mail_code",
+        lambda *a, **k: calls.append(a) or None,
+    )
+
+    res = api.get_domain_email_codes()
+    assert res["ok"] is True
+    assert res["codes"] == {}
+    assert calls == []
+
+
+def test_smart_parse_and_batch_import_with_claude_category(tmp_path: Path):
+    api = AccountApi(data_dir=tmp_path / "data")
+
+    raw = (
+        "claude_one@example.com----ClaudePass#1----JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP\n"
+        "claude_two@example.com----ClaudePass#2----GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
+    )
+    parsed = api.smart_parse(raw, "Claude")
+    assert parsed["count"] == 2
+    assert all(r["account_type"] == "Claude" for r in parsed["records"])
+    assert parsed["records"][0]["totp"]["valid"] is True
+
+    imported = api.batch_import(raw, "Claude")
+    assert imported == {"ok": True, "imported": 2}
+    claude_items = api.get_dashboard(account_type="Claude")["accounts"]
+    assert sorted(i["account"] for i in claude_items) == [
+        "claude_one@example.com",
+        "claude_two@example.com",
+    ]
+    stats = api.get_dashboard()["stats"]
+    assert stats["claude"] == 2
+    assert stats["types"]["Claude"] == 2
+    assert stats["other"] == 0
+
+    # Domain mailboxes keep their dedicated parser even with the Claude label.
+    domain_res = api.batch_import("mailbox01@other.example----PasswordOne", "域名邮箱")
+    assert domain_res == {"ok": True, "imported": 1}
+    assert api.get_dashboard(account_type="域名邮箱")["stats"]["types"]["Claude"] == 2
+
+
+def test_smart_parse_without_category_keeps_existing_behaviour(tmp_path: Path):
+    api = AccountApi(data_dir=tmp_path / "data")
+    parsed = api.smart_parse(
+        "alice_demo01@example.com----DemoPass#2026!----JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
+    )
+    assert parsed["records"][0]["account_type"] == "ChatGPT"
+    google = api.smart_parse(
+        "bob_google99@gmail.com----GoogleDemo#888----recovery_demo@example.org"
+        "----gezdgnbvgy3tqojqgezdgnbvgy3tqojq----2024----US"
+    )
+    assert google["records"][0]["account_type"] == "Google"
+    domain = api.smart_parse("mailbox01@ggb6.com----MailboxPass#2026!")
+    assert domain["records"][0]["account_type"] == "域名邮箱"
+
+
+def test_get_proxy_nodes_forwards_claude_category(tmp_path: Path, monkeypatch):
+    import src.api as api_module
+
+    calls = []
+
+    def fake_detect(account_type=""):
+        calls.append(account_type)
+        return {"nodes": [{"name": "US | MiyaIP-2 HY2"}], "ports": []}
+
+    monkeypatch.setattr(api_module, "detect_proxy_environment", fake_detect)
+    api = AccountApi(data_dir=tmp_path / "data")
+    acc = api.save_account(
+        {"account_type": "Claude", "account": "claude_nodes@example.com", "password": "pw"}
+    )["account"]
+
+    api.get_proxy_nodes("Claude")
+    api.get_proxy_nodes(acc["id"])
+    assert calls == ["Claude", "Claude"]

@@ -26,6 +26,8 @@ const state = {
   selectedProxyUrl: "http://127.0.0.1:17899",
   selectedNodeName: "",
   _initialFilterRestored: false,
+  nodeCodeStats: {},
+  autoMailCodePolling: false,
   // System Settings State
   currentDictTab: "account_type",
   editingDictId: null,
@@ -93,6 +95,9 @@ async function loadDashboard() {
       }
     }
     state.accounts = data.accounts || [];
+    if (data.node_code_stats) {
+      state.nodeCodeStats = data.node_code_stats;
+    }
     updateWorkBuddyQueue(data.workbuddy);
     state.stats = data.stats || { total: 0, google: 0, chatgpt: 0, types: {}, devices: {}, other: 0, active: 0, deactivated: 0, available: 0, unavailable: 0, health: {}, antigravity: {} };
     if (data.dicts) {
@@ -112,6 +117,14 @@ async function loadDashboard() {
     syncTopBarPills();
     syncAntigravitySelectStyle();
     renderAccounts();
+    if (state.filterType === "域名邮箱" && state.autoMailCodePolling) {
+      startMailCodePolling();
+    } else {
+      stopMailCodePolling();
+    }
+    if (typeof syncAutoMailPollButton === "function") {
+      syncAutoMailPollButton();
+    }
   } catch (err) {
     console.error("Load dashboard failed:", err);
   }
@@ -143,14 +156,46 @@ function renderStats() {
         })
         .join("");
     } else {
+      const claudeCount = state.stats.claude ?? typeCounts.Claude ?? 0;
       optionsHtml += `
         <option value="ChatGPT">ChatGPT (${state.stats.chatgpt || 0})</option>
         <option value="Google">Google (${state.stats.google || 0})</option>
+        <option value="Claude">Claude (${claudeCount})</option>
       `;
     }
     topSel.innerHTML = optionsHtml;
     topSel.value = state.filterType || "All";
     syncCustomSelect(topSel);
+  }
+
+  syncPlatformDotColor();
+}
+
+function syncPlatformDotColor() {
+  const dot = document.getElementById("topbar-platform-dot");
+  if (!dot) return;
+  const p = state.filterType;
+  if (p === "Claude") {
+    dot.style.backgroundColor = "var(--color-claude)";
+    dot.style.boxShadow = "0 0 6px rgba(217, 119, 87, 0.6)";
+  } else if (p === "ChatGPT") {
+    dot.style.backgroundColor = "var(--color-chatgpt)";
+    dot.style.boxShadow = "0 0 6px rgba(16, 185, 129, 0.6)";
+  } else if (p === "Google") {
+    dot.style.backgroundColor = "var(--color-google)";
+    dot.style.boxShadow = "0 0 6px rgba(245, 158, 11, 0.6)";
+  } else if (p === "WorkBuddy") {
+    dot.style.backgroundColor = "#818cf8";
+    dot.style.boxShadow = "0 0 6px rgba(129, 140, 248, 0.6)";
+  } else if (p === "域名邮箱") {
+    dot.style.backgroundColor = "#38bdf8";
+    dot.style.boxShadow = "0 0 6px rgba(56, 189, 248, 0.6)";
+  } else if (p === "Qcoder") {
+    dot.style.backgroundColor = "#f472b6";
+    dot.style.boxShadow = "0 0 6px rgba(244, 114, 182, 0.6)";
+  } else {
+    dot.style.backgroundColor = "var(--accent-primary)";
+    dot.style.boxShadow = "0 0 6px rgba(59, 130, 246, 0.6)";
   }
 }
 
@@ -169,6 +214,8 @@ function syncTopBarPills() {
   if (pillPlatWrap) pillPlatWrap.classList.toggle("active", state.filterType !== "All");
   if (pillAvail) pillAvail.classList.toggle("active", state.healthFilter === "可用");
   if (pillUnavail) pillUnavail.classList.toggle("active", state.healthFilter === "不可用");
+
+  syncPlatformDotColor();
 }
 
 function isAttributeApplicable(attr, platform) {
@@ -203,6 +250,7 @@ function renderFilterDropdowns() {
       html += `
         <option value="ChatGPT">🤖 ChatGPT</option>
         <option value="Google">🔍 Google</option>
+        <option value="Claude">✴️ Claude</option>
       `;
     }
     platSel.innerHTML = html;
@@ -311,6 +359,14 @@ function setDeviceFilter(dev) {
 
 function setFilterType(type) {
   state.filterType = type || "All";
+  if (state.filterType === "域名邮箱" && state.autoMailCodePolling) {
+    startMailCodePolling();
+  } else {
+    stopMailCodePolling();
+  }
+  if (typeof syncAutoMailPollButton === "function") {
+    syncAutoMailPollButton();
+  }
   const topSel = document.getElementById("topbar-platform-select");
   if (topSel && topSel.value !== state.filterType) {
     topSel.value = state.filterType;
@@ -323,6 +379,7 @@ function setFilterType(type) {
   syncCustomSelect(platSel);
   renderFilterDropdowns();
   syncTopBarPills();
+  syncPlatformDotColor();
   callApi("save_settings", { last_filter_type: state.filterType }).catch(() => {});
   loadDashboard();
 }
@@ -579,13 +636,23 @@ function getFpSummary(item) {
   const proxyNode = fp.proxy_node || "";
   const locked = !!fp.node_locked;
   const proxyPort = fp.proxy ? fp.proxy.replace("http://127.0.0.1:", ":") : "";
+
+  const isClaude = item.account_type === "Claude";
+  const isBound = !!(proxyNode || fp.proxy);
+  const tz = fp.timezone || (isClaude ? "America/Los_Angeles" : "系统默认");
+  const locale = fp.locale || (isClaude ? "en-US, en" : "系统默认");
+  const warnText = isClaude && !isBound ? "⚠️ 未绑定代理" : "";
+
+  let tooltip = `专属配对指纹环境 [${code}]\nGPU: ${gpu}\nCPU/内存: ${cpu}核 / ${mem}GB\n分辨率: ${scr}\n绑定节点: ${proxyNode || (isClaude ? "⚠️ 未绑定代理 (建议美西住宅代理)" : "未绑定")} (${locked ? "已锁定" : "未锁定"})\n端口: ${fp.proxy || "默认"}\n时区/语言: ${tz} · ${locale}\n数据隔离目录: data/browsers/acc_${item.id}`;
+
   return {
     code,
     proxyNode,
     locked,
     proxyPort,
-    shortDesc: `${gpu} · ${cpu}核/${mem}G · ${scr}`,
-    tooltip: `专属配对指纹环境 [${code}]\nGPU: ${gpu}\nCPU/内存: ${cpu}核 / ${mem}GB\n分辨率: ${scr}\n绑定节点: ${proxyNode || "未绑定"} (${locked ? "已锁定" : "未锁定"})\n端口: ${fp.proxy || "默认"}\n数据隔离目录: data/browsers/acc_${item.id}`,
+    shortDesc: `${gpu} · ${cpu}核/${mem}G · ${scr}${warnText ? ` · ${warnText}` : ""}`,
+    tooltip,
+    warnText,
   };
 }
 
@@ -677,9 +744,44 @@ function renderCardItem(item, remaining) {
     : `<span class="u-2fa-flag none" title="未配置 2FA 动态秘钥">🛡️ 无2FA</span>`;
 
   const fpInfo = getFpSummary(item);
-  const nodePillText = fpInfo.proxyNode
+  const isClaude = item.account_type === "Claude";
+  const isUnboundClaude = isClaude && !fpInfo.proxyNode && !(item.fp_config && item.fp_config.proxy);
+  let nodePillText = fpInfo.proxyNode
     ? `${fpInfo.locked ? "🔒" : "🔓"} ${fpInfo.proxyNode}${fpInfo.proxyPort ? ` (${fpInfo.proxyPort})` : ""}`
-    : "🔓 绑定节点";
+    : (isClaude ? "⚠️ 未绑定代理" : "🔓 绑定节点");
+  if (item.account_type === "域名邮箱" && fpInfo.proxyNode) {
+    const c = (state.nodeCodeStats && state.nodeCodeStats[fpInfo.proxyNode]) || 0;
+    nodePillText = `${fpInfo.locked ? "🔒" : "🔓"} ${fpInfo.proxyNode} (${c}/2 已收码)`;
+  }
+
+  let totpBoxHtml;
+  if (item.account_type === "域名邮箱") {
+    if (item.custom_fields && item.custom_fields.latest_code) {
+      totpBoxHtml = `
+        <div class="u-totp-box mail-code-box has-code" onclick="copyTotpCode(this, ${item.id})" title="最新邮件验证码: ${escapeHtml(item.custom_fields.latest_code)} · 点击直接复制">
+          <span class="u-totp-label mail-code-label">邮件码</span>
+          <span class="u-totp-code mail-code-val" id="totp-code-${item.id}">${escapeHtml(item.custom_fields.latest_code)}</span>
+          <span class="u-totp-sec">(${formatTimeAgo(item.custom_fields.code_received_at)})</span>
+        </div>
+      `;
+    } else {
+      totpBoxHtml = `
+        <div class="u-totp-box mail-code-box pending" onclick="copyTotpCode(this, ${item.id})" title="暂无验证码 · 点击立即连接邮箱查信">
+          <span class="u-totp-label mail-code-label">邮件码</span>
+          <span class="u-totp-code pending-mail-code" id="totp-code-${item.id}">暂无 (查信)</span>
+          <span class="u-totp-sec">🔄</span>
+        </div>
+      `;
+    }
+  } else {
+    totpBoxHtml = `
+      <div class="u-totp-box" onclick="copyTotpCode(null, ${item.id})" title="点击复制 6 位 2FA 动态验证码">
+        <span class="u-totp-label">2FA码</span>
+        <span class="u-totp-code" id="totp-code-${item.id}">${totpFormatted}</span>
+        ${hasTotp ? `<span class="u-totp-sec">(<span class="card-rem-sec">${remaining}</span>s)</span>` : ""}
+      </div>
+    `;
+  }
 
   const metaLeft = getUnifiedMetaSummary(item);
   const showDrawer = state.viewMode === "full" || !!state.expandedCards[item.id];
@@ -930,7 +1032,7 @@ function renderCardItem(item, remaining) {
           </span>
         </div>
         <div class="u-status-right">
-          <button class="u-node-pill ${fpInfo.locked ? "locked" : ""}" onclick="openNodeModal(${item.id})" title="专属代理节点">
+          <button class="u-node-pill ${fpInfo.locked ? "locked" : ""} ${isUnboundClaude ? "unbound-warn" : ""}" onclick="openNodeModal(${item.id})" title="专属代理节点">
             ${escapeHtml(nodePillText)}
           </button>
         </div>
@@ -938,11 +1040,7 @@ function renderCardItem(item, remaining) {
 
       <!-- Line 3: Unified TOTP + 1-Click Copy + Fingerprint Browser Launch Strip -->
       <div class="u-action-bar">
-        <div class="u-totp-box" onclick="copyTotpCode(null, ${item.id})" title="点击复制 6 位 2FA 动态验证码">
-          <span class="u-totp-label">2FA码</span>
-          <span class="u-totp-code" id="totp-code-${item.id}">${totpFormatted}</span>
-          ${hasTotp ? `<span class="u-totp-sec">(<span class="card-rem-sec">${remaining}</span>s)</span>` : ""}
-        </div>
+        ${totpBoxHtml}
 
         <div class="u-copy-group">
           <button class="copy-btn" onclick="copyFieldValue(this, ${item.id}, 'account', '账号')">账号</button>
@@ -968,6 +1066,11 @@ function renderCardItem(item, remaining) {
         </div>
 
         <div class="u-card-tools">
+          ${
+            item.account_type === "域名邮箱"
+              ? `<button class="tool-link danger" onclick="confirmResetDomainEmailNodes(${item.id})" title="重置该邮箱绑定的代理节点与收码记录">重置节点</button>`
+              : ""
+          }
           ${
             state.viewMode === "compact"
               ? `<button class="tool-link" onclick="toggleCardExpand(${item.id})">${showDrawer ? "收起 ▴" : "详情 ▾"}</button>`
@@ -1000,9 +1103,15 @@ function renderTableView(remaining, list = state.accounts) {
       const isPwdModified = !!item.password_modified;
       const is2faModified = !!item.twofa_modified;
       const fpInfo = getFpSummary(item);
-      const nodePillText = fpInfo.proxyNode
+      const isClaude = item.account_type === "Claude";
+      const isUnboundClaude = isClaude && !fpInfo.proxyNode && !(item.fp_config && item.fp_config.proxy);
+      let nodePillText = fpInfo.proxyNode
         ? `${fpInfo.locked ? "🔒" : "🔓"} ${fpInfo.proxyNode}`
-        : "🔓 绑定节点";
+        : (isClaude ? "⚠️ 未绑定代理" : "🔓 绑定节点");
+      if (item.account_type === "域名邮箱" && fpInfo.proxyNode) {
+        const c = (state.nodeCodeStats && state.nodeCodeStats[fpInfo.proxyNode]) || 0;
+        nodePillText = `${fpInfo.locked ? "🔒" : "🔓"} ${fpInfo.proxyNode} (${c}/2 已收码)`;
+      }
 
       const healthBadgeHtml = `
         <div class="u-health-dropdown" data-acc-id="${item.id}">
@@ -1107,7 +1216,7 @@ function renderTableView(remaining, list = state.accounts) {
                 <button class="u-peek-btn" onclick="toggleReveal(${item.id}, 'account')">${showAcc ? "隐" : "明"}</button>
               </div>
               <div class="tb-acc-row2">
-                <button class="u-node-pill ${fpInfo.locked ? "locked" : ""}" onclick="openNodeModal(${item.id})" title="${escapeHtml(fpInfo.proxyNode || '直连')}">
+                <button class="u-node-pill ${fpInfo.locked ? "locked" : ""} ${isUnboundClaude ? "unbound-warn" : ""}" onclick="openNodeModal(${item.id})" title="${escapeHtml(fpInfo.proxyNode || '直连')}">
                   ${escapeHtml(nodePillText)}
                 </button>
                 ${deviceChipHtml}
@@ -1142,10 +1251,21 @@ function renderTableView(remaining, list = state.accounts) {
             </div>
           </td>
           <td>
-            <div class="tb-col-totp">
-              <span class="u-totp-code" id="totp-code-${item.id}" onclick="copyTotpCode(null, ${item.id})" title="点击复制动态码">${totpFormatted}</span>
-              ${hasTotp ? `<span class="u-totp-sec"><span class="card-rem-sec">${remaining}</span>s</span>` : ""}
-            </div>
+            ${
+              item.account_type === "域名邮箱"
+                ? (item.custom_fields && item.custom_fields.latest_code
+                    ? `<div class="tb-col-totp tb-mail-code-cell">
+                        <span class="tb-mail-code-val" onclick="copyTotpCode(null, ${item.id})" title="点击复制最新邮件验证码: ${escapeHtml(item.custom_fields.latest_code)}">${escapeHtml(item.custom_fields.latest_code)}</span>
+                      </div>`
+                    : `<div class="tb-col-totp tb-mail-code-cell">
+                        <span class="tb-mail-code-pending" onclick="copyTotpCode(null, ${item.id})" title="点击立即连接邮箱查信">暂无 (查信)</span>
+                      </div>`
+                  )
+                : `<div class="tb-col-totp">
+                    <span class="u-totp-code" id="totp-code-${item.id}" onclick="copyTotpCode(null, ${item.id})" title="点击复制动态码">${totpFormatted}</span>
+                    ${hasTotp ? `<span class="u-totp-sec"><span class="card-rem-sec">${remaining}</span>s</span>` : ""}
+                  </div>`
+            }
           </td>
           <td>
             <div class="u-copy-group tb-copy-group">
@@ -1158,6 +1278,11 @@ function renderTableView(remaining, list = state.accounts) {
             <div class="tb-col-actions">
               <button class="btn-browser tb-btn-browser" onclick="onClickLaunchBrowser(${item.id}, this)" title="${escapeHtml(fpInfo.tooltip)}">🌐 启动</button>
               <div class="u-card-tools tb-tools">
+                ${
+                  item.account_type === "域名邮箱"
+                    ? `<button class="tool-link danger" onclick="confirmResetDomainEmailNodes(${item.id})" title="重置该邮箱绑定的代理节点">重置节点</button>`
+                    : ""
+                }
                 <button class="tool-link" onclick="openEditModal(${item.id})">编辑</button>
                 <button class="tool-link danger" onclick="confirmDeleteAccount(${item.id})">删除</button>
               </div>
@@ -1207,6 +1332,7 @@ async function onClickLaunchBrowser(accountId, btnEl = null) {
 
 async function executeLaunchBrowser(accountId, btnEl = null) {
   const origHtml = btnEl ? btnEl.innerHTML : "";
+  const item = state.accounts.find((a) => a.id === accountId);
   if (btnEl) {
     btnEl.classList.add("loading");
     btnEl.disabled = true;
@@ -1224,6 +1350,9 @@ async function executeLaunchBrowser(accountId, btnEl = null) {
       const fp = res.fp_config || {};
       const nodeStr = fp.proxy_node ? ` · 节点:${fp.proxy_node}` : "";
       showToast(`🌐 已启动 [${fp.profile_code || "FP"}] (${fp.gpu_short || "GPU"}${nodeStr}) · 自动登录助手已就绪`);
+      if (item && item.account_type === "域名邮箱") {
+        await loadDashboard();
+      }
     } else {
       showToast(res.error || "启动指纹浏览器失败");
     }
@@ -1246,6 +1375,12 @@ async function openNodeModal(accountId) {
   const fp = item.fp_config || {};
   document.getElementById("node-modal-title").textContent = `节点锁定配置 · [${fp.profile_code || "FP"}] ${item.masked_account}`;
   document.getElementById("node-modal").style.display = "flex";
+
+  // Claude-specific guidance banner
+  const claudeHintEl = document.getElementById("node-claude-hint");
+  if (claudeHintEl) {
+    claudeHintEl.style.display = item.account_type === "Claude" ? "flex" : "none";
+  }
 
   // Loading state
   const loadingEl = document.getElementById("node-modal-loading");
@@ -1305,6 +1440,21 @@ async function openNodeModal(accountId) {
     }
   } else {
     state.selectedRegion = "全部";
+  }
+
+  // Claude accounts without any proxy: pre-select the recommended sidecar/Clash port and a US residential node
+  if (item.account_type === "Claude" && !fp.proxy && !fp.proxy_node) {
+    const prefPort = ports.find((p) => p.url && (p.url.includes("17899") || p.url.includes("7897")));
+    if (prefPort) {
+      state.selectedProxyUrl = prefPort.url;
+    }
+    const recNode =
+      (env.nodes || []).find((n) => /miyaip|isp|住宅|家宽/i.test(n.name)) ||
+      (env.nodes || []).find((n) => n.region === "美国" || n.region === "US" || /us/i.test(n.name));
+    if (recNode) {
+      state.selectedNodeName = recNode.name;
+      state.selectedRegion = recNode.region || "全部";
+    }
   }
 
   const portOptionsHtml = ports
@@ -1399,6 +1549,9 @@ function renderNodeGrid(isLocked) {
   const filtered = state.selectedRegion === "全部" ? nodes : nodes.filter((n) => n.region === state.selectedRegion);
   const gridEl = document.getElementById("node-grid-container");
 
+  const curItem = state.accounts.find((a) => a.id === state.nodeModalAccountId);
+  const isClaudeAcc = curItem && curItem.account_type === "Claude";
+
   const portOnlySelected = state.selectedNodeName === "";
   const portOnlyCard = `
     <div class="node-item ${portOnlySelected ? "selected" : ""} ${isLocked ? "disabled" : ""}" onclick="onSelectNodeItem('', ${isLocked})">
@@ -1421,11 +1574,14 @@ function renderNodeGrid(isLocked) {
         const isLiveActive = n.name === activeNodeName;
         const delayHtml = n.delay ? `<span class="node-delay">${n.delay}ms</span>` : "";
         const activeBadge = isLiveActive ? `<span class="node-item-badge" title="本机当前正在生效的代理节点">🟢 当前在用</span>` : "";
+        const isRecommend = isClaudeAcc && /miyaip|isp|住宅|家宽/i.test(n.name);
+        const recBadge = isRecommend ? `<span class="node-badge-recommend">🌟 推荐住宅</span>` : "";
         return `
           <div class="node-item ${isSel ? "selected" : ""} ${isLiveActive ? "is-active-now" : ""} ${isLocked ? "disabled" : ""}" onclick="onSelectNodeItem('${escapeHtml(n.name)}', ${isLocked})">
             <span style="display:flex;align-items:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
               ${escapeHtml(n.name)}
               ${activeBadge}
+              ${recBadge}
             </span>
             ${delayHtml}
           </div>
@@ -1588,6 +1744,7 @@ function startZeroOverheadTotpTicker() {
         const res = await callApi("refresh_totp");
         if (res && res.codes) {
           state.accounts.forEach((acc) => {
+            if (acc.account_type === "域名邮箱") return;
             const updatedTotp = res.codes[String(acc.id)];
             if (updatedTotp) {
               acc.totp = updatedTotp;
@@ -1603,6 +1760,203 @@ function startZeroOverheadTotpTicker() {
       }
     }
   }, 1000);
+}
+
+// ============================================================
+// DOMAIN EMAIL VERIFICATION CODES, POLLING & NODE RESET
+// ============================================================
+let mailCodePollingTimer = null;
+let mailCodePollingBusy = false;
+
+function startMailCodePolling() {
+  if (!state.autoMailCodePolling || state.filterType !== "域名邮箱") {
+    stopMailCodePolling();
+    return;
+  }
+  if (mailCodePollingTimer) return;
+  mailCodePollingTimer = setInterval(async () => {
+    if (!state.autoMailCodePolling || state.filterType !== "域名邮箱") {
+      stopMailCodePolling();
+      return;
+    }
+    await pollDomainEmailCodes(false);
+  }, 4500);
+}
+
+function stopMailCodePolling() {
+  if (mailCodePollingTimer) {
+    clearInterval(mailCodePollingTimer);
+    mailCodePollingTimer = null;
+  }
+}
+
+function syncAutoMailPollButton() {
+  const btn = document.getElementById("btn-toggle-auto-mail-poll");
+  if (!btn) return;
+  if (state.autoMailCodePolling) {
+    btn.className = "btn btn-secondary";
+    btn.textContent = "🟢 静默刷新: 开";
+  } else {
+    btn.className = "btn btn-ghost";
+    btn.textContent = "⏸️ 静默刷新: 关";
+  }
+}
+
+function toggleAutoMailCodePolling() {
+  state.autoMailCodePolling = !state.autoMailCodePolling;
+  syncAutoMailPollButton();
+  if (state.autoMailCodePolling) {
+    showToast("已开启后台静默刷新验证码");
+    if (state.filterType === "域名邮箱") {
+      startMailCodePolling();
+      pollDomainEmailCodes(false);
+    }
+  } else {
+    stopMailCodePolling();
+    showToast("已关闭后台静默刷新验证码");
+  }
+}
+
+async function pollDomainEmailCodes(isManual = false, targetAccountIds = null) {
+  if (!isManual && mailCodePollingBusy) return { updatedCount: 0, newCodesFound: [], codes: {} };
+  const acquiredBgLock = !isManual;
+  if (acquiredBgLock) mailCodePollingBusy = true;
+  try {
+    const res = await callApi("get_domain_email_codes", targetAccountIds || null);
+    if (res && res.ok) {
+      let statsChanged = false;
+      if (res.node_stats) {
+        if (JSON.stringify(state.nodeCodeStats) !== JSON.stringify(res.node_stats)) {
+          state.nodeCodeStats = res.node_stats;
+          statsChanged = true;
+        }
+      }
+      const codes = res.codes || {};
+      let updatedCount = 0;
+      const newCodesFound = [];
+
+      for (const item of state.accounts) {
+        const info = codes[item.id] || codes[String(item.id)];
+        if (!info || !info.code) continue;
+
+        if (!item.custom_fields) {
+          item.custom_fields = {};
+        }
+        const oldCode = item.custom_fields.latest_code;
+        if (oldCode !== info.code) {
+          item.custom_fields.latest_code = info.code;
+          item.custom_fields.code_received_at = info.received_at || Math.floor(Date.now() / 1000);
+          item.custom_fields.code_subject = info.subject || "";
+          item.custom_fields.has_received_code = true;
+          updatedCount++;
+          newCodesFound.push({ email: item.account, code: info.code });
+        } else {
+          if (info.received_at) item.custom_fields.code_received_at = info.received_at;
+          if (info.subject) item.custom_fields.code_subject = info.subject;
+        }
+      }
+
+      if (updatedCount > 0 || statsChanged) {
+        renderAccounts();
+        for (const nc of newCodesFound) {
+          showToast(`✉️ 收到新验证码: ${nc.code}`);
+        }
+      } else if (isManual) {
+        const codeKeys = Object.keys(codes);
+        const targetMissing = Array.isArray(targetAccountIds) && targetAccountIds.length > 0
+          && !targetAccountIds.some((id) => codes[id] || codes[String(id)]);
+        if (codeKeys.length === 0 || targetMissing) {
+          showToast("收件箱查信完成，暂无新验证码");
+        }
+      }
+      return { updatedCount, newCodesFound, codes };
+    } else if (isManual && res && res.error) {
+      showToast("查信失败: " + res.error);
+    }
+  } catch (err) {
+    if (isManual) {
+      showToast("查信异常: " + err.message);
+    }
+  } finally {
+    if (acquiredBgLock) mailCodePollingBusy = false;
+  }
+  return { updatedCount: 0, newCodesFound: [], codes: {} };
+}
+
+async function refreshDomainEmailCodes() {
+  const btn = document.getElementById("btn-refresh-mail-codes");
+  const origHtml = btn ? btn.innerHTML : "";
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = "<span>🔄 查信中...</span>";
+  }
+  showToast("正在连接收件箱检查验证码...", 2000);
+  try {
+    const selectedIds = (typeof workbuddy !== "undefined" && workbuddy.selected && workbuddy.selected.size > 0)
+      ? [...workbuddy.selected]
+      : null;
+    await pollDomainEmailCodes(true, selectedIds);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = origHtml;
+    }
+  }
+}
+
+async function refreshSingleEmailCode(accountId) {
+  const codeEl = document.getElementById(`totp-code-${accountId}`);
+  const prevText = codeEl ? codeEl.textContent : "";
+  if (codeEl) codeEl.textContent = "查信中...";
+  showToast("正在检查该邮箱收件箱...", 2000);
+  try {
+    const result = await pollDomainEmailCodes(true, [accountId]);
+    const info = result && result.codes
+      ? (result.codes[accountId] || result.codes[String(accountId)])
+      : null;
+    if (info && info.code) {
+      await writeClipboard(String(info.code));
+      showToast(`✓ 已获取并复制验证码: ${info.code}`);
+    } else if (codeEl && document.body.contains(codeEl)) {
+      codeEl.textContent = prevText || "暂无 (查信)";
+    }
+  } catch (err) {
+    if (codeEl && document.body.contains(codeEl)) {
+      codeEl.textContent = prevText || "暂无 (查信)";
+    }
+    showToast("查信失败: " + err.message);
+  }
+}
+
+async function confirmResetDomainEmailNodes(accountId = null) {
+  const validId = typeof accountId === "number" ? accountId : null;
+  const msg = "确定要重置代理节点绑定吗？这将清除绑定的节点与已收验证码计数，使节点可以重新从头分配。";
+  if (!confirm(msg)) return;
+  try {
+    const res = await callApi("reset_domain_email_nodes", validId ? [validId] : null);
+    if (res && res.ok) {
+      showToast("已重置代理节点与收码记录");
+      await loadDashboard();
+    } else {
+      showToast("重置失败: " + (res && res.error ? res.error : "未知错误"));
+    }
+  } catch (err) {
+    showToast("重置异常: " + err.message);
+  }
+}
+
+function formatTimeAgo(ts) {
+  if (!ts) return "";
+  let timeMs = typeof ts === "number" ? (ts < 1e11 ? ts * 1000 : ts) : Date.parse(ts);
+  if (isNaN(timeMs)) return "";
+  const diffSec = Math.max(0, Math.floor((Date.now() - timeMs) / 1000));
+  if (diffSec < 60) return `${diffSec}秒前`;
+  const diffMin = Math.floor(diffSec / 60);
+  if (diffMin < 60) return `${diffMin}分钟前`;
+  const diffHours = Math.floor(diffMin / 60);
+  if (diffHours < 24) return `${diffHours}小时前`;
+  const diffDays = Math.floor(diffHours / 24);
+  return `${diffDays}天前`;
 }
 
 // Copy Helpers
@@ -1624,6 +1978,12 @@ async function writeClipboard(text) {
   }
 }
 
+async function copyText(text, label = "验证码") {
+  if (!text) return;
+  await writeClipboard(String(text));
+  showToast(`✓ 已复制 ${label}: ${text}`);
+}
+
 async function copyFieldValue(btnEl, accountId, fieldName, labelText) {
   const item = state.accounts.find((a) => a.id === accountId);
   if (!item) return;
@@ -1638,7 +1998,19 @@ async function copyFieldValue(btnEl, accountId, fieldName, labelText) {
 
 async function copyTotpCode(btnEl, accountId) {
   const item = state.accounts.find((a) => a.id === accountId);
-  if (!item || !item.totp || !item.totp.code) return;
+  if (!item) return;
+  if (item.account_type === "域名邮箱") {
+    const code = item.custom_fields && item.custom_fields.latest_code;
+    if (code) {
+      await writeClipboard(String(code));
+      flashCopyButton(btnEl);
+      showToast(`✓ 已复制最新邮件验证码: ${code}`);
+    } else {
+      await refreshSingleEmailCode(item.id);
+    }
+    return;
+  }
+  if (!item.totp || !item.totp.code) return;
   await writeClipboard(item.totp.code);
   flashCopyButton(btnEl);
   showToast(`✓ 已复制 6 位动态验证码: ${item.totp.code}`);
@@ -1751,8 +2123,8 @@ function openAddModal() {
   resetFeedbackText();
   resetFormFields();
 
-  const defType = state.filterType === "域名邮箱" ? "域名邮箱" : (state.settings?.default_account_type || "ChatGPT");
-  state.importAccountType = defType === "域名邮箱" ? defType : "";
+  const defType = (state.filterType && state.filterType !== "All") ? state.filterType : (state.settings?.default_account_type || "ChatGPT");
+  state.importAccountType = (defType && defType !== "ChatGPT") ? defType : "";
   syncAccountTypeRadios(defType);
   renderAccountModalDynamicFields(defType, {
     health_status: "可用",
@@ -1774,7 +2146,7 @@ function openEditModal(accountId) {
   resetFeedbackText();
 
   document.getElementById("field-id").value = item.id;
-  state.importAccountType = item.account_type === "域名邮箱" ? item.account_type : "";
+  state.importAccountType = (item.account_type && item.account_type !== "ChatGPT") ? item.account_type : "";
   syncAccountTypeRadios(item.account_type || "ChatGPT");
   renderAccountModalDynamicFields(item.account_type || "ChatGPT", {
     health_status: item.health_status,
@@ -1963,7 +2335,7 @@ async function onSmartPasteInput(rawText) {
     }
 
     const first = records[0];
-    const recType = first.account_type || "ChatGPT";
+    const recType = first.account_type || state.importAccountType || "ChatGPT";
     syncAccountTypeRadios(recType);
     renderAccountModalDynamicFields(recType, {
       health_status: first.health_status || "可用",
@@ -2927,6 +3299,7 @@ function syncAccountTypeRadios(selectedType = "ChatGPT") {
       : [
           { dict_key: "ChatGPT", dict_label: "ChatGPT", color_class: "chatgpt", icon: "🤖" },
           { dict_key: "Google", dict_label: "Google", color_class: "google", icon: "🔍" },
+          { dict_key: "Claude", dict_label: "Claude", color_class: "claude", icon: "✴️" },
           { dict_key: "WorkBuddy", dict_label: "WorkBuddy", color_class: "workbuddy", icon: "💼" },
           { dict_key: "域名邮箱", dict_label: "域名邮箱", color_class: "domain-email", icon: "✉️" },
           { dict_key: "Qcoder", dict_label: "Qcoder", color_class: "qcoder", icon: "⚡" },
@@ -3123,7 +3496,7 @@ function onAccountTypeRadioChange(newType) {
   const currentValues = getCurrentDynamicFormValues();
   renderAccountModalDynamicFields(newType, currentValues);
   syncDomainEmailLoginHint(newType);
-  state.importAccountType = newType === "域名邮箱" ? newType : "";
+  state.importAccountType = (newType && newType !== "ChatGPT") ? newType : "";
   const raw = document.getElementById("smart-paste-input").value;
   if (raw.trim()) onSmartPasteInput(raw);
 }

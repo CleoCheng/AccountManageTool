@@ -472,3 +472,145 @@ def test_schedule_paused_check_invoked_by_queue_and_modal(tmp_path):
     finally:
         api._shutdown()
 
+
+def test_domain_email_ui_elements_static():
+    root = Path(__file__).parents[1]
+    html = (root / "web" / "index.html").read_text(encoding="utf-8")
+    js = (root / "web" / "app.js").read_text(encoding="utf-8")
+    css = (root / "web" / "style.css").read_text(encoding="utf-8")
+
+    # index.html assertions
+    assert 'id="btn-refresh-mail-codes"' in html
+    assert 'id="btn-reset-email-nodes"' in html
+    assert 'id="btn-toggle-auto-mail-poll"' in html
+    assert 'onclick="refreshDomainEmailCodes()"' in html
+    assert 'onclick="confirmResetDomainEmailNodes()"' in html
+    assert "每 2 个邮箱收到验证码自动换下一节点" in html
+
+    # app.js assertions
+    assert "function refreshDomainEmailCodes" in js
+    assert "function confirmResetDomainEmailNodes" in js
+    assert "function startMailCodePolling" in js
+    assert "function stopMailCodePolling" in js
+    assert "function toggleAutoMailCodePolling" in js
+    assert "function syncAutoMailPollButton" in js
+    assert "autoMailCodePolling: false" in js
+    assert "function copyText" in js
+    assert "mail-code-box" in js
+    assert "pending-mail-code" in js
+    assert "has-code" in js
+    assert "latest_code" in js
+    assert "get_domain_email_codes" in js
+    assert "reset_domain_email_nodes" in js
+
+    # style.css assertions
+    assert ".u-totp-box.mail-code-box.has-code" in css
+    assert ".mail-code-label" in css
+    assert ".mail-code-val" in css
+    assert ".pending-mail-code" in css
+
+
+def test_domain_email_card_and_table_rendering(tmp_path, monkeypatch):
+    playwright = pytest.importorskip("playwright.sync_api")
+    exe = find_chromium_executable()
+    if not exe:
+        pytest.skip("Requires an installed Chromium browser")
+
+    api = AccountApi(tmp_path)
+    # Keep the silent-refresh toggle test off the network.
+    monkeypatch.setattr(
+        api,
+        "get_domain_email_codes",
+        lambda *a, **k: {"ok": True, "codes": {}, "node_stats": {}},
+    )
+    # 1st account with latest_code
+    acc1 = api.save_account({
+        "account_type": "域名邮箱",
+        "account": "hascode@ggb6.com",
+        "password": "pwd1",
+        "custom_fields": {
+            "latest_code": "889900",
+            "code_received_at": int(time.time()),
+            "has_received_code": True,
+        },
+    })["account"]
+    api.db.bind_account_proxy_node(acc1["id"], "http://127.0.0.1:17899", "Node-A", locked=True)
+
+    # 2nd account without code
+    acc2 = api.save_account({
+        "account_type": "域名邮箱",
+        "account": "nocode@ggb6.com",
+        "password": "pwd2",
+        "custom_fields": {},
+    })["account"]
+    api.db.bind_account_proxy_node(acc2["id"], "http://127.0.0.1:17899", "Node-A", locked=True)
+
+    errors = []
+    try:
+        with playwright.sync_playwright() as driver:
+            browser = driver.chromium.launch(executable_path=exe, headless=True)
+            page = browser.new_page(viewport={"width": 1180, "height": 780})
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.on("dialog", lambda dialog: dialog.accept())
+            page.expose_function("__apiCall", lambda method, args: getattr(api, method)(*args))
+            page.add_init_script("""
+                window.pywebview = {api: new Proxy({}, {
+                    get: (_, method) => (...args) => window.__apiCall(method, args)
+                })};
+            """)
+            page.goto((Path(__file__).parents[1] / "web" / "index.html").as_uri())
+            page.wait_for_function("state.accounts.length === 2")
+            page.evaluate('setFilterType("域名邮箱")')
+
+            # Verify toolbar buttons visible
+            page.locator("#workbuddy-toolbar").wait_for(state="visible")
+            assert page.locator("#btn-refresh-mail-codes").is_visible()
+            assert page.locator("#btn-reset-email-nodes").is_visible()
+
+            # Silent auto-refresh toggle is visible and off by default; toggling flips the label
+            auto_poll_btn = page.locator("#btn-toggle-auto-mail-poll")
+            assert auto_poll_btn.is_visible()
+            assert "静默刷新: 关" in auto_poll_btn.inner_text()
+            assert page.evaluate("state.autoMailCodePolling") is False
+            auto_poll_btn.click()
+            assert "静默刷新: 开" in auto_poll_btn.inner_text()
+            assert page.evaluate("state.autoMailCodePolling") is True
+            auto_poll_btn.click()
+            assert "静默刷新: 关" in auto_poll_btn.inner_text()
+            assert page.evaluate("state.autoMailCodePolling") is False
+
+            # Verify card rendering: latest mail code lives directly in the 2FA slot
+            page.locator(".u-totp-box.mail-code-box.has-code").wait_for()
+            has_code_box = page.locator(".u-totp-box.mail-code-box.has-code")
+            assert "邮件码" in has_code_box.inner_text()
+            assert "889900" in has_code_box.inner_text()
+            pending_box = page.locator(".u-totp-box.mail-code-box.pending")
+            assert pending_box.count() == 1
+            assert "暂无 (查信)" in pending_box.inner_text()
+
+            # Check node stats display on proxy node pill
+            page.evaluate("""() => {
+                state.nodeCodeStats = { "Node-A": 1 };
+                renderAccounts();
+            }""")
+            pill_text = page.locator(".u-node-pill").first.inner_text()
+            assert "Node-A" in pill_text
+            assert "(1/2 已收码)" in pill_text
+
+            # Switch to table view and verify mail code rendering in 2FA column
+            page.evaluate('applyViewMode("table", false)')
+            page.locator("#accounts-container .u-table").wait_for()
+            table_code_cell = page.locator(".tb-mail-code-cell").first
+            assert "889900" in table_code_cell.inner_text()
+
+            # Verify copyText function works
+            assert page.evaluate("typeof copyText === 'function'")
+            assert page.evaluate("typeof refreshDomainEmailCodes === 'function'")
+            assert page.evaluate("typeof confirmResetDomainEmailNodes === 'function'")
+
+            assert not errors
+            browser.close()
+    finally:
+        api._shutdown()
+
+

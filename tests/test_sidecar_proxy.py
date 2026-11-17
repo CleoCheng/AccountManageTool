@@ -160,9 +160,509 @@ def test_rank_nodes_for_workbuddy_prefers_iepl_dedicated_lines_in_same_region():
     assert ranked.index("🇸🇬 Singapore | 02") < ranked.index("🇸🇬 Singapore | 01")
 
 
+def test_rank_nodes_for_workbuddy_prefers_residential_nodes():
+    from src.sidecar_proxy import rank_nodes_for_workbuddy
+
+    nodes = [
+        {"name": "🇺🇸 Datacenter | 01", "delay": 10},
+        {"name": "USbyJPTT | MiyaIP-2 HY2", "delay": 90},
+        {"name": "US | MiyaIP-2 HY2", "delay": 120},
+        {"name": "🇸🇬 Singapore | 01", "delay": 20},
+        {"name": "🇯🇵 Japan | 01", "delay": 30},
+    ]
+    ranked = [n["name"] for n in rank_nodes_for_workbuddy(nodes)]
+    # Residential tier is the primary key: direct residential beats relay
+    # residential, and both lead every generic airport node — even SG/JP — so
+    # WorkBuddy signups never land on a shared airport blacklist IP.
+    assert ranked[:2] == ["US | MiyaIP-2 HY2", "USbyJPTT | MiyaIP-2 HY2"]
+    for residential in ("US | MiyaIP-2 HY2", "USbyJPTT | MiyaIP-2 HY2"):
+        assert ranked.index(residential) < ranked.index("🇸🇬 Singapore | 01")
+        assert ranked.index(residential) < ranked.index("🇯🇵 Japan | 01")
+        assert ranked.index(residential) < ranked.index("🇺🇸 Datacenter | 01")
+    # Inside the US bucket direct residential beats relay residential, and both
+    # beat a lower-latency datacenter node.
+    us = [name for name in ranked if name in (
+        "US | MiyaIP-2 HY2",
+        "USbyJPTT | MiyaIP-2 HY2",
+        "🇺🇸 Datacenter | 01",
+    )]
+    assert us == [
+        "US | MiyaIP-2 HY2",
+        "USbyJPTT | MiyaIP-2 HY2",
+        "🇺🇸 Datacenter | 01",
+    ]
+
+    # A dead residential line is useless: it sinks below the healthy node.
+    dead = [
+        {"name": "US | MiyaIP-Dead", "timed_out": True},
+        {"name": "🇺🇸 Datacenter | 01", "delay": 200},
+    ]
+    dead_ranked = [n["name"] for n in rank_nodes_for_workbuddy(dead)]
+    assert dead_ranked == ["🇺🇸 Datacenter | 01", "US | MiyaIP-Dead"]
+
+    # HK residential markers must never promote a blocked HK exit.
+    hk = [
+        {"name": "🇭🇰 Hong Kong | 01", "delay": 10},
+        {"name": "🇺🇸 Datacenter | 01", "delay": 300},
+    ]
+    hk_ranked = [n["name"] for n in rank_nodes_for_workbuddy(hk)]
+    assert hk_ranked == ["🇺🇸 Datacenter | 01", "🇭🇰 Hong Kong | 01"]
+
+    # Standard / IEPL ordering for non-residential nodes is untouched.
+    standard = [
+        {"name": "🇸🇬 Singapore | 01", "delay": 20},
+        {"name": "🇸🇬 新加坡 IEPL 专线 1", "delay": 300},
+        {"name": "🇸🇬 Singapore | 02", "delay": 10},
+    ]
+    assert [n["name"] for n in rank_nodes_for_workbuddy(standard)] == [
+        "🇸🇬 新加坡 IEPL 专线 1",
+        "🇸🇬 Singapore | 02",
+        "🇸🇬 Singapore | 01",
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Read-only extraction + environment description
 # ---------------------------------------------------------------------------
+def test_build_config_bypasses_domestic_mail_and_keeps_sidecar_group(tmp_path: Path):
+    from src.sidecar_proxy import SIDECAR_GROUP_NAME, SidecarProxyManager
+
+    manager = SidecarProxyManager(runtime_dir=tmp_path / "sidecar")
+    config = manager._build_config(
+        [
+            {"name": "🇸🇬 Singapore | 01", "type": "ss", "server": "127.0.0.1", "port": 30001},
+            {"name": "🇯🇵 Japan | 01", "type": "ss", "server": "127.0.0.1", "port": 30002},
+        ]
+    )
+
+    rules = config["rules"]
+    assert "DOMAIN-SUFFIX,ggb6.com,DIRECT" in rules
+    # ``no-resolve`` keeps Mihomo from using the local Windows DNS resolver to
+    # classify proxy-bound domains via GeoIP.
+    assert "GEOIP,CN,DIRECT,no-resolve" in rules
+    assert "GEOIP,CN,DIRECT" not in rules
+    assert config["find-process-mode"] == "off"
+    assert f"MATCH,{SIDECAR_GROUP_NAME}" in rules
+    assert rules[-1] == "MATCH,KEYVAULT_PROXY"
+    # The mail bypass must be evaluated before traffic falls through to the proxy.
+    assert rules.index("DOMAIN-SUFFIX,ggb6.com,DIRECT") < rules.index("MATCH,KEYVAULT_PROXY")
+    assert config["proxy-groups"][0]["name"] == SIDECAR_GROUP_NAME
+    assert config["proxy-groups"][0]["proxies"] == ["🇸🇬 Singapore | 01", "🇯🇵 Japan | 01"]
+
+    # STUN/TURN must be blocked so WebRTC cannot leak the real local IP.
+    assert "DOMAIN-KEYWORD,stun,REJECT" in rules
+    assert "DST-PORT,3478,REJECT" in rules
+    assert "DST-PORT,5349,REJECT" in rules
+    # Anthropic traffic must always exit through the sidecar selector.
+    for domain in ("claude.ai", "anthropic.com", "claudeusercontent.com"):
+        rule = f"DOMAIN-SUFFIX,{domain},{SIDECAR_GROUP_NAME}"
+        assert rule in rules
+        assert rules.index(rule) < rules.index("GEOIP,CN,DIRECT,no-resolve")
+    assert rules.index("DOMAIN-SUFFIX,ggb6.com,DIRECT") < rules.index(
+        "GEOIP,CN,DIRECT,no-resolve"
+    )
+    assert rules.index("GEOIP,CN,DIRECT,no-resolve") < rules.index("MATCH,KEYVAULT_PROXY")
+    assert rules.index("DOMAIN-KEYWORD,stun,REJECT") < rules.index("MATCH,KEYVAULT_PROXY")
+
+
+def test_rank_nodes_for_claude_prefers_us_residential_then_us_then_clean_regions():
+    from src.sidecar_proxy import rank_nodes_for_claude
+
+    nodes = [
+        {"name": "🇭🇰 Hong Kong | 01"},
+        {"name": "🇯🇵 Japan | 01"},
+        {"name": "🇸🇬 Singapore | 01"},
+        {"name": "USbyJPTT | MiyaIP-2 HY2"},
+        {"name": "USbyJP-54 | MiyaIP-2 HY2"},
+        {"name": "US | MiyaIP-2 HY2"},
+        {"name": "🇺🇸 United States | 01"},
+        {"name": "🇬🇧 United Kingdom | 01"},
+        {"name": "🌍 Other | 01"},
+    ]
+    ranked = [n["name"] for n in rank_nodes_for_claude(nodes)]
+    assert ranked[0] == "US | MiyaIP-2 HY2"
+    assert ranked[1:3] == ["USbyJPTT | MiyaIP-2 HY2", "USbyJP-54 | MiyaIP-2 HY2"]
+    assert ranked[3] == "🇺🇸 United States | 01"
+    # Clean non-US regions beat HK.
+    assert ranked.index("🇸🇬 Singapore | 01") < ranked.index("🇭🇰 Hong Kong | 01")
+    assert ranked.index("🇯🇵 Japan | 01") < ranked.index("🇭🇰 Hong Kong | 01")
+    assert ranked[-1] == "🇭🇰 Hong Kong | 01"
+    # Every US node outranks SG/JP.
+    for us_name in ("US | MiyaIP-2 HY2", "🇺🇸 United States | 01"):
+        assert ranked.index(us_name) < ranked.index("🇸🇬 Singapore | 01")
+        assert ranked.index(us_name) < ranked.index("🇯🇵 Japan | 01")
+
+    # Caller inputs are not mutated.
+    assert "region" not in nodes[0]
+    assert all(isinstance(n, dict) for n in nodes)
+
+    # Empty / malformed input must not raise.
+    assert rank_nodes_for_claude([]) == []
+    assert rank_nodes_for_claude([None, "nope"]) == []
+
+
+def test_rank_nodes_for_claude_sinks_timed_out_and_honours_latency():
+    from src.sidecar_proxy import rank_nodes_for_claude
+
+    nodes = [
+        {"name": "US | MiyaIP-Slow", "delay": 400},
+        {"name": "US | MiyaIP-Fast", "delay": 80},
+        {"name": "US | MiyaIP-Dead", "timed_out": True},
+        {"name": "🇺🇸 Datacenter | 01", "delay": 20},
+    ]
+    ranked = [n["name"] for n in rank_nodes_for_claude(nodes)]
+    assert ranked[:2] == ["US | MiyaIP-Fast", "US | MiyaIP-Slow"]
+    assert ranked[2] == "🇺🇸 Datacenter | 01"
+    assert ranked[-1] == "US | MiyaIP-Dead"
+
+
+def test_miyaip2_tiers_rank_workbuddy_and_claude_identically():
+    from src.sidecar_proxy import (
+        _residential_tier,
+        rank_nodes_for_claude,
+        rank_nodes_for_workbuddy,
+    )
+
+    expected_tiers = {
+        "US | MiyaIP-2 HY2": 0,
+        "US | MiyaIP-2": 1,
+        "USbyJPTT | MiyaIP-2 HY2": 1,
+        "USbyJP-54 | MiyaIP-2 HY2": 1,
+        "US | MiyaIP": 2,
+        "US | MiyaIP HY2": 2,
+        "USbyJPTT | MiyaIP": 3,
+        "🇸🇬 Singapore | 01": 4,
+    }
+    for name, expected in expected_tiers.items():
+        assert _residential_tier(name) == expected, name
+
+    nodes = [
+        {"name": "US | MiyaIP"},
+        {"name": "US | MiyaIP HY2"},
+        {"name": "US | MiyaIP-2"},
+        {"name": "USbyJPTT | MiyaIP-2 HY2"},
+        {"name": "USbyJP-54 | MiyaIP-2 HY2"},
+        {"name": "US | MiyaIP-2 HY2"},
+    ]
+    expected_order = [
+        "US | MiyaIP-2 HY2",
+        "US | MiyaIP-2",
+        "USbyJPTT | MiyaIP-2 HY2",
+        "USbyJP-54 | MiyaIP-2 HY2",
+        "US | MiyaIP",
+        "US | MiyaIP HY2",
+    ]
+    for ranker in (rank_nodes_for_workbuddy, rank_nodes_for_claude):
+        ranked = [n["name"] for n in ranker(nodes)]
+        # The MiyaIP-2 HY2 direct line is always the first choice.
+        assert ranked[0] == "US | MiyaIP-2 HY2"
+        assert ranked == expected_order
+        # Every MiyaIP-2 line outranks the legacy US | MiyaIP lines.
+        for miyaip2 in (
+            "US | MiyaIP-2 HY2",
+            "US | MiyaIP-2",
+            "USbyJPTT | MiyaIP-2 HY2",
+            "USbyJP-54 | MiyaIP-2 HY2",
+        ):
+            assert ranked.index(miyaip2) < ranked.index("US | MiyaIP")
+            assert ranked.index(miyaip2) < ranked.index("US | MiyaIP HY2")
+
+    # Ranking never mutates the caller's node dicts.
+    assert all("region" not in n for n in nodes)
+
+
+def test_describe_environment_for_claude_ranks_us_first_and_exposes_local_ai_us_port(
+    tmp_path: Path, monkeypatch
+):
+    from src.sidecar_proxy import SidecarProxyManager
+
+    config = tmp_path / "clash-verge.yaml"
+    config.write_text(
+        yaml.safe_dump(
+            {
+                "mixed-port": 17898,
+                "listeners": [
+                    {
+                        "name": "AI-US",
+                        "type": "mixed",
+                        "listen": "127.0.0.1",
+                        "port": 7897,
+                        "proxy": "US",
+                    }
+                ],
+                "proxies": [
+                    {"name": "🇭🇰 Hong Kong | 01", "type": "ss", "server": "127.0.0.1", "port": 30001},
+                    {"name": "🇯🇵 Japan | 01", "type": "ss", "server": "127.0.0.1", "port": 30002},
+                    {"name": "USbyJPTT | MiyaIP-2 HY2", "type": "ss", "server": "127.0.0.1", "port": 30003},
+                    {"name": "US | MiyaIP-2 HY2", "type": "ss", "server": "127.0.0.1", "port": 30004},
+                ],
+            },
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("KEYVAULT_CLASH_CONFIG", str(config))
+    monkeypatch.setattr(
+        "src.sidecar_proxy.find_mihomo_binary", lambda: Path("C:/fake/mihomo.exe")
+    )
+    monkeypatch.setattr(
+        "src.sidecar_proxy._is_local_port_open", lambda port, timeout=0.08: int(port) == 7897
+    )
+
+    manager = SidecarProxyManager(runtime_dir=tmp_path / "sidecar")
+    env = manager.describe_environment("Claude")
+
+    names = [n["name"] for n in env["nodes"]]
+    assert names[0] == "US | MiyaIP-2 HY2"
+    assert names[1] == "USbyJPTT | MiyaIP-2 HY2"
+    assert names.index("🇯🇵 Japan | 01") < names.index("🇭🇰 Hong Kong | 01")
+    assert env["recommended_node"] == "US | MiyaIP-2 HY2"
+
+    # The sidecar port stays first; the live AI-US listener follows it.
+    ports = env["ports"]
+    assert len(ports) == 2
+    assert ports[0]["bound_group"] == "KEYVAULT_PROXY"
+    assert ports[1]["port"] == 7897
+    assert "AI-US" in ports[1]["label"]
+
+    # A dead listener is never exposed.
+    monkeypatch.setattr(
+        "src.sidecar_proxy._is_local_port_open", lambda port, timeout=0.08: False
+    )
+    env_dead = manager.describe_environment("Claude")
+    assert len(env_dead["ports"]) == 1
+
+    # WorkBuddy / default behaviour is untouched (single dedicated port).
+    env_wb = manager.describe_environment("WorkBuddy")
+    assert len(env_wb["ports"]) == 1
+    assert "recommended_node" not in env_wb
+    env_default = manager.describe_environment()
+    assert len(env_default["ports"]) == 1
+    assert "recommended_node" not in env_default
+
+
+def test_extract_leaf_proxies_resolves_hosts_decoys_and_config_keeps_hosts(
+    tmp_path: Path, monkeypatch
+):
+    from src.sidecar_proxy import SidecarProxyManager
+
+    monkeypatch.delenv("KEYVAULT_CLASH_CONFIG", raising=False)
+
+    verge_dir = tmp_path / "verge"
+    profiles_dir = verge_dir / "profiles"
+    profiles_dir.mkdir(parents=True)
+
+    primary = verge_dir / "clash-verge.yaml"
+    primary.write_text(
+        yaml.safe_dump(
+            {
+                "hosts": {
+                    "63182sh8-4d7b.aws-agent.net": "37f36sh0-2fd9.apt-agent.net",
+                    "oss-cn-shanghai.toshiba-asdf.com": "gpt-ai-shanghai.micron-asdf.com",
+                    "gpt-ai-shanghai.micron-asdf.com": ["10.0.0.9"],
+                    "list-valued.example.net": ["", "1.2.3.4"],
+                    "empty-value.example.net": "",
+                },
+                "proxies": [
+                    {
+                        "name": "🇸🇬 Singapore | Decoy",
+                        "type": "ss",
+                        "server": "63182sh8-4d7b.aws-agent.net",
+                        "port": 30001,
+                        "cipher": "aes-128-gcm",
+                        "password": "sg-pass",
+                    },
+                    {
+                        "name": "🇯🇵 Japan | Chained",
+                        "type": "ss",
+                        "server": "oss-cn-shanghai.toshiba-asdf.com",
+                        "port": 30002,
+                        "cipher": "aes-128-gcm",
+                        "password": "jp-pass",
+                    },
+                    {
+                        "name": "🇭🇰 Hong Kong | Plain",
+                        "type": "ss",
+                        "server": "hk.example.com",
+                        "port": 30003,
+                        "cipher": "aes-128-gcm",
+                        "password": "hk-pass",
+                    },
+                ],
+            },
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    # The remote profile declares its own decoy host and a proxy using it.
+    (profiles_dir / "remote-profile.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "hosts": {"per-file-decoy.aws-agent.net": "jp.example.com"},
+                "proxies": [
+                    {
+                        "name": "🇺🇸 United States | PerFile",
+                        "type": "ss",
+                        "server": "per-file-decoy.aws-agent.net",
+                        "port": 30004,
+                        "cipher": "aes-128-gcm",
+                        "password": "us-pass",
+                    }
+                ],
+            },
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (verge_dir / "profiles.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "current": "remote-profile",
+                "items": [
+                    {
+                        "uid": "remote-profile",
+                        "type": "remote",
+                        "name": "Remote Sub",
+                        "file": "remote-profile.yaml",
+                    }
+                ],
+            },
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        "src.sidecar_proxy.find_clash_config_files",
+        lambda: [("Clash Verge Rev", primary)],
+    )
+
+    manager = SidecarProxyManager(runtime_dir=tmp_path / "sidecar")
+    _, _, raw_proxies, node_summaries = manager.extract_leaf_proxies()
+
+    servers = {p["name"]: p["server"] for p in raw_proxies}
+    assert servers["🇸🇬 Singapore | Decoy"] == "37f36sh0-2fd9.apt-agent.net"
+    # Chained hosts entries are followed until the final address.
+    assert servers["🇯🇵 Japan | Chained"] == "10.0.0.9"
+    # Non-decoy servers and per-file hosts maps pass through untouched.
+    assert servers["🇭🇰 Hong Kong | Plain"] == "hk.example.com"
+    assert servers["🇺🇸 United States | PerFile"] == "jp.example.com"
+    summary_servers = {n["name"]: n["server"] for n in node_summaries}
+    assert summary_servers == servers
+
+    # The source YAML must stay untouched (read-only extraction).
+    original = yaml.safe_load(primary.read_text(encoding="utf-8"))
+    assert original["proxies"][0]["server"] == "63182sh8-4d7b.aws-agent.net"
+
+    assert manager._last_hosts_map["63182sh8-4d7b.aws-agent.net"] == (
+        "37f36sh0-2fd9.apt-agent.net"
+    )
+    assert manager._last_hosts_map["list-valued.example.net"] == "1.2.3.4"
+    assert "empty-value.example.net" not in manager._last_hosts_map
+
+    config = manager._build_config(raw_proxies)
+    assert config["dns"] == {"enable": False, "use-hosts": True}
+    assert config["hosts"]["63182sh8-4d7b.aws-agent.net"] == "37f36sh0-2fd9.apt-agent.net"
+    assert config["hosts"]["oss-cn-shanghai.toshiba-asdf.com"] == (
+        "gpt-ai-shanghai.micron-asdf.com"
+    )
+    assert config["hosts"]["per-file-decoy.aws-agent.net"] == "jp.example.com"
+    # An explicit empty map must not leak the cached hosts section.
+    assert "hosts" not in manager._build_config(raw_proxies, {})
+
+
+def test_prepare_sidecar_exe_uses_proxybridge_direct_process_name(tmp_path: Path, monkeypatch):
+    import src.sidecar_proxy as sidecar_module
+    from src.sidecar_proxy import SidecarProxyManager
+
+    manager = SidecarProxyManager(runtime_dir=tmp_path / "sidecar")
+    manager.runtime_dir.mkdir(parents=True)
+    mihomo_bin = tmp_path / "verge-mihomo.exe"
+    mihomo_bin.write_bytes(b"kernel-binary")
+
+    monkeypatch.setattr(sidecar_module.sys, "platform", "win32")
+    staged = manager._prepare_sidecar_exe(mihomo_bin)
+    # ProxyBridge's 代理核心直连 rule matches mihomo.exe, so the kernel's own
+    # traffic goes DIRECT instead of double-proxying through 17898.
+    assert staged == manager.runtime_dir / "mihomo.exe"
+    assert staged.read_bytes() == b"kernel-binary"
+
+    # A copy failure still returns an already staged mihomo.exe.
+    with monkeypatch.context() as patched:
+        def _boom(*args, **kwargs):
+            raise PermissionError("kernel is running")
+
+        patched.setattr(sidecar_module.shutil, "copy2", _boom)
+        assert manager._prepare_sidecar_exe(mihomo_bin) == manager.runtime_dir / "mihomo.exe"
+
+        # Without a staged mihomo.exe the legacy name is used, then the source.
+        staged.unlink()
+        fallback = manager.runtime_dir / "keyvault-mihomo.exe"
+        fallback.write_bytes(b"kernel-binary")
+        assert manager._prepare_sidecar_exe(mihomo_bin) == fallback
+        fallback.unlink()
+        assert manager._prepare_sidecar_exe(mihomo_bin) == mihomo_bin
+
+    # Non-Windows keeps the plain ``mihomo`` filename.
+    monkeypatch.setattr(sidecar_module.sys, "platform", "linux")
+    linux_staged = manager._prepare_sidecar_exe(mihomo_bin)
+    assert linux_staged == manager.runtime_dir / "mihomo"
+
+
+def test_apply_active_or_default_node_restores_or_ranks_selection(tmp_path: Path):
+    from src.sidecar_proxy import SIDECAR_GROUP_NAME, SidecarProxyManager
+
+    nodes = [
+        {"name": "🇭🇰 Hong Kong | 01", "region": "🇭🇰 香港 (HK)"},
+        {"name": "🇸🇬 Singapore | 01", "region": "🇸🇬 新加坡 (SG)"},
+    ]
+    manager = SidecarProxyManager(runtime_dir=tmp_path / "sidecar")
+    calls: list[tuple[str, str, dict | None]] = []
+    ack_status = 204
+
+    def fake_request(method, path, body=None, **kwargs):
+        calls.append((method, path, body))
+        return ack_status, {}
+
+    manager._ctrl_request = fake_request
+
+    # No selection yet: the WorkBuddy ranking picks SG over HK.
+    manager._apply_active_or_default_node(nodes)
+    assert calls[-1] == ("PUT", f"/proxies/{SIDECAR_GROUP_NAME}", {"name": "🇸🇬 Singapore | 01"})
+    assert manager.active_node == "🇸🇬 Singapore | 01"
+
+    # An existing active node wins over the ranking.
+    calls.clear()
+    manager.active_node = "🇭🇰 Hong Kong | 01"
+    manager._apply_active_or_default_node(nodes)
+    assert calls == [("PUT", f"/proxies/{SIDECAR_GROUP_NAME}", {"name": "🇭🇰 Hong Kong | 01"})]
+    assert manager.active_node == "🇭🇰 Hong Kong | 01"
+
+    # A node that vanished from the subscription falls back to the ranking.
+    calls.clear()
+    manager.active_node = "🇯🇵 Japan | 99"
+    manager._apply_active_or_default_node(nodes)
+    assert manager.active_node == "🇸🇬 Singapore | 01"
+
+    # A rejected selection must not be recorded as active.
+    calls.clear()
+    manager.active_node = ""
+    ack_status = 400
+    manager._apply_active_or_default_node(nodes)
+    assert calls
+    assert manager.active_node == ""
+
+    # Empty node lists are a no-op.
+    calls.clear()
+    manager._apply_active_or_default_node([])
+    assert calls == []
+
+
 def test_extract_leaf_proxies_and_describe_environment_never_touches_clash_verge(
     tmp_path: Path, clash_yaml: Path, no_verge_touch
 ):
@@ -625,3 +1125,75 @@ def test_stop_is_idempotent_and_never_leaks_a_process(tmp_path: Path, monkeypatc
     fake.terminate.assert_called_once()
     fake.wait.assert_called_once()
     assert manager._proc is None
+
+
+def test_apply_active_or_default_node_prefers_explicit_node_and_claude_ranking(tmp_path: Path):
+    from src.sidecar_proxy import SIDECAR_GROUP_NAME, SidecarProxyManager
+
+    nodes = [
+        {"name": "🇭🇰 Hong Kong | 01", "region": "🇭🇰 香港 (HK)"},
+        {"name": "🇸🇬 Singapore | 01", "region": "🇸🇬 新加坡 (SG)"},
+        {"name": "US | MiyaIP-2 HY2", "region": "🇺🇸 美国 (US)"},
+    ]
+    manager = SidecarProxyManager(runtime_dir=tmp_path / "sidecar")
+    calls: list[tuple[str, str, dict | None]] = []
+
+    def fake_request(method, path, body=None, **kwargs):
+        calls.append((method, path, body))
+        return 204, {}
+
+    manager._ctrl_request = fake_request
+
+    # An explicit preferred node wins over the Claude ranking.
+    manager._apply_active_or_default_node(
+        nodes, preferred_node="🇸🇬 Singapore | 01", account_type="Claude"
+    )
+    assert calls[-1] == ("PUT", f"/proxies/{SIDECAR_GROUP_NAME}", {"name": "🇸🇬 Singapore | 01"})
+    assert manager.active_node == "🇸🇬 Singapore | 01"
+
+    # Without a preference, Claude ranking picks the US residential node.
+    calls.clear()
+    manager.active_node = ""
+    manager._apply_active_or_default_node(nodes, account_type="Claude")
+    assert manager.active_node == "US | MiyaIP-2 HY2"
+
+    # A vanished preferred node falls back to the ranking instead of erroring.
+    calls.clear()
+    manager.active_node = ""
+    manager._apply_active_or_default_node(
+        nodes, preferred_node="🇺🇸 Missing | 99", account_type="Claude"
+    )
+    assert manager.active_node == "US | MiyaIP-2 HY2"
+
+    # WorkBuddy ranking prefers the residential node when one is available.
+    calls.clear()
+    manager.active_node = ""
+    manager._apply_active_or_default_node(nodes, account_type="WorkBuddy")
+    assert manager.active_node == "US | MiyaIP-2 HY2"
+
+    # Without residential lines, WorkBuddy keeps the legacy region ranking.
+    airport_nodes = [
+        {"name": "🇭🇰 Hong Kong | 01", "region": "🇭🇰 香港 (HK)"},
+        {"name": "🇸🇬 Singapore | 01", "region": "🇸🇬 新加坡 (SG)"},
+        {"name": "🇺🇸 United States | 01", "region": "🇺🇸 美国 (US)"},
+    ]
+    calls.clear()
+    manager.active_node = ""
+    manager._apply_active_or_default_node(airport_nodes, account_type="WorkBuddy")
+    assert manager.active_node == "🇸🇬 Singapore | 01"
+
+
+def test_ensure_started_accepts_preferred_node_without_breaking_no_arg_calls(tmp_path: Path):
+    import inspect
+
+    from src.sidecar_proxy import SidecarProxyManager
+
+    signature = inspect.signature(SidecarProxyManager.ensure_started)
+    assert signature.parameters["preferred_node"].default == ""
+    assert signature.parameters["account_type"].default == ""
+    # Keyword-only so existing positional callers keep working.
+    assert all(
+        p.kind == inspect.Parameter.KEYWORD_ONLY
+        for name, p in signature.parameters.items()
+        if name != "self"
+    )

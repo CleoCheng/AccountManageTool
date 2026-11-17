@@ -1,9 +1,11 @@
 import base64
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from src.browser_service import launch_isolated_browser
 from src.db_service import DatabaseService, compute_usage_info
+from src.github_mail import fetch_latest_mail_code
 from src.parser import parse_account_text, parse_domain_email_file, parse_domain_email_text
 from src.proxy_service import detect_proxy_environment
 from src.totp_service import generate_totp, mask_secret, normalize_secret
@@ -108,6 +110,7 @@ class AccountApi:
             "dicts": dicts,
             "attributes": attributes,
             "workbuddy": self._workbuddy.snapshot(),
+            "node_code_stats": self.db.get_node_code_stats(),
             "server_time": now,
             "remaining": 30 - (now % 30),
         }
@@ -143,7 +146,11 @@ class AccountApi:
         import re
         from src.parser import _is_likely_base32_secret
         try:
-            records = parse_domain_email_text(raw_text) if account_type == "域名邮箱" else parse_account_text(raw_text)
+            records = (
+                parse_domain_email_text(raw_text)
+                if account_type == "域名邮箱"
+                else parse_account_text(raw_text, account_type=account_type)
+            )
         except ValueError as exc:
             return {"records": [], "count": 0, "error": str(exc)}
         if not records and raw_text and raw_text.strip():
@@ -251,18 +258,107 @@ class AccountApi:
         return self.db.update_attribute_bindings(int(attr_id), bound_platforms)
 
     def launch_browser(self, account_id: int) -> dict:
-        import importlib
         import src.browser_service as bs
-        importlib.reload(bs)
         account = self.db.get_account(int(account_id))
         if not account:
             return {"ok": False, "error": "账号不存在"}
         if account["account_type"] == "域名邮箱":
-            import webbrowser
-            from src.github_mail import MAIL_URL
-            opened = webbrowser.open(MAIL_URL)
-            return {"ok": opened, "mailbox": True, "error": "" if opened else "无法打开默认浏览器"}
+            fp_cfg = account.get("fp_config") or {}
+            if not (fp_cfg.get("node_locked") and str(fp_cfg.get("proxy_node") or "").strip()):
+                self.allocate_node_for_domain_email(int(account_id))
+                account = self.db.get_account(int(account_id)) or account
+            result = bs.launch_isolated_browser(self.data_dir, account)
+            result.setdefault("fp_config", account.get("fp_config") or {})
+            result.setdefault(
+                "profile_dir",
+                str(self.data_dir / "browsers" / f"acc_{int(account_id)}"),
+            )
+            return result
         return bs.launch_isolated_browser(self.data_dir, account)
+
+    def allocate_node_for_domain_email(self, account_id: int) -> str:
+        env = self.get_proxy_nodes("WorkBuddy")
+        nodes: list[str] = []
+        for node in env.get("nodes") or []:
+            if isinstance(node, str):
+                name = node.strip()
+            elif isinstance(node, dict):
+                name = str(node.get("name") or "").strip()
+            else:
+                name = ""
+            if name and name not in nodes:
+                nodes.append(name)
+        default_proxy_url = "http://127.0.0.1:17899"
+        for port in env.get("ports") or []:
+            if isinstance(port, dict) and port.get("url"):
+                default_proxy_url = str(port["url"])
+                break
+        return self.db.allocate_clean_node_for_account(
+            int(account_id),
+            nodes,
+            default_proxy_url=default_proxy_url,
+        )
+
+    def _is_active_domain_email(self, account: dict) -> bool:
+        fp_cfg = account.get("fp_config") or {}
+        cf = account.get("custom_fields") or {}
+        acc_id = int(account["id"])
+        if bool(str(fp_cfg.get("proxy_node") or "").strip()):
+            return True
+        if (self.data_dir / "browsers" / f"acc_{acc_id}").exists():
+            return True
+        if str(cf.get("wb_reg_status") or "").strip() == "进行中":
+            return True
+        return False
+
+    def get_domain_email_codes(self, account_ids: list[int] | None = None) -> dict:
+        wanted = {int(i) for i in account_ids} if account_ids else None
+        accounts = self.db.list_accounts(account_type="域名邮箱")
+        if wanted is not None:
+            target_accounts = [acc for acc in accounts if acc["id"] in wanted]
+        else:
+            active_accounts = [acc for acc in accounts if self._is_active_domain_email(acc)]
+            if active_accounts:
+                target_accounts = active_accounts
+            elif len(accounts) <= 5:
+                # 兼容未绑定节点的少量测试数据，避免误伤小数据集
+                target_accounts = accounts
+            else:
+                # 无活跃邮箱时避免全量扫描上百个闲置账号
+                target_accounts = []
+
+        codes: dict[int, dict] = {}
+        if target_accounts:
+            def _fetch_one(acc):
+                try:
+                    return fetch_latest_mail_code(acc["account"], acc["password"])
+                except Exception:
+                    return None
+
+            with ThreadPoolExecutor(max_workers=min(6, len(target_accounts))) as pool:
+                code_infos = list(pool.map(_fetch_one, target_accounts))
+
+            # SQLite 写入保留在主线程，避免跨线程并发写库
+            for account, code_info in zip(target_accounts, code_infos):
+                if not code_info:
+                    continue
+                updated = self.db.record_email_verification_code(account["id"], code_info)
+                fp_cfg = (updated or account).get("fp_config") or {}
+                codes[account["id"]] = {
+                    "code": code_info.get("code", ""),
+                    "received_at": code_info.get("timestamp"),
+                    "subject": code_info.get("subject", ""),
+                    "proxy_node": fp_cfg.get("proxy_node", ""),
+                }
+        return {
+            "ok": True,
+            "codes": codes,
+            "node_stats": self.db.get_node_code_stats(),
+        }
+
+    def reset_domain_email_nodes(self, account_ids: list[int] | None = None) -> dict:
+        res = self.db.reset_domain_email_nodes(account_ids)
+        return {"ok": True, "reset_count": res.get("reset_count", 0)}
 
     def regenerate_fingerprint(self, account_id: int) -> dict:
         updated = self.db.regenerate_fingerprint(int(account_id), salt=str(time.time()))
@@ -272,7 +368,11 @@ class AccountApi:
 
     def batch_import(self, raw_text: str, account_type: str = "") -> dict:
         try:
-            records = parse_domain_email_text(raw_text) if account_type == "域名邮箱" else parse_account_text(raw_text)
+            records = (
+                parse_domain_email_text(raw_text)
+                if account_type == "域名邮箱"
+                else parse_account_text(raw_text, account_type=account_type)
+            )
         except ValueError as exc:
             return {"ok": False, "imported": 0, "error": str(exc)}
         if not records:

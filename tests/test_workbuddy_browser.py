@@ -14,6 +14,7 @@ without binding port 443.
 
 import datetime
 import inspect
+import json
 import shutil
 import ssl
 import subprocess
@@ -1142,6 +1143,140 @@ def test_visible_windows_use_zero_creationflags_and_headless_hides_console(
         else 0
     )
     assert hidden["kwargs"]["creationflags"] == expected
+
+
+# ---------------------------------------------------------------------------
+# 2c. Locale/timezone anti-leak for the WorkBuddy Chrome profile
+# ---------------------------------------------------------------------------
+@requires_chrome
+def test_launch_browser_writes_locale_preferences_and_env(tmp_path: Path, monkeypatch):
+    captured: list[dict] = []
+
+    class _FakeProc:
+        pid = 424243
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            return None
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            return None
+
+    def _fake_popen(args, **kwargs):
+        captured.append({"args": list(args), "kwargs": dict(kwargs)})
+        return _FakeProc()
+
+    monkeypatch.setattr(wb.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(wb, "_wait_for_devtools", lambda *args, **kwargs: True)
+
+    helper = WorkBuddyBrowser(tmp_path / "sessions_locale")
+    helper.headless = True
+    session_dir = tmp_path / "sessions_locale" / "7"
+    fp = {
+        "proxy_node": "US | MiyaIP-2 HY2",
+        "proxy": "http://127.0.0.1:17899",
+        "canvas_seed": 1234,
+    }
+    ctx = helper._launch_browser(session_dir, 0, fp, "http://127.0.0.1:17899")
+    launch = captured[-1]
+    args = launch["args"]
+
+    # Locale flags must precede the final about:blank target.
+    assert "--disable-quic" in args
+    assert "--lang=en-US" in args
+    assert "--accept-lang=en-US,en" in args
+    assert args[-1] == "about:blank"
+    assert args.index("--lang=en-US") < args.index("about:blank")
+    assert args.index("--accept-lang=en-US,en") < args.index("about:blank")
+    assert "--proxy-server=http://127.0.0.1:17899" in args
+
+    # The Chrome subprocess must carry the spoofed clock/locale, not the host's.
+    env = launch["kwargs"]["env"]
+    assert env["TZ"] == "America/Los_Angeles"
+    assert env["LANG"] == "en_US.UTF-8"
+    assert env["LC_ALL"] == "en_US.UTF-8"
+
+    prefs = json.loads(
+        (session_dir / "Default" / "Preferences").read_text(encoding="utf-8")
+    )
+    assert prefs["intl"]["accept_languages"] == "en-US,en"
+    assert prefs["intl"]["selected_languages"] == "en-US,en"
+    assert prefs["spellcheck"]["dictionaries"] == ["en-US"]
+
+    # The CDP context carries the same profile so every page inherits it.
+    assert ctx.timezone == "America/Los_Angeles"
+    assert ctx.locale == "en-US"
+
+
+def test_cdp_page_applies_emulation_overrides_without_runtime_enable(monkeypatch):
+    sent: list[tuple[str, dict | None]] = []
+
+    class _FakeClient:
+        def __init__(self, ws_url):
+            self._closed = False
+            self.sent_methods: list[str] = []
+
+        def send(self, method, params=None):
+            if method == "Runtime.enable":
+                raise RuntimeError("Forbidden CDP method")
+            sent.append((method, params))
+            self.sent_methods.append(method)
+            return {}
+
+    class _StubContext:
+        timezone = "America/Los_Angeles"
+        locale = "en-US"
+
+        def _find_target(self, target_id):
+            return None
+
+    monkeypatch.setattr(wb, "_CdpClient", _FakeClient)
+
+    page = wb._CdpPage(_StubContext(), "target-1", "ws://127.0.0.1:1/devtools/page/1")
+    page._ensure_client()
+
+    methods = [m for m, _ in sent]
+    assert "Page.enable" in methods
+    assert "Network.enable" in methods
+    assert "Emulation.setTimezoneOverride" in methods
+    assert "Emulation.setLocaleOverride" in methods
+    assert "Runtime.enable" not in methods
+    assert sent[methods.index("Emulation.setTimezoneOverride")][1] == {
+        "timezoneId": "America/Los_Angeles"
+    }
+    assert sent[methods.index("Emulation.setLocaleOverride")][1] == {"locale": "en-US"}
+
+    # An explicit per-page override wins over the context default.
+    sent.clear()
+    page2 = wb._CdpPage(
+        _StubContext(),
+        "target-2",
+        "ws://127.0.0.1:1/devtools/page/2",
+        timezone="Asia/Tokyo",
+        locale="ja-JP",
+    )
+    page2._ensure_client()
+    overrides = dict(sent)
+    assert overrides["Emulation.setTimezoneOverride"] == {"timezoneId": "Asia/Tokyo"}
+    assert overrides["Emulation.setLocaleOverride"] == {"locale": "ja-JP"}
+
+    # Emulation failures never break page setup.
+    class _FailingClient(_FakeClient):
+        def send(self, method, params=None):
+            if method.startswith("Emulation."):
+                raise RuntimeError("unsupported")
+            return super().send(method, params)
+
+    sent.clear()
+    monkeypatch.setattr(wb, "_CdpClient", _FailingClient)
+    page3 = wb._CdpPage(_StubContext(), "target-3", "ws://127.0.0.1:1/devtools/page/3")
+    assert page3._ensure_client() is not None
+    assert [m for m, _ in sent] == ["Page.enable", "Network.enable"]
 
 
 # ---------------------------------------------------------------------------

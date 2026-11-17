@@ -13,6 +13,7 @@ MAIL_HOST = "mail.ggb6.com"
 MAIL_URL = "https://" + MAIL_HOST
 _CODE = re.compile(r"(?<![\w-])(?:[0-9]{8}|[0-9]{6})(?![\w-])")
 _SUBJECT = re.compile(r"launch code|verif(?:y|ication)|验证码|验证.*邮箱", re.I)
+_PREFERRED = re.compile(r"github|workbuddy|launch code|verification|verify|验证码", re.I)
 _MONTHS = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
 
 
@@ -64,6 +65,77 @@ def _message_code(raw: bytes, email: str, earliest: float, now: float) -> str | 
     if len(codes) != 1:
         raise ValueError("最新验证邮件里没有唯一的验证码，请打开网页邮箱查看。")
     return codes.pop()
+
+
+def _generic_message(raw: bytes, max_age_seconds: int, now: float) -> dict | None:
+    message = BytesParser(policy=policy.default).parsebytes(raw)
+    subject = str(message.get("Subject", ""))
+    sender = str(message.get("From", ""))
+    date_header = str(message.get("Date", ""))
+    try:
+        date = parsedate_to_datetime(date_header)
+        if date is None:
+            return None
+        timestamp = date.timestamp()
+    except (ValueError, TypeError, OverflowError):
+        return None
+    if timestamp > now + 60 or timestamp < now - max(0, int(max_age_seconds)):
+        return None
+
+    body = message.get_body(preferencelist=("plain", "html"))
+    content = body.get_content() if body else ""
+    if body and body.get_content_type() == "text/html":
+        parser = _VisibleText()
+        parser.feed(content)
+        content = " ".join(parser.text)
+    match = _CODE.search(subject + "\n" + re.sub(r"https?://\S+", "", content))
+    if not match:
+        return None
+    return {
+        "code": match.group(0),
+        "from": sender,
+        "subject": subject,
+        "date": date_header,
+        "timestamp": int(timestamp),
+        "preferred": bool(_PREFERRED.search(sender) or _PREFERRED.search(subject)),
+    }
+
+
+def fetch_latest_mail_code(email: str, password: str, max_age_seconds: int = 1800) -> dict | None:
+    """Read the latest inbox messages and return a recent verification code."""
+    now = time.time()
+    try:
+        with imaplib.IMAP4_SSL(MAIL_HOST, 993, ssl_context=ssl.create_default_context(), timeout=8) as inbox:
+            inbox.login(email, password)
+            if inbox.select("INBOX", readonly=True)[0] != "OK":
+                return None
+            status, matches = inbox.uid("SEARCH", None, "ALL")
+            if status != "OK":
+                return None
+            uids = (matches[0] or b"").split()[-8:]
+            candidates: list[dict] = []
+            for uid in reversed(uids):
+                status, parts = inbox.uid("FETCH", uid, "(BODY.PEEK[]<0.262144>)")
+                if status != "OK":
+                    continue
+                for part in parts:
+                    if not isinstance(part, tuple):
+                        continue
+                    try:
+                        info = _generic_message(part[1], max_age_seconds, now)
+                    except (ValueError, TypeError, UnicodeError, LookupError):
+                        continue
+                    if info:
+                        candidates.append(info)
+            if not candidates:
+                return None
+            best = max(candidates, key=lambda item: (item["preferred"], item["timestamp"]))
+            best.pop("preferred", None)
+            return best
+    except (OSError, imaplib.IMAP4.error, UnicodeError, LookupError, ValueError, TypeError):
+        # IMAP servers and malformed mail headers raise a wide range of errors;
+        # a failed fetch simply means "no code available right now".
+        return None
 
 
 def read_github_code(email: str, password: str, started_at: int) -> str:
