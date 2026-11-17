@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import subprocess
 import threading
 import time
@@ -358,6 +359,7 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
             "twofaModified": bool(account.get("twofa_modified")),
             "profileCode": fp.get("profile_code", "FP-000"),
             "proxyNode": (fp.get("proxy_node") or "").strip(),
+            "launchToken": f"{int(time.time() * 1000)}_{secrets.token_hex(4)}",
         },
         ensure_ascii=False,
     )
@@ -505,16 +507,141 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
     }} catch (_) {{}}
   }}
 
-  // --- DOM Helpers for React / Google Wiz ---
-  // Default silent (manual click-to-fill) to avoid synthetic auto-submit anti-bot signals.
-  let autoEnabled = safeGetSession('kv_autologin_enabled') === '1';
-  let capsuleHidden = safeGetSession('kv_capsule_hidden') === '1';
-  let statusText = autoEnabled
-    ? '⚡ 正在检测登录表单...'
-    : '🛡️ 静默防风控模式（点下方按钮填入 · Alt+K 隐藏）';
+  // --- Shared Cross-Origin Launch State (First-Launch One-Shot Auto-Login + Bar UI State) ---
+  const LAUNCH_STORAGE_KEY = 'kv_launch_state';
+  const SESSION_STATE_KEY = 'kv_launch_state_' + (AUTH.launchToken || 'default');
+  let launchState = {{
+    launchToken: AUTH.launchToken || '',
+    autoLoginDone: false,
+    loginRoundActive: false,
+    stepsDone: {{}},
+    lastStepAt: 0,
+    minimized: false,
+    hidden: false,
+    pos: null
+  }};
+  let storageReady = false;
+  let roundCheckAnchorAt = Date.now();
+  let autoEnabled = false;
+  let capsuleHidden = false;
+  let minimized = false;
+  let statusText = '⏳ 首轮登录检测中...';
   let statusUiUpdater = null;
   let lastFocusedInput = null;
   let hotkeyBound = false;
+  let dropdownOpen = false;
+  let navPopupBuiltKey = '';
+
+  function persistLaunchState() {{
+    try {{
+      safeSetSession(SESSION_STATE_KEY, JSON.stringify(launchState));
+    }} catch (_) {{}}
+    try {{
+      if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {{
+        chrome.storage.local.set({{ [LAUNCH_STORAGE_KEY]: launchState }});
+      }}
+    }} catch (_) {{}}
+  }}
+
+  function finishAutoLoginRound(msg) {{
+    const changed = !launchState.autoLoginDone || autoEnabled;
+    launchState.autoLoginDone = true;
+    launchState.loginRoundActive = false;
+    autoEnabled = false;
+    if (changed) {{
+      persistLaunchState();
+    }}
+    if (msg) setStatus(msg);
+    else if (statusUiUpdater) statusUiUpdater();
+  }}
+
+  function claimAutoStep(stepKey, force) {{
+    if (force) {{
+      launchState.loginRoundActive = true;
+      launchState.lastStepAt = Date.now();
+      launchState.stepsDone[stepKey] = launchState.lastStepAt;
+      persistLaunchState();
+      return true;
+    }}
+    if (launchState.stepsDone && launchState.stepsDone[stepKey]) {{
+      return false;
+    }}
+    const now = Date.now();
+    if (!launchState.stepsDone) launchState.stepsDone = {{}};
+    launchState.stepsDone[stepKey] = now;
+    launchState.loginRoundActive = true;
+    launchState.lastStepAt = now;
+    persistLaunchState();
+    return true;
+  }}
+
+  function startManualAutoLoginRound() {{
+    resetStepCooldowns();
+    launchState.autoLoginDone = false;
+    launchState.loginRoundActive = true;
+    launchState.stepsDone = {{}};
+    launchState.lastStepAt = Date.now();
+    roundCheckAnchorAt = Date.now();
+    autoEnabled = true;
+    persistLaunchState();
+    setStatus('⚡ 正在执行本轮自动登录...');
+    runAutoLoginTick(true);
+  }}
+
+  function initLaunchState(onReady) {{
+    const finalize = (saved) => {{
+      if (saved && typeof saved === 'object' && saved.launchToken === (AUTH.launchToken || '')) {{
+        launchState = {{
+          ...launchState,
+          ...saved,
+          stepsDone: (saved.stepsDone && typeof saved.stepsDone === 'object') ? saved.stepsDone : {{}}
+        }};
+      }} else {{
+        launchState = {{
+          launchToken: AUTH.launchToken || '',
+          autoLoginDone: false,
+          loginRoundActive: false,
+          stepsDone: {{}},
+          lastStepAt: 0,
+          minimized: false,
+          hidden: false,
+          pos: null
+        }};
+        persistLaunchState();
+      }}
+      autoEnabled = !launchState.autoLoginDone;
+      capsuleHidden = !!launchState.hidden;
+      minimized = !!launchState.minimized;
+      statusText = autoEnabled
+        ? '⏳ 检测登录状态中...'
+        : '🛡️ 静默防风控模式（点按钮手动填入 · Alt+K 隐藏）';
+      storageReady = true;
+      if (typeof onReady === 'function') onReady();
+    }};
+
+    try {{
+      if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {{
+        chrome.storage.local.get([LAUNCH_STORAGE_KEY], (res) => {{
+          let saved = res ? res[LAUNCH_STORAGE_KEY] : null;
+          if (!saved) {{
+            try {{
+              const cached = safeGetSession(SESSION_STATE_KEY);
+              if (cached) saved = JSON.parse(cached);
+            }} catch (_) {{}}
+          }}
+          finalize(saved);
+        }});
+        return;
+      }}
+    }} catch (_) {{}}
+
+    let cachedObj = null;
+    try {{
+      const cached = safeGetSession(SESSION_STATE_KEY);
+      if (cached) cachedObj = JSON.parse(cached);
+    }} catch (_) {{}}
+    finalize(cachedObj);
+  }}
 
   document.addEventListener('focusin', (e) => {{
     if (e.target && e.target.tagName === 'INPUT') {{
@@ -718,11 +845,17 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
       const isEmailInboxCode = /check your inbox|查看您的收件箱|sent a code to your email|已向您的电子邮件发送/i.test(pageText)
         && !/authenticator|身份验证器|one-time|一次性|two-step|两步验证/i.test(pageText);
       if (isEmailInboxCode && !force) {{
-        setStatus('📧 检测到邮箱验证码步骤，请查收邮箱或手动点击[填2FA]');
+        finishAutoLoginRound('📧 需邮箱验证码 · 自动登录已关闭');
         return;
       }}
-      if (getActiveTotpSecret() && (force || canRunStep('openai_totp', 4200))) {{
+      if (getActiveTotpSecret() && claimAutoStep('openai_totp', force)) {{
         scheduleTotpFillAndSubmit(() => findOpenAISubmitButton(otpInput));
+        return;
+      }}
+      if (launchState.stepsDone && launchState.stepsDone.openai_totp && !force) {{
+        if (Date.now() - (launchState.lastStepAt || 0) >= 6500) {{
+          finishAutoLoginRound('✅ 本轮登录已结束 · 自动登录已关闭');
+        }}
         return;
       }}
     }}
@@ -747,7 +880,7 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
     ]);
 
     if (pwdInput && AUTH.password) {{
-      if (force || canRunStep('openai_pwd', 4000)) {{
+      if (claimAutoStep('openai_pwd', force)) {{
         if (emailInput && !emailInput.value && AUTH.account) {{
           setNativeInputValue(emailInput, AUTH.account);
         }}
@@ -757,19 +890,23 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
           const btn = findOpenAISubmitButton(pwdInput);
           if (btn) clickButton(btn);
         }}, 400);
+      }} else if (!force && Date.now() - (launchState.lastStepAt || 0) >= 7500) {{
+        finishAutoLoginRound('✅ 本轮密码步骤已提交 · 自动登录已关闭');
       }}
       return;
     }}
 
     // 3. Check for OpenAI / ChatGPT Email step (works both on auth.openai.com and inline modal on chatgpt.com)
     if (emailInput && AUTH.account) {{
-      if (force || canRunStep('openai_email', 4000)) {{
+      if (claimAutoStep('openai_email', force)) {{
         setNativeInputValue(emailInput, AUTH.account);
         setStatus('⚡ 已自动填入账号邮箱，正在点击继续...');
         setTimeout(() => {{
           const btn = findOpenAISubmitButton(emailInput);
           if (btn) clickButton(btn);
         }}, 400);
+      }} else if (!force && Date.now() - (launchState.lastStepAt || 0) >= 7500) {{
+        finishAutoLoginRound('✅ 本轮邮箱步骤已结束 · 自动登录已关闭');
       }}
       return;
     }}
@@ -783,18 +920,28 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
       ]) || Array.from(document.querySelectorAll('button, a')).find((el) => {{
         if (!isVisible(el)) return false;
         const t = (el.innerText || el.textContent || '').trim();
-        return /^(log in|登录)$/i.test(t);
+        return /^(log in|sign in|登录)$/i.test(t);
       }});
 
-      if (!loginBtn) {{
-        setStatus('✅ 已成功登录 ChatGPT 主页');
-        autoMinimizeCapsule();
+      if (loginBtn) {{
+        if (claimAutoStep('chatgpt_landing_login', force)) {{
+          setStatus('⚡ 检测到未登录，正在点击「登录」按钮...');
+          setTimeout(() => clickButton(loginBtn), 450);
+        }} else if (!force && Date.now() - (launchState.lastStepAt || 0) >= 7500) {{
+          finishAutoLoginRound('✅ 本轮登录已触发 · 自动登录已关闭');
+        }}
         return;
       }}
 
-      if (force || canRunStep('chatgpt_landing_login', 4500)) {{
-        setStatus('⚡ 检测到未登录，正在点击「登录」按钮...');
-        setTimeout(() => clickButton(loginBtn), 450);
+      const signedInEl = document.querySelector(
+        '#prompt-textarea, [data-testid="profile-button"], button[data-testid="accounts-profile-button"], [data-testid="create-new-chat-button"], nav a[href^="/c/"]'
+      );
+      if (signedInEl || Date.now() - roundCheckAnchorAt >= 2600) {{
+        finishAutoLoginRound(
+          launchState.loginRoundActive
+            ? '✅ 首轮登录完成 · 自动登录已关闭'
+            : '🛡️ 已登录 ChatGPT · 自动登录已关闭'
+        );
         return;
       }}
     }}
@@ -819,17 +966,22 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
     const path = location.pathname.toLowerCase();
 
     if (host.includes('myaccount.google.com') && !path.includes('signin')) {{
-      setStatus('✅ 已成功登录 Google 账号主页');
-      autoMinimizeCapsule();
+      finishAutoLoginRound(
+        launchState.loginRoundActive
+          ? '✅ 首轮登录 Google 完成 · 自动登录已关闭'
+          : '🛡️ 已登录 Google · 自动登录已关闭'
+      );
       return;
     }}
 
     // 0. Account Chooser screen (if present)
     if (AUTH.account) {{
       const chooserRow = document.querySelector(`div[data-identifier="${{CSS.escape(AUTH.account)}}"]`);
-      if (chooserRow && isVisible(chooserRow) && (force || canRunStep('google_chooser', 4200))) {{
-        setStatus('⚡ 已在列表中选择当前 Google 账号...');
-        setTimeout(() => clickButton(chooserRow), 350);
+      if (chooserRow && isVisible(chooserRow)) {{
+        if (claimAutoStep('google_chooser', force)) {{
+          setStatus('⚡ 已在列表中选择当前 Google 账号...');
+          setTimeout(() => clickButton(chooserRow), 350);
+        }}
         return;
       }}
     }}
@@ -842,8 +994,10 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
       'input[autocomplete="one-time-code"]',
     ]);
     if (totpInput && getActiveTotpSecret()) {{
-      if (force || canRunStep('google_totp', 4800)) {{
+      if (claimAutoStep('google_totp', force)) {{
         scheduleTotpFillAndSubmit(() => findGoogleNextButton('#totpNext'));
+      }} else if (!force && Date.now() - (launchState.lastStepAt || 0) >= 7500) {{
+        finishAutoLoginRound('✅ 本轮 2FA 提交完成 · 自动登录已关闭');
       }}
       return;
     }}
@@ -854,26 +1008,28 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
       'input[name="knowledgePreregisteredEmailResponse"]',
     ]);
     if (recInput && AUTH.recoveryEmail) {{
-      if (force || canRunStep('google_recovery_email', 4500)) {{
+      if (claimAutoStep('google_recovery_email', force)) {{
         setNativeInputValue(recInput, AUTH.recoveryEmail);
         setStatus('⚡ 已自动填入辅助邮箱，正在验证...');
         setTimeout(() => {{
           const btn = findGoogleNextButton(null);
           if (btn) clickButton(btn);
         }}, 450);
+      }} else if (!force && Date.now() - (launchState.lastStepAt || 0) >= 7500) {{
+        finishAutoLoginRound('✅ 本轮辅助邮箱验证已提交 · 自动登录已关闭');
       }}
       return;
     }}
 
     // Also check if Google is showing the "Choose verification method" list with "Confirm your recovery email" (data-challengetype="12") or Authenticator (data-challengetype="6")
     const totpChallengeOption = document.querySelector('div[data-challengetype="6"], li div[data-challengetype="6"]');
-    if (totpChallengeOption && isVisible(totpChallengeOption) && getActiveTotpSecret() && (force || canRunStep('google_pick_totp', 4200))) {{
+    if (totpChallengeOption && isVisible(totpChallengeOption) && getActiveTotpSecret() && claimAutoStep('google_pick_totp', force)) {{
       setStatus('⚡ 自动选择 Google 身份验证器 2FA 验证...');
       setTimeout(() => clickButton(totpChallengeOption), 400);
       return;
     }}
     const recChallengeOption = document.querySelector('div[data-challengetype="12"], li div[data-challengetype="12"]');
-    if (recChallengeOption && isVisible(recChallengeOption) && AUTH.recoveryEmail && (force || canRunStep('google_pick_rec', 4200))) {{
+    if (recChallengeOption && isVisible(recChallengeOption) && AUTH.recoveryEmail && claimAutoStep('google_pick_rec', force)) {{
       setStatus('⚡ 自动选择确认辅助邮箱验证...');
       setTimeout(() => clickButton(recChallengeOption), 400);
       return;
@@ -886,13 +1042,15 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
       '#password input[type="password"]',
     ]);
     if (pwdInput && AUTH.password) {{
-      if (force || canRunStep('google_pwd', 4500)) {{
+      if (claimAutoStep('google_pwd', force)) {{
         setNativeInputValue(pwdInput, AUTH.password);
         setStatus('⚡ 已自动填入 Google 密码，正在下一步...');
         setTimeout(() => {{
           const btn = findGoogleNextButton('#passwordNext');
           if (btn) clickButton(btn);
         }}, 450);
+      }} else if (!force && Date.now() - (launchState.lastStepAt || 0) >= 7500) {{
+        finishAutoLoginRound('✅ 本轮密码步骤已提交 · 自动登录已关闭');
       }}
       return;
     }}
@@ -903,15 +1061,30 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
       'input[type="email"][name="identifier"]',
     ]);
     if (emailInput && AUTH.account) {{
-      if (force || canRunStep('google_email', 4500)) {{
+      if (claimAutoStep('google_email', force)) {{
         setNativeInputValue(emailInput, AUTH.account);
         setStatus('⚡ 已自动填入 Google 邮箱，正在下一步...');
         setTimeout(() => {{
           const btn = findGoogleNextButton('#identifierNext');
           if (btn) clickButton(btn);
         }}, 450);
+      }} else if (!force && Date.now() - (launchState.lastStepAt || 0) >= 7500) {{
+        finishAutoLoginRound('✅ 本轮账号步骤已提交 · 自动登录已关闭');
       }}
       return;
+    }}
+
+    // Signed-in non-login Google surfaces (Gmail, Cloud Console, Account overview, etc.)
+    if (!force) {{
+      const elapsed = Date.now() - Math.max(roundCheckAnchorAt, launchState.lastStepAt || 0);
+      const hasSignedInNav = !!document.querySelector('a[aria-label*="Google"], a[href*="SignOutOptions"]');
+      if (hasSignedInNav || (!host.includes('accounts.google.com') && elapsed >= 1500) || elapsed >= 3200) {{
+        finishAutoLoginRound(
+          launchState.loginRoundActive
+            ? '✅ 首轮登录已结束 · 自动登录已关闭'
+            : '🛡️ 无需登录 · 自动登录已关闭'
+        );
+      }}
     }}
   }}
 
@@ -931,21 +1104,20 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
     ]);
     const loggedInPath = path.startsWith('/new') || path.startsWith('/chat/');
     if (composer && isVisible(composer) && !emailInput && (loggedInPath || !document.querySelector('form'))) {{
-      setStatus('✅ 已成功登录 Claude');
-      autoMinimizeCapsule();
+      finishAutoLoginRound('✅ 已成功登录 Claude（自动登录已关闭）');
       return;
     }}
 
     if (emailInput && AUTH.account) {{
-      if (force || canRunStep('claude_email', 4500)) {{
+      if (claimAutoStep('claude_email', force)) {{
         setNativeInputValue(emailInput, AUTH.account);
-        setStatus('⚡ 已自动填入 Claude 登录邮箱，请完成人机验证/邮箱验证码或点击 Continue 继续');
+        finishAutoLoginRound('✅ 已填入 Claude 登录邮箱 · 首轮自动填充已关闭');
       }}
       return;
     }}
 
     if (host.includes('claude.ai') && !loggedInPath && !composer) {{
-      if (force || canRunStep('claude_landing', 5000)) {{
+      if (claimAutoStep('claude_landing', force)) {{
         const loginBtn = findFirstVisible([
           'a[href*="/login"]',
           'button[data-testid="login-button"]',
@@ -963,7 +1135,12 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
     }}
 
     if (emailInput && !AUTH.account) {{
-      setStatus('⚠️ 此账号未配置登录邮箱');
+      finishAutoLoginRound('⚠️ 此账号未配置登录邮箱 · 自动登录已关闭');
+      return;
+    }}
+
+    if (!force && Date.now() - Math.max(roundCheckAnchorAt, launchState.lastStepAt || 0) >= 3200) {{
+      finishAutoLoginRound('🛡️ 当前无需登录 · 自动登录已关闭');
     }}
   }}
 
@@ -980,13 +1157,12 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
     const loggedIn = (document.body && document.body.classList.contains('task-mail'))
       || (!!document.querySelector('#layout-content') && !document.querySelector('#login-form'));
     if (loggedIn) {{
-      setStatus('✅ 已成功登录 GGB6 邮箱收件箱');
-      autoMinimizeCapsule();
+      finishAutoLoginRound('✅ 已成功登录 GGB6 邮箱收件箱（自动登录已关闭）');
       return;
     }}
 
     if (userEl && pwdEl && AUTH.account && AUTH.password) {{
-      if (force || canRunStep('roundcube_login', 4000)) {{
+      if (claimAutoStep('roundcube_login', force)) {{
         setNativeInputValue(userEl, AUTH.account);
         setNativeInputValue(pwdEl, AUTH.password);
         setStatus('⚡ 已自动填入邮箱账号与密码，正在登录...');
@@ -998,13 +1174,15 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
             if (form) form.submit();
           }}
         }}, 350);
+      }} else if (!force && Date.now() - (launchState.lastStepAt || 0) >= 6500) {{
+        finishAutoLoginRound('✅ 本轮邮箱登录已提交 · 自动登录已关闭');
       }}
       return;
     }}
 
     if (isMailHost) {{
       if (!AUTH.account || !AUTH.password) {{
-        setStatus('⚠️ 此账号未配置邮箱账号或密码');
+        finishAutoLoginRound('⚠️ 此账号未配置邮箱账号或密码');
       }} else if (!userEl && !loggedIn) {{
         setStatus('⏳ 正在等待 GGB6 邮箱登录表单加载...');
       }}
@@ -1094,6 +1272,7 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
   }}
 
   function runAutoLoginTick(force = false) {{
+    if (!storageReady) return;
     if (!autoEnabled && !force) return;
     if (force) resetStepCooldowns();
     const host = location.hostname.toLowerCase();
@@ -1105,20 +1284,33 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
       runClaudeFlow(force);
     }} else if (host.includes('mail.ggb6.com') || document.querySelector('#rcmloginuser')) {{
       runRoundcubeMailFlow(force);
+    }} else if (!force) {{
+      finishAutoLoginRound('🛡️ 当前页无需登录 · 自动登录已关闭');
+      return;
+    }}
+
+    if (!force && autoEnabled && !launchState.autoLoginDone) {{
+      const now = Date.now();
+      if (launchState.loginRoundActive && launchState.lastStepAt && now - launchState.lastStepAt >= 8000) {{
+        finishAutoLoginRound('✅ 本轮登录已结束 · 自动登录已关闭');
+      }} else if (!launchState.loginRoundActive && now - roundCheckAnchorAt >= 4500) {{
+        finishAutoLoginRound('🛡️ 无需登录 · 自动登录已关闭');
+      }}
     }}
   }}
 
-  // --- Closed Shadow DOM Floating Auto-Login Capsule ---
-  let minimized = false;
+  // --- Closed Shadow DOM Top Bar & Draggable Mini Capsule ---
   let minimizeTimer = null;
-  let domainPanelKey = '';
+  let currentUiMode = '';
 
   function autoMinimizeCapsule() {{
     if (minimizeTimer) return;
     minimizeTimer = setTimeout(() => {{
       minimized = true;
+      launchState.minimized = true;
+      persistLaunchState();
       if (statusUiUpdater) statusUiUpdater();
-    }}, 2200);
+    }}, 1800);
   }}
 
   function bindToggleHotkey() {{
@@ -1128,7 +1320,8 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
       if (e.altKey && (e.key === 'k' || e.key === 'K' || e.code === 'KeyK')) {{
         e.preventDefault();
         capsuleHidden = !capsuleHidden;
-        safeSetSession('kv_capsule_hidden', capsuleHidden ? '1' : '0');
+        launchState.hidden = capsuleHidden;
+        persistLaunchState();
         const existing = document.getElementById('__kv_autologin_host');
         if (capsuleHidden) {{
           if (existing) existing.remove();
@@ -1150,189 +1343,272 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
     if (!rootTarget || existingHost) return;
     const hostEl = document.createElement('div');
     hostEl.id = '__kv_autologin_host';
-    hostEl.style.cssText = 'all: initial; position: fixed; top: 14px; right: 14px; z-index: 2147483647; font-family: system-ui, -apple-system, "Segoe UI", sans-serif;';
+    hostEl.style.cssText = 'all: initial; position: fixed; top: 6px; left: 50%; transform: translateX(-50%); z-index: 2147483647; font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;';
     const shadow = hostEl.attachShadow({{ mode: 'closed' }});
 
     const style = document.createElement('style');
     style.textContent = `
-      .kv-box {{
-        background: rgba(15, 23, 42, 0.94);
-        backdrop-filter: blur(10px);
-        color: #f8fafc;
-        border: 1px solid rgba(56, 189, 248, 0.35);
-        border-radius: 12px;
-        padding: 10px 12px;
-        width: 270px;
-        box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
-        font-size: 12px;
-        line-height: 1.4;
-        user-select: none;
-      }}
-      .kv-box.minimized {{
-        width: auto;
-        padding: 6px 11px;
-        border-radius: 999px;
-        cursor: pointer;
-        display: flex;
+      * {{ box-sizing: border-box; }}
+      .kv-bar {{
+        position: relative;
+        display: inline-flex;
         align-items: center;
         gap: 6px;
+        flex-wrap: nowrap;
+        max-width: calc(100vw - 16px);
+        background: rgba(11, 17, 32, 0.94);
+        backdrop-filter: blur(10px);
+        color: #f8fafc;
+        border: 1px solid rgba(99, 102, 241, 0.45);
+        border-radius: 10px;
+        padding: 4px 8px;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.48);
+        font-size: 11.5px;
+        line-height: 1.25;
+        user-select: none;
+        white-space: nowrap;
       }}
-      .kv-head {{
-        display: flex;
+      .kv-bar.minimized {{
+        border-radius: 999px;
+        padding: 4px 8px 4px 10px;
+        background: rgba(23, 21, 58, 0.95);
+        border-color: rgba(129, 140, 248, 0.65);
+        cursor: grab;
+        gap: 7px;
+      }}
+      .kv-bar.minimized:active {{
+        cursor: grabbing;
+      }}
+      .kv-drag-handle {{
+        display: inline-flex;
         align-items: center;
-        justify-content: space-between;
-        margin-bottom: 6px;
-        padding-bottom: 5px;
-        border-bottom: 1px solid rgba(148, 163, 184, 0.18);
-      }}
-      .kv-title {{
+        gap: 5px;
+        padding: 3px 7px;
+        border-radius: 6px;
+        background: rgba(30, 41, 59, 0.9);
+        border: 1px solid rgba(148, 163, 184, 0.22);
+        color: #7dd3fc;
         font-weight: 700;
-        color: #38bdf8;
-        font-size: 12px;
-        display: flex;
-        align-items: center;
-        gap: 5px;
+        cursor: grab;
+        max-width: 190px;
+        overflow: hidden;
+        text-overflow: ellipsis;
       }}
-      .kv-actions-top {{
-        display: flex;
+      .kv-drag-handle:active {{
+        cursor: grabbing;
+      }}
+      .kv-sep {{
+        width: 1px;
+        height: 18px;
+        background: rgba(148, 163, 184, 0.22);
+        flex: 0 0 auto;
+      }}
+      .kv-btn {{
+        display: inline-flex;
         align-items: center;
-        gap: 5px;
+        gap: 3px;
+        background: rgba(30, 41, 59, 0.95);
+        color: #e2e8f0;
+        border: 1px solid rgba(148, 163, 184, 0.24);
+        border-radius: 6px;
+        padding: 4px 8px;
+        font-size: 11px;
+        font-weight: 600;
+        cursor: pointer;
+        white-space: nowrap;
+      }}
+      .kv-btn:hover {{
+        background: rgba(51, 65, 85, 0.95);
+        border-color: rgba(56, 189, 248, 0.55);
+        color: #fff;
+      }}
+      .kv-btn.primary {{
+        background: rgba(2, 132, 199, 0.9);
+        border-color: rgba(56, 189, 248, 0.75);
+        color: #fff;
+      }}
+      .kv-btn.primary:hover {{
+        background: #0ea5e9;
+      }}
+      .kv-btn.totp {{
+        background: rgba(6, 78, 59, 0.85);
+        border-color: rgba(16, 185, 129, 0.48);
+        color: #6ee7b7;
+        font-family: ui-monospace, Consolas, monospace;
+      }}
+      .kv-btn.totp:hover {{
+        background: rgba(5, 150, 105, 0.9);
+        color: #fff;
+      }}
+      .kv-btn.auto-on {{
+        background: rgba(16, 185, 129, 0.2);
+        border-color: rgba(16, 185, 129, 0.55);
+        color: #34d399;
+      }}
+      .kv-btn.auto-off {{
+        background: rgba(30, 41, 59, 0.85);
+        color: #94a3b8;
+      }}
+      .kv-status-pill {{
+        max-width: 165px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        color: #94a3b8;
+        font-size: 11px;
+        padding: 0 4px;
       }}
       .kv-mini-btn {{
-        background: rgba(255,255,255,0.08);
+        background: rgba(255, 255, 255, 0.08);
         color: #cbd5e1;
-        border: 1px solid rgba(255,255,255,0.14);
-        border-radius: 5px;
-        padding: 2px 6px;
+        border: 1px solid rgba(255, 255, 255, 0.16);
+        border-radius: 6px;
+        padding: 3px 7px;
         font-size: 11px;
+        font-weight: 600;
         cursor: pointer;
+        white-space: nowrap;
       }}
-      .kv-mini-btn.active {{
-        background: rgba(16, 185, 129, 0.22);
-        color: #34d399;
-        border-color: rgba(16, 185, 129, 0.45);
+      .kv-mini-btn:hover {{
+        background: rgba(255, 255, 255, 0.18);
+        color: #fff;
       }}
-      .kv-row {{
+      .kv-mini-btn.collapse {{
+        background: rgba(67, 56, 202, 0.45);
+        border-color: rgba(129, 140, 248, 0.55);
+        color: #e0e7ff;
+      }}
+      .kv-mini-btn.close:hover {{
+        background: rgba(185, 28, 28, 0.7);
+        border-color: rgba(248, 113, 113, 0.7);
+      }}
+      .kv-menu-wrap {{
+        position: relative;
+        display: inline-flex;
+      }}
+      .kv-dropdown {{
+        position: absolute;
+        top: calc(100% + 6px);
+        right: 0;
+        min-width: 168px;
+        background: rgba(15, 23, 42, 0.98);
+        border: 1px solid rgba(99, 102, 241, 0.48);
+        border-radius: 9px;
+        padding: 5px;
+        box-shadow: 0 12px 28px rgba(0, 0, 0, 0.55);
+        display: none;
+        flex-direction: column;
+        gap: 3px;
+        z-index: 2147483647;
+      }}
+      .kv-dropdown.open {{
         display: flex;
-        align-items: center;
-        justify-content: space-between;
-        margin-bottom: 5px;
+      }}
+      .kv-dropdown a {{
+        display: block;
         color: #cbd5e1;
+        text-decoration: none;
+        padding: 5px 9px;
+        border-radius: 6px;
+        font-size: 11.5px;
+        font-weight: 600;
+      }}
+      .kv-dropdown a:hover {{
+        background: rgba(56, 189, 248, 0.2);
+        color: #fff;
+      }}
+      .kv-mini-brand {{
+        color: #e0e7ff;
+        font-weight: 700;
         font-size: 11.5px;
       }}
-      .kv-totp {{
+      .kv-mini-totp {{
         font-family: ui-monospace, Consolas, monospace;
         font-weight: 700;
         color: #34d399;
         background: rgba(16, 185, 129, 0.14);
-        padding: 1px 6px;
-        border-radius: 5px;
-        cursor: pointer;
-      }}
-      .kv-status {{
-        background: rgba(30, 41, 59, 0.9);
-        color: #e2e8f0;
-        padding: 5px 8px;
-        border-radius: 6px;
-        font-size: 11px;
-        margin: 6px 0;
-        border-left: 3px solid #38bdf8;
-      }}
-      .kv-btns {{
-        display: flex;
-        flex-wrap: wrap;
-        gap: 5px;
-        margin-top: 6px;
-      }}
-      .kv-btn {{
-        flex: 1 1 auto;
-        background: rgba(56, 189, 248, 0.15);
-        color: #bae6fd;
-        border: 1px solid rgba(56, 189, 248, 0.32);
-        border-radius: 6px;
-        padding: 4px 7px;
-        font-size: 11px;
-        font-weight: 600;
-        cursor: pointer;
-        text-align: center;
-      }}
-      .kv-btn:hover {{
-        background: rgba(56, 189, 248, 0.28);
-        color: #fff;
-      }}
-      .kv-btn.primary {{
-        background: #0284c7;
-        color: #fff;
-        border-color: #38bdf8;
-      }}
-      .kv-field {{
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 6px;
-        background: rgba(30, 41, 59, 0.85);
-        border: 1px solid rgba(148, 163, 184, 0.18);
-        border-radius: 6px;
-        padding: 4px 6px;
-        margin-bottom: 5px;
-      }}
-      .kv-field-label {{
-        color: #94a3b8;
-        font-size: 10px;
-        min-width: 34px;
-      }}
-      .kv-field-value {{
-        flex: 1 1 auto;
-        color: #e2e8f0;
-        font-size: 11px;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-        user-select: text;
-      }}
-      .kv-copy-btn {{
-        flex: 0 0 auto;
-        background: rgba(56, 189, 248, 0.16);
-        color: #7dd3fc;
-        border: 1px solid rgba(56, 189, 248, 0.35);
-        border-radius: 5px;
         padding: 2px 6px;
-        font-size: 10px;
-        cursor: pointer;
-      }}
-      .kv-copy-btn:hover {{
-        background: rgba(56, 189, 248, 0.3);
-        color: #fff;
-      }}
-      .kv-nav {{
-        display: flex;
-        flex-direction: column;
-        gap: 4px;
-        margin-top: 5px;
-      }}
-      .kv-nav a {{
-        display: block;
-        background: rgba(16, 185, 129, 0.14);
-        color: #6ee7b7;
-        border: 1px solid rgba(16, 185, 129, 0.35);
-        border-radius: 6px;
-        padding: 4px 7px;
+        border-radius: 999px;
         font-size: 11px;
-        font-weight: 600;
-        text-align: center;
-        text-decoration: none;
-      }}
-      .kv-nav a:hover {{
-        background: rgba(16, 185, 129, 0.28);
-        color: #fff;
       }}
     `;
 
     const container = document.createElement('div');
-    container.className = 'kv-box';
+    container.className = 'kv-bar';
     shadow.appendChild(style);
     shadow.appendChild(container);
     rootTarget.appendChild(hostEl);
+
+    let suppressClickUntil = 0;
+
+    function applyBarPosition() {{
+      if (launchState.pos && typeof launchState.pos.left === 'number' && typeof launchState.pos.top === 'number') {{
+        const rect = hostEl.getBoundingClientRect();
+        const w = rect.width || 220;
+        const h = rect.height || 36;
+        const maxL = Math.max(4, (window.innerWidth || 1280) - w - 4);
+        const maxT = Math.max(4, (window.innerHeight || 800) - h - 4);
+        const clampedL = Math.max(4, Math.min(maxL, launchState.pos.left));
+        const clampedT = Math.max(4, Math.min(maxT, launchState.pos.top));
+        hostEl.style.transform = 'none';
+        hostEl.style.left = clampedL + 'px';
+        hostEl.style.top = clampedT + 'px';
+      }} else {{
+        hostEl.style.left = '50%';
+        hostEl.style.top = '6px';
+        hostEl.style.transform = 'translateX(-50%)';
+      }}
+    }}
+
+    function attachDrag(el, miniOnly = false) {{
+      if (!el || el.__kvDragBound) return;
+      el.__kvDragBound = true;
+      el.addEventListener('mousedown', (e) => {{
+        if (e.button !== 0) return;
+        if (miniOnly && !minimized) return;
+        if (e.target && e.target.closest('button, a, input')) return;
+        e.preventDefault();
+        const startX = e.clientX;
+        const startY = e.clientY;
+        const rect = hostEl.getBoundingClientRect();
+        const origLeft = rect.left;
+        const origTop = rect.top;
+        let moved = false;
+
+        const onMove = (ev) => {{
+          const dx = ev.clientX - startX;
+          const dy = ev.clientY - startY;
+          if (!moved && Math.abs(dx) + Math.abs(dy) < 4) return;
+          moved = true;
+          const curRect = hostEl.getBoundingClientRect();
+          const maxL = Math.max(4, (window.innerWidth || 1280) - curRect.width - 4);
+          const maxT = Math.max(4, (window.innerHeight || 800) - curRect.height - 4);
+          const nextL = Math.round(Math.max(4, Math.min(maxL, origLeft + dx)));
+          const nextT = Math.round(Math.max(4, Math.min(maxT, origTop + dy)));
+          hostEl.style.transform = 'none';
+          hostEl.style.left = nextL + 'px';
+          hostEl.style.top = nextT + 'px';
+          launchState.pos = {{ left: nextL, top: nextT }};
+        }};
+
+        const onUp = () => {{
+          window.removeEventListener('mousemove', onMove, true);
+          window.removeEventListener('mouseup', onUp, true);
+          if (moved) {{
+            suppressClickUntil = Date.now() + 180;
+            persistLaunchState();
+          }}
+        }};
+
+        window.addEventListener('mousemove', onMove, true);
+        window.addEventListener('mouseup', onUp, true);
+      }});
+    }}
+
+    if (!window.__kv_resize_bound) {{
+      window.__kv_resize_bound = true;
+      window.addEventListener('resize', () => applyBarPosition());
+    }}
 
     function fillIntoFocusedOrTarget(val, label, fallbackSelectors) {{
       if (!val) {{
@@ -1346,7 +1622,7 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
         setStatus('✅ 已填入' + label);
       }} else {{
         navigator.clipboard?.writeText(val).catch(() => {{}});
-        setStatus('📋 未找到输入框，已复制' + label + '到剪贴板');
+        setStatus('📋 未找到输入框，已复制' + label);
       }}
     }}
 
@@ -1388,161 +1664,90 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
       }} catch (_) {{}}
     }}
 
-    function buildDomainEmailPanel() {{
-      const panel = document.createElement('div');
-      const fields = [
-        ['邮箱', AUTH.account],
-        ['密码', AUTH.password],
-        ['GitHub名', AUTH.suggestedUsername],
-      ];
-      for (const [label, value] of fields) {{
-        const field = mkEl('div', 'kv-field');
-        const labelEl = mkEl('span', 'kv-field-label', label);
-        const valueEl = mkEl('span', 'kv-field-value', value || '—');
-        valueEl.title = value || '';
-        const copyBtn = mkEl('button', 'kv-copy-btn', '复制');
-        copyBtn.onclick = (e) => {{
-          e.stopPropagation();
-          copyText(value, label);
-        }};
-        field.append(labelEl, valueEl, copyBtn);
-        panel.appendChild(field);
-      }}
-
-      const nav = mkEl('div', 'kv-nav');
-      const links = [
-        ['打开 GitHub 首页', 'https://github.com/'],
-        ['打开 GitHub 注册', 'https://github.com/signup'],
-        ['打开 WorkBuddy', 'https://www.workbuddy.ai/'],
-        ['打开网页邮箱', AUTH.mailUrl || 'https://mail.ggb6.com/'],
-      ];
-      for (const [text, href] of links) {{
+    function buildLinksDropdown(linkDefs, buttonLabel) {{
+      const wrap = mkEl('div', 'kv-menu-wrap');
+      const trigger = mkEl('button', 'kv-btn', buttonLabel);
+      const menu = mkEl('div', 'kv-dropdown' + (dropdownOpen ? ' open' : ''));
+      for (const [text, href] of linkDefs) {{
         const link = mkEl('a', '', text);
         link.href = href;
         link.target = '_blank';
         // ``noopener`` only: keep the Referer so GitHub sees the same warm
         // first-party navigation chain a human would produce.
         link.rel = 'noopener';
-        link.onclick = (e) => e.stopPropagation();
-        nav.appendChild(link);
+        link.onclick = (e) => {{
+          e.stopPropagation();
+          dropdownOpen = false;
+          menu.classList.remove('open');
+        }};
+        menu.appendChild(link);
       }}
-      panel.appendChild(nav);
-
-      const mailBtns = mkEl('div', 'kv-btns');
-      const mailLoginBtn = mkEl('button', 'kv-btn primary', '⚡ 自动登录邮箱');
-      mailLoginBtn.onclick = (e) => {{
+      trigger.onclick = (e) => {{
         e.stopPropagation();
-        runRoundcubeMailFlow(true);
+        dropdownOpen = !dropdownOpen;
+        menu.classList.toggle('open', dropdownOpen);
       }};
-      const fillPageBtn = mkEl('button', 'kv-btn', '⚡ 填当前页表单');
-      fillPageBtn.title = '仅在点击时执行：邮箱页自动登录；GitHub 首页/注册页填入邮箱、密码与建议用户名';
-      fillPageBtn.onclick = (e) => {{
-        e.stopPropagation();
-        runManualFormFill();
-      }};
-      mailBtns.append(mailLoginBtn, fillPageBtn);
-      panel.appendChild(mailBtns);
-      return panel;
+      wrap.append(trigger, menu);
+      return wrap;
     }}
 
-    function render() {{
-      try {{
-        const secret = getActiveTotpSecret();
-        const nowSec = Math.floor(Date.now() / 1000);
-        const rem = 30 - (nowSec % 30);
-        const code = secret ? computeTotp(secret, Date.now()) : '';
-        const fmtCode = code ? code.slice(0, 3) + ' ' + code.slice(3) : '无 2FA';
+    let uiRefs = null;
 
-        if (minimized) {{
-          container.className = 'kv-box minimized';
-          domainPanelKey = '';
-          const s1 = mkEl('span', '', '🔐 ' + AUTH.profileCode);
-          s1.style.cssText = 'color:#38bdf8;font-weight:700;';
-          const s2 = mkEl('span', '', fmtCode);
-          s2.style.cssText = 'color:#34d399;font-family:monospace;';
-          container.replaceChildren(s1, s2);
-          container.onclick = () => {{
-            minimized = false;
-            render();
-          }};
-          return;
-        }}
+    function buildExpandedBar() {{
+      const dragHandle = mkEl(
+        'div',
+        'kv-drag-handle',
+        '⠿ 🛡️ ' + AUTH.profileCode + ' · ' + (AUTH.maskedAccount || AUTH.account || 'KeyVault')
+      );
+      dragHandle.title =
+        (AUTH.account || '') + '\\n按住此处可自由拖拽顶部栏位置 · 双击缩为小胶囊';
+      dragHandle.addEventListener('dblclick', (e) => {{
+        e.stopPropagation();
+        minimized = true;
+        launchState.minimized = true;
+        persistLaunchState();
+        render(true);
+      }});
 
-        container.onclick = null;
-        container.className = 'kv-box';
+      const elements = [dragHandle, mkEl('div', 'kv-sep')];
+      let totpBtn = null;
+      let toggleBtn = null;
+      let statusEl = null;
 
-        // Header
-        const head = mkEl('div', 'kv-head');
-        const title = mkEl('span', 'kv-title', '🔐 KeyVault · ' + AUTH.profileCode);
-        const actionsTop = mkEl('div', 'kv-actions-top');
-        const toggleBtn = mkEl('button', 'kv-mini-btn' + (autoEnabled ? ' active' : ''), autoEnabled ? '自动: 开' : '自动: 关');
-        toggleBtn.onclick = (e) => {{
+      if (AUTH.isDomainEmail) {{
+        const btnMailCopy = mkEl('button', 'kv-btn', '📧 邮箱');
+        btnMailCopy.title = AUTH.account;
+        btnMailCopy.onclick = (e) => {{ e.stopPropagation(); copyText(AUTH.account, '邮箱'); }};
+
+        const btnPwdCopy = mkEl('button', 'kv-btn', '🔑 密码');
+        btnPwdCopy.onclick = (e) => {{ e.stopPropagation(); copyText(AUTH.password, '密码'); }};
+
+        const btnGhUser = mkEl('button', 'kv-btn', '👤 GitHub名');
+        btnGhUser.title = AUTH.suggestedUsername;
+        btnGhUser.onclick = (e) => {{ e.stopPropagation(); copyText(AUTH.suggestedUsername, 'GitHub名'); }};
+
+        const mailLoginBtn = mkEl('button', 'kv-btn primary', '⚡ 自动登录邮箱');
+        mailLoginBtn.onclick = (e) => {{
           e.stopPropagation();
-          autoEnabled = !autoEnabled;
-          safeSetSession('kv_autologin_enabled', autoEnabled ? '1' : '0');
-          setStatus(autoEnabled ? '⚡ 已开启自动登录检测' : '🛡️ 静默防风控模式（点下方按钮填入 · Alt+K 隐藏）');
-          if (autoEnabled) runAutoLoginTick(true);
+          runRoundcubeMailFlow(true);
         }};
-        const minBtn = mkEl('button', 'kv-mini-btn', '—');
-        minBtn.title = '收起为小胶囊';
-        minBtn.onclick = (e) => {{
+        const fillPageBtn = mkEl('button', 'kv-btn', '⚡ 填当前页表单');
+        fillPageBtn.title = '仅在点击时执行：邮箱页自动登录；GitHub 首页/注册页填入邮箱、密码与建议用户名';
+        fillPageBtn.onclick = (e) => {{
           e.stopPropagation();
-          minimized = true;
-          render();
+          runManualFormFill();
         }};
-        const hideBtn = mkEl('button', 'kv-mini-btn', '×');
-        hideBtn.title = '暂时隐藏 (按 Alt+K 恢复显示)';
-        hideBtn.onclick = (e) => {{
-          e.stopPropagation();
-          capsuleHidden = true;
-          safeSetSession('kv_capsule_hidden', '1');
-          hostEl.remove();
-        }};
-        actionsTop.append(toggleBtn, minBtn, hideBtn);
-        head.append(title, actionsTop);
 
-        // 域名邮箱 accounts get a credential + quick-navigation helper panel.
-        // Reuse the existing nodes so the 1s refresh does not break text selection.
-        if (AUTH.isDomainEmail) {{
-          const panelKey = AUTH.account + '\\n' + AUTH.password;
-          if (domainPanelKey !== panelKey) {{
-            domainPanelKey = panelKey;
-            container.replaceChildren(head, buildDomainEmailPanel(), mkEl('div', 'kv-status', statusText));
-          }} else {{
-            const statusNode = container.querySelector('.kv-status');
-            if (statusNode) statusNode.textContent = statusText;
-          }}
-          return;
-        }}
-        domainPanelKey = '';
-
-        // Account & TOTP row
-        const row = mkEl('div', 'kv-row');
-        const accSpan = mkEl('span', '', AUTH.maskedAccount || AUTH.account);
-        accSpan.title = AUTH.account;
-        accSpan.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:145px;';
-        const totpSpan = mkEl('span', 'kv-totp', fmtCode + ' (' + rem + 's)');
-        totpSpan.title = '点击复制 2FA';
-        totpSpan.onclick = (e) => {{
-          e.stopPropagation();
-          if (code) {{
-            navigator.clipboard?.writeText(code).catch(() => {{}});
-            setStatus('📋 已复制 2FA 验证码: ' + code);
-          }}
-        }};
-        row.append(accSpan, totpSpan);
-
-        // Status
-        const statusEl = mkEl('div', 'kv-status', statusText);
-
-        // Buttons
-        const btns = mkEl('div', 'kv-btns');
-        const runNowBtn = mkEl('button', 'kv-btn primary', '⚡ 自动登录');
-        runNowBtn.onclick = (e) => {{
-          e.stopPropagation();
-          runAutoLoginTick(true);
-        }};
-        const fillUserBtn = mkEl('button', 'kv-btn', '填账号');
+        const domainLinks = [
+          ['打开 GitHub 首页', 'https://github.com/'],
+          ['打开 GitHub 注册', 'https://github.com/signup'],
+          ['打开 WorkBuddy', 'https://www.workbuddy.ai/'],
+          ['打开网页邮箱', AUTH.mailUrl || 'https://mail.ggb6.com/'],
+        ];
+        const navWrap = buildLinksDropdown(domainLinks, '🌐 快捷入口 ▾');
+        elements.push(btnMailCopy, btnPwdCopy, btnGhUser, mailLoginBtn, fillPageBtn, navWrap);
+      }} else {{
+        const fillUserBtn = mkEl('button', 'kv-btn', '📧 账号');
         fillUserBtn.onclick = (e) => {{
           e.stopPropagation();
           fillIntoFocusedOrTarget(AUTH.account, '账号', [
@@ -1550,27 +1755,34 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
             'input#email-input', 'input[name="username"]', 'input[type="email"]'
           ]);
         }};
-        const fillPwdBtn = mkEl('button', 'kv-btn', '填密码');
+        const fillPwdBtn = mkEl('button', 'kv-btn', '🔑 密码');
         fillPwdBtn.onclick = (e) => {{
           e.stopPropagation();
           fillIntoFocusedOrTarget(AUTH.password, '密码', [
             'input[type="password"][name="Passwd"]', 'input[type="password"][name="password"]', 'input[type="password"]'
           ]);
         }};
-        const fill2faBtn = mkEl('button', 'kv-btn', '填2FA');
-        fill2faBtn.onclick = (e) => {{
+
+        totpBtn = mkEl('button', 'kv-btn totp', '🛡️ 无2FA');
+        totpBtn.title = '点击填入 2FA 动态码并复制';
+        totpBtn.onclick = (e) => {{
           e.stopPropagation();
-          const c = computeTotp(secret, Date.now());
-          if (!fillOtpCodeOnPage(c)) {{
-            fillIntoFocusedOrTarget(c, '2FA 验证码', ['input[type="tel"]', 'input[type="text"]']);
-          }} else {{
-            setStatus('✅ 已填入 2FA 验证码: ' + c);
+          const sec = getActiveTotpSecret();
+          if (!sec) {{
+            setStatus('⚠️ 此账号未配置 2FA');
+            return;
+          }}
+          const c = computeTotp(sec, Date.now());
+          copyText(c, '2FA ' + c);
+          if (fillOtpCodeOnPage(c)) {{
+            setStatus('✅ 已填入 2FA: ' + c);
           }}
         }};
-        btns.append(runNowBtn, fillUserBtn, fillPwdBtn, fill2faBtn);
+
+        elements.push(fillUserBtn, fillPwdBtn, totpBtn);
 
         if (AUTH.initialSecretKey && AUTH.initialSecretKey !== AUTH.secretKey) {{
-          const fillInit2faBtn = mkEl('button', 'kv-btn', '填原2FA');
+          const fillInit2faBtn = mkEl('button', 'kv-btn', '原2FA');
           fillInit2faBtn.onclick = (e) => {{
             e.stopPropagation();
             const c = computeTotp(AUTH.initialSecretKey, Date.now());
@@ -1580,31 +1792,31 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
               setStatus('✅ 已填入初始 2FA 验证码: ' + c);
             }}
           }};
-          btns.appendChild(fillInit2faBtn);
+          elements.push(fillInit2faBtn);
         }}
 
         if (AUTH.recoveryEmail) {{
-          const fillRecBtn = mkEl('button', 'kv-btn', '填辅助邮箱');
+          const fillRecBtn = mkEl('button', 'kv-btn', '📮 辅邮');
           fillRecBtn.onclick = (e) => {{
             e.stopPropagation();
             fillIntoFocusedOrTarget(AUTH.recoveryEmail, '辅助邮箱', [
               'input#knowledge-preregistered-email-response', 'input[name="knowledgePreregisteredEmailResponse"]', 'input[type="email"]'
             ]);
           }};
-          btns.appendChild(fillRecBtn);
+          elements.push(fillRecBtn);
         }}
 
         if (AUTH.recoveryPassword) {{
-          const fillRecPwdBtn = mkEl('button', 'kv-btn', '填辅密');
+          const fillRecPwdBtn = mkEl('button', 'kv-btn', '🔐 辅密');
           fillRecPwdBtn.onclick = (e) => {{
             e.stopPropagation();
             fillIntoFocusedOrTarget(AUTH.recoveryPassword, '辅助邮箱密码', ['input[type="password"]']);
           }};
-          btns.appendChild(fillRecPwdBtn);
+          elements.push(fillRecPwdBtn);
         }}
 
         const genPwdBtn = mkEl('button', 'kv-btn', '🎲 强密');
-        genPwdBtn.title = '生成 16 位高强度随机密码并复制到剪贴板';
+        genPwdBtn.title = '生成 16 位高强度随机密码并复制/填入';
         genPwdBtn.onclick = (e) => {{
           e.stopPropagation();
           const pool = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*_-+=';
@@ -1621,49 +1833,173 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
             setStatus('🎲 已生成强密并填入 & 复制: ' + out);
           }}
         }};
-        btns.appendChild(genPwdBtn);
 
-        const nav = mkEl('div', 'kv-nav');
+        toggleBtn = mkEl('button', 'kv-btn ' + (autoEnabled ? 'auto-on' : 'auto-off'), autoEnabled ? '⚡ 自动:开' : '⚡ 首轮登录');
+        toggleBtn.title = '开馆首轮自动登录结束后自动关闭；点击可手动重触发或暂停';
+        toggleBtn.onclick = (e) => {{
+          e.stopPropagation();
+          if (autoEnabled) {{
+            finishAutoLoginRound('⏸ 已手动关闭自动登录');
+          }} else {{
+            startManualAutoLoginRound();
+          }}
+        }};
+
         const rescueLinks = AUTH.accountType === 'Google'
           ? [
-              ['安全中心', 'https://myaccount.google.com/security'],
-              ['受限诊断', 'https://myaccount.google.com/restrictions'],
-              ['TOS申诉', 'https://forms.gle/hGzM9MEUv2azZsrb9'],
-              ['IP检测', 'https://ipinfo.io/json'],
+              ['🔐 Google 安全中心', 'https://myaccount.google.com/security'],
+              ['⚖️ 服务受限诊断', 'https://myaccount.google.com/restrictions'],
+              ['🆘 TOS 封禁申诉表', 'https://forms.gle/hGzM9MEUv2azZsrb9'],
+              ['🌍 地区归属变更', 'https://policies.google.com/country-association-form'],
+              ['🌐 出口 IP 检测', 'https://ipinfo.io/json'],
             ]
           : AUTH.accountType === 'Claude'
             ? [
-                ['Console', 'https://console.anthropic.com/'],
-                ['IP检测', 'https://ipinfo.io/json'],
+                ['✴️ Anthropic Console', 'https://console.anthropic.com/'],
+                ['🌐 出口 IP 检测', 'https://ipinfo.io/json'],
               ]
             : [
-                ['API平台', 'https://platform.openai.com/api-keys'],
-                ['IP检测', 'https://ipinfo.io/json'],
+                ['🤖 OpenAI API 平台', 'https://platform.openai.com/api-keys'],
+                ['🌐 出口 IP 检测', 'https://ipinfo.io/json'],
               ];
-        for (const [text, href] of rescueLinks) {{
-          const link = mkEl('a', '', text);
-          link.href = href;
-          link.target = '_blank';
-          link.rel = 'noopener';
-          link.onclick = (e) => e.stopPropagation();
-          nav.appendChild(link);
-        }}
+        const navWrap = buildLinksDropdown(rescueLinks, '🌐 工具 ▾');
+        elements.push(mkEl('div', 'kv-sep'), genPwdBtn, toggleBtn, navWrap);
+      }}
 
-        container.replaceChildren(head, row, statusEl, btns, nav);
+      statusEl = mkEl('span', 'kv-status-pill', statusText);
+      statusEl.title = statusText;
+
+      const minBtn = mkEl('button', 'kv-mini-btn collapse', '⊟ 最小');
+      minBtn.title = '缩小为可自由拖拽的迷你小胶囊';
+      minBtn.onclick = (e) => {{
+        e.stopPropagation();
+        dropdownOpen = false;
+        minimized = true;
+        launchState.minimized = true;
+        persistLaunchState();
+        render(true);
+      }};
+
+      const hideBtn = mkEl('button', 'kv-mini-btn close', '×');
+      hideBtn.title = '暂时隐藏 (按 Alt+K 恢复显示)';
+      hideBtn.onclick = (e) => {{
+        e.stopPropagation();
+        capsuleHidden = true;
+        launchState.hidden = true;
+        persistLaunchState();
+        hostEl.remove();
+      }};
+
+      elements.push(mkEl('div', 'kv-sep'), statusEl, minBtn, hideBtn);
+      container.className = 'kv-bar';
+      container.replaceChildren(...elements);
+      uiRefs = {{ mode: 'expanded', totpBtn, toggleBtn, statusEl }};
+    }}
+
+    function buildMiniCapsule() {{
+      const brandEl = mkEl('span', 'kv-mini-brand', '⠿ 🔐 ' + AUTH.profileCode);
+      const totpPill = mkEl('span', 'kv-mini-totp', '无 2FA');
+      totpPill.title = '点击复制当前 2FA 验证码';
+      totpPill.onclick = (e) => {{
+        if (Date.now() < suppressClickUntil) return;
+        e.stopPropagation();
+        const sec = getActiveTotpSecret();
+        if (sec) {{
+          const c = computeTotp(sec, Date.now());
+          copyText(c, '2FA ' + c);
+        }}
+      }};
+
+      const expandBtn = mkEl('button', 'kv-mini-btn collapse', '展开');
+      expandBtn.title = '恢复顶部工具栏';
+      expandBtn.onclick = (e) => {{
+        if (Date.now() < suppressClickUntil) return;
+        e.stopPropagation();
+        minimized = false;
+        launchState.minimized = false;
+        persistLaunchState();
+        render(true);
+      }};
+
+      container.className = 'kv-bar minimized';
+      container.title = (AUTH.account || '') + '\\n按住小胶囊可自由拖动到页面任意位置';
+      container.replaceChildren(brandEl, totpPill, expandBtn);
+      uiRefs = {{ mode: 'mini', totpPill }};
+    }}
+
+    attachDrag(container, false);
+    window.__kv_close_dropdown = () => {{
+      if (dropdownOpen) {{
+        dropdownOpen = false;
+        shadow.querySelectorAll('.kv-dropdown.open').forEach((m) => m.classList.remove('open'));
+      }}
+    }};
+    if (!window.__kv_outside_click_bound) {{
+      window.__kv_outside_click_bound = true;
+      document.addEventListener('click', () => {{
+        if (typeof window.__kv_close_dropdown === 'function') window.__kv_close_dropdown();
+      }});
+    }}
+
+    function updateLiveTexts() {{
+      const secret = getActiveTotpSecret();
+      const nowSec = Math.floor(Date.now() / 1000);
+      const rem = 30 - (nowSec % 30);
+      const code = secret ? computeTotp(secret, Date.now()) : '';
+      const fmtCode = code ? code.slice(0, 3) + ' ' + code.slice(3) : '无 2FA';
+
+      if (uiRefs && uiRefs.mode === 'mini') {{
+        if (uiRefs.totpPill) {{
+          uiRefs.totpPill.textContent = code ? (fmtCode + ' · ' + rem + 's') : '无2FA';
+        }}
+        return;
+      }}
+      if (uiRefs && uiRefs.mode === 'expanded') {{
+        if (uiRefs.totpBtn) {{
+          uiRefs.totpBtn.textContent = code ? ('🛡️ ' + fmtCode + ' (' + rem + 's)') : '🛡️ 无2FA';
+        }}
+        if (uiRefs.toggleBtn) {{
+          uiRefs.toggleBtn.className = 'kv-btn ' + (autoEnabled ? 'auto-on' : 'auto-off');
+          uiRefs.toggleBtn.textContent = autoEnabled ? '⚡ 自动:开' : '⚡ 首轮登录';
+        }}
+        if (uiRefs.statusEl) {{
+          uiRefs.statusEl.textContent = statusText;
+          uiRefs.statusEl.title = statusText;
+        }}
+      }}
+    }}
+
+    function render(forceRebuild = false) {{
+      try {{
+        const targetMode = minimized ? 'mini' : 'expanded';
+        if (forceRebuild || currentUiMode !== targetMode || !uiRefs) {{
+          currentUiMode = targetMode;
+          if (minimized) buildMiniCapsule();
+          else buildExpandedBar();
+          if (typeof requestAnimationFrame === 'function') {{
+            requestAnimationFrame(() => applyBarPosition());
+          }} else {{
+            applyBarPosition();
+          }}
+        }}
+        updateLiveTexts();
       }} catch (_) {{}}
     }}
 
-    statusUiUpdater = render;
-    render();
-    setInterval(render, 1000);
+    statusUiUpdater = () => render(false);
+    render(true);
+    setInterval(() => render(false), 1000);
   }}
 
   function init() {{
     window.__kv_ensure_mounted = () => {{
+      if (!storageReady) return;
       try {{ mountCapsule(); }} catch (_) {{}}
       try {{ runAutoLoginTick(false); }} catch (_) {{}}
     }};
-    window.__kv_ensure_mounted();
+    initLaunchState(() => {{
+      window.__kv_ensure_mounted();
+    }});
     setInterval(window.__kv_ensure_mounted, 900);
   }}
 
@@ -1688,8 +2024,9 @@ def _build_extension_files(ext_dir: Path, fp: dict, account_or_label: dict | str
     manifest = {
         "manifest_version": 3,
         "name": f"KeyVault Fingerprint & AutoLogin ({fp.get('profile_code', 'FP')})",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "description": f"Isolated hardware fingerprint & auto-login paired to {account_label}",
+        "permissions": ["storage"],
         "content_scripts": [
             {
                 "matches": ["<all_urls>"],
@@ -1710,14 +2047,19 @@ def _build_extension_files(ext_dir: Path, fp: dict, account_or_label: dict | str
                 "matches": [
                     "https://chatgpt.com/*",
                     "https://*.openai.com/*",
+                    "https://platform.openai.com/*",
                     "https://accounts.google.com/*",
                     "https://myaccount.google.com/*",
+                    "https://mail.google.com/*",
+                    "https://console.cloud.google.com/*",
+                    "https://policies.google.com/*",
                     "https://github.com/*",
                     "https://www.workbuddy.ai/*",
                     "https://mail.ggb6.com/*",
                     "https://claude.ai/*",
                     "https://*.claude.ai/*",
                     "https://accounts.anthropic.com/*",
+                    "https://console.anthropic.com/*",
                 ],
                 "js": ["autologin.js"],
                 "run_at": "document_idle",

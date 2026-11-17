@@ -338,7 +338,12 @@ def test_launch_isolated_browser_skips_cdp_injector_for_domain_email(tmp_path: P
     autologin_code = (tmp_path / "data" / "browsers" / "acc_16" / "fp_ext" / "autologin.js").read_text(
         encoding="utf-8"
     )
-    assert "safeGetSession('kv_autologin_enabled') === '1'" in autologin_code
+    assert "launchToken" in autologin_code
+    assert "finishAutoLoginRound" in autologin_code
+    assert "claimAutoStep" in autologin_code
+    assert "⊟ 最小" in autologin_code
+    assert "展开" in autologin_code
+    assert "top: 6px; left: 50%; transform: translateX(-50%);" in autologin_code
     assert "Alt+K" in autologin_code
     assert "setNativeInputValue(target, out)" in autologin_code
 
@@ -1143,3 +1148,244 @@ def test_proxy_relay_parses_4part_credentials():
         assert resolved["urllib_proxy"] == "http://user1:pass1@127.0.0.1:8888"
     finally:
         shutdown_auth_relays()
+
+
+def test_autologin_top_bar_draggable_mini_capsule_and_one_shot_round(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    profile_dir = browser_service.prepare_profile_dir(
+        data_dir,
+        {
+            "id": 102,
+            "account_type": "Google",
+            "account": "oneshot@gmail.com",
+            "password": "OneShotPassword#1",
+            "secret_key": "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+        },
+    )
+    autologin_path = profile_dir / "fp_ext" / "autologin.js"
+    node_check = subprocess.run(
+        ["node", "--check", str(autologin_path)],
+        capture_output=True,
+        text=True,
+    )
+    assert node_check.returncode == 0, node_check.stderr
+
+    manifest = json.loads((profile_dir / "fp_ext" / "manifest.json").read_text(encoding="utf-8"))
+    assert "storage" in (manifest.get("permissions") or [])
+
+    # Behavioral Node harness simulating chrome.storage.local across 3 scenarios:
+    # 1) ChatGPT already logged in -> immediately closes auto-login (autoLoginDone = true)
+    # 2) Google login flow -> each step executes at most once automatically, finishes at myaccount.google.com
+    # 3) Top bar minimize -> mini capsule drag persists pos & minimized state
+    harness = f"""
+const fs = require('fs');
+const vm = require('vm');
+const code = fs.readFileSync({json.dumps(str(autologin_path))}, 'utf8');
+
+function createHarness(initialHost, initialPath, selectorsMap, storeSeed) {{
+  const storageObj = storeSeed || {{}};
+  const intervals = [];
+  const timeouts = [];
+  let mountedShadow = null;
+
+  class El {{
+    constructor(tag) {{
+      this.tagName = tag.toUpperCase();
+      this.children = [];
+      this.listeners = {{}};
+      this.style = {{ cssText: '' }};
+      this.className = '';
+      this.textContent = '';
+      this.title = '';
+      this.value = '';
+      this.disabled = false;
+      this.readOnly = false;
+      this.isConnected = true;
+      this._rect = {{ left: 400, top: 6, width: 520, height: 34 }};
+    }}
+    append(...nodes) {{ nodes.forEach(n => this.appendChild(n)); }}
+    appendChild(n) {{ if (n) {{ n.parentElement = this; this.children.push(n); }} return n; }}
+    replaceChildren(...nodes) {{ this.children = []; this.append(...nodes); }}
+    remove() {{ this.removed = true; }}
+    addEventListener(ev, fn) {{ (this.listeners[ev] = this.listeners[ev] || []).push(fn); }}
+    removeEventListener(ev, fn) {{
+      if (this.listeners[ev]) this.listeners[ev] = this.listeners[ev].filter(f => f !== fn);
+    }}
+    dispatchEvent(ev) {{
+      const handlers = this.listeners[ev.type] || [];
+      handlers.forEach(fn => fn(ev));
+      return true;
+    }}
+    focus() {{}}
+    click() {{ if (typeof this.onclick === 'function') this.onclick({{ stopPropagation() {{}}, preventDefault() {{}} }}); }}
+    getBoundingClientRect() {{ return this._rect; }}
+    closest(sel) {{
+      if (sel.includes('button') && this.tagName === 'BUTTON') return this;
+      if (sel.includes('a') && this.tagName === 'A') return this;
+      return null;
+    }}
+    attachShadow() {{
+      const sr = new El('#shadow');
+      mountedShadow = sr;
+      return sr;
+    }}
+    querySelector(sel) {{
+      const list = this.querySelectorAll(sel);
+      return list[0] || null;
+    }}
+    querySelectorAll(sel) {{
+      const res = [];
+      const walk = (node) => {{
+        for (const c of (node.children || [])) {{
+          if (sel.split(',').some(s => {{
+            s = s.trim();
+            if (s.startsWith('.')) return (' ' + (c.className || '') + ' ').includes(' ' + s.slice(1) + ' ');
+            return c.tagName && c.tagName.toLowerCase() === s.toLowerCase();
+          }})) res.push(c);
+          walk(c);
+        }}
+      }};
+      walk(this);
+      return res;
+    }}
+  }}
+
+  const docEl = new El('html');
+  const bodyEl = new El('body');
+  docEl.appendChild(bodyEl);
+  const docListeners = {{}};
+  const winListeners = {{}};
+  const sess = new Map();
+
+  const ctx = {{
+    console, Math, Date, JSON, Uint8Array, Uint32Array, DataView, Array, Object, String, Number, Boolean, Error, RegExp, Map, Set, URL,
+    CSS: {{ escape: (s) => s }},
+    HTMLInputElement: {{ prototype: Object.getOwnPropertyDescriptor({{ set value(v){{}}, get value(){{ return ''; }} }}, 'value') ? {{}} : {{}} }},
+    KeyboardEvent: function(t, o) {{ this.type = t; Object.assign(this, o); }},
+    InputEvent: function(t, o) {{ this.type = t; Object.assign(this, o); }},
+    MouseEvent: function(t, o) {{ this.type = t; Object.assign(this, o); }},
+    Event: function(t, o) {{ this.type = t; Object.assign(this, o); }},
+    crypto: {{ getRandomValues: (arr) => {{ for (let i = 0; i < arr.length; i++) arr[i] = i + 1; return arr; }} }},
+    navigator: {{ clipboard: {{ writeText: () => Promise.resolve() }} }},
+    chrome: {{
+      storage: {{
+        local: {{
+          get: (keys, cb) => cb({{ ...storageObj }}),
+          set: (obj) => Object.assign(storageObj, obj),
+        }}
+      }}
+    }},
+    sessionStorage: {{
+      getItem: (k) => sess.has(k) ? sess.get(k) : null,
+      setItem: (k, v) => sess.set(k, String(v)),
+      removeItem: (k) => sess.delete(k),
+      get length() {{ return sess.size; }},
+      key: (i) => Array.from(sess.keys())[i] || null,
+    }},
+    setTimeout: (fn, ms) => {{ timeouts.push(fn); return timeouts.length; }},
+    setInterval: (fn, ms) => {{ intervals.push(fn); return intervals.length; }},
+    requestAnimationFrame: (fn) => fn(),
+    location: {{ protocol: 'https:', hostname: initialHost, pathname: initialPath }},
+    document: {{
+      readyState: 'complete',
+      documentElement: docEl,
+      body: bodyEl,
+      createElement: (tag) => new El(tag),
+      getElementById: (id) => (docEl.children.find(c => c.id === id) || null),
+      querySelector: (sel) => {{
+        for (const k of sel.split(',').map(s => s.trim())) {{
+          if (selectorsMap[k]) return Array.isArray(selectorsMap[k]) ? selectorsMap[k][0] : selectorsMap[k];
+        }}
+        return null;
+      }},
+      querySelectorAll: (sel) => {{
+        for (const k of sel.split(',').map(s => s.trim())) {{
+          if (selectorsMap[k]) return Array.isArray(selectorsMap[k]) ? selectorsMap[k] : [selectorsMap[k]];
+        }}
+        return [];
+      }},
+      addEventListener: (ev, fn) => {{ (docListeners[ev] = docListeners[ev] || []).push(fn); }},
+    }},
+    window: null,
+    globalThis: null,
+  }};
+  Object.defineProperty(ctx.HTMLInputElement.prototype, 'value', {{
+    configurable: true,
+    get() {{ return this._val || ''; }},
+    set(v) {{ this._val = v; }}
+  }});
+  ctx.window = ctx;
+  ctx.top = ctx;
+  ctx.globalThis = ctx;
+  ctx.innerWidth = 1280;
+  ctx.innerHeight = 800;
+  ctx.getComputedStyle = () => ({{ display: 'block', visibility: 'visible', opacity: '1' }});
+  ctx.addEventListener = (ev, fn) => {{ (winListeners[ev] = winListeners[ev] || []).push(fn); }};
+  ctx.removeEventListener = (ev, fn) => {{
+    if (winListeners[ev]) winListeners[ev] = winListeners[ev].filter(f => f !== fn);
+  }};
+
+  vm.runInNewContext(code, ctx);
+  return {{ ctx, storageObj, timeouts, winListeners, getShadow: () => mountedShadow }};
+}}
+
+// Scenario 1: ChatGPT already signed in -> closes auto-login immediately
+const s1 = createHarness('chatgpt.com', '/', {{ '#prompt-textarea': {{ tagName: 'DIV' }} }}, {{}});
+if (!s1.storageObj.kv_launch_state || !s1.storageObj.kv_launch_state.autoLoginDone) {{
+  throw new Error('Expected already-logged-in ChatGPT to set autoLoginDone=true');
+}}
+
+// Scenario 2: Google login step runs ONCE on accounts.google.com, does NOT repeat on second tick, then finishes on myaccount.google.com
+const sharedStore = {{}};
+const emailBox = {{
+  tagName: 'INPUT', isConnected: true, disabled: false, readOnly: false, _val: '',
+  focus() {{}}, dispatchEvent() {{}},
+  getBoundingClientRect() {{ return {{ width: 200, height: 30 }}; }},
+}};
+let nextClicks = 0;
+const nextBtn = {{
+  tagName: 'BUTTON', isConnected: true, disabled: false, innerText: 'Next',
+  focus() {{}}, dispatchEvent() {{}},
+  click() {{ nextClicks++; }},
+  getBoundingClientRect() {{ return {{ width: 80, height: 30 }}; }},
+}};
+const s2 = createHarness('accounts.google.com', '/signin', {{
+  'input#identifierId': emailBox,
+  '#identifierNext button': nextBtn,
+}}, sharedStore);
+if (!s2.storageObj.kv_launch_state.stepsDone.google_email) {{
+  throw new Error('Expected google_email step claimed');
+}}
+s2.timeouts.forEach(fn => fn());
+if (nextClicks !== 1) throw new Error('Expected 1 Next click, got ' + nextClicks);
+
+// Simulate reload back to same login form with SAME sharedStore: must NOT click Next again!
+emailBox._val = '';
+const s2b = createHarness('accounts.google.com', '/signin', {{
+  'input#identifierId': emailBox,
+  '#identifierNext button': nextBtn,
+}}, sharedStore);
+s2b.timeouts.forEach(fn => fn());
+if (nextClicks !== 1) throw new Error('Duplicate step should be blocked in same round!');
+
+// Navigate to myaccount.google.com -> marks autoLoginDone=true and test minimize + drag
+const s3 = createHarness('myaccount.google.com', '/', {{}}, sharedStore);
+if (!s3.storageObj.kv_launch_state.autoLoginDone) {{
+  throw new Error('Expected myaccount.google.com to mark autoLoginDone=true');
+}}
+const bar = s3.getShadow().children.find(c => c.className && c.className.includes('kv-bar'));
+const minBtn = bar.querySelector('.collapse');
+minBtn.click();
+if (!bar.className.includes('minimized') || !s3.storageObj.kv_launch_state.minimized) {{
+  throw new Error('Expected minimize button to shrink into minimized capsule');
+}}
+bar.dispatchEvent({{ type: 'mousedown', button: 0, clientX: 450, clientY: 12, target: bar, preventDefault() {{}} }});
+(s3.winListeners.mousemove || []).forEach(fn => fn({{ clientX: 600, clientY: 320 }}));
+(s3.winListeners.mouseup || []).forEach(fn => fn({{}}));
+if (!s3.storageObj.kv_launch_state.pos || s3.storageObj.kv_launch_state.pos.left < 500) {{
+  throw new Error('Expected mini capsule drag to persist updated position');
+}}
+console.log('ONESHOT_AND_DRAG_OK');
+"""
+    proc = subprocess.run(["node", "-e", harness], capture_output=True, text=True, check=True)
+    assert "ONESHOT_AND_DRAG_OK" in proc.stdout
