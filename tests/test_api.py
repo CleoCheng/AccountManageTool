@@ -562,3 +562,92 @@ def test_get_proxy_nodes_forwards_claude_category(tmp_path: Path, monkeypatch):
     api.get_proxy_nodes("Claude")
     api.get_proxy_nodes(acc["id"])
     assert calls == ["Claude", "Claude"]
+
+
+def test_totp_otpauth_and_offset_and_persona_generators(tmp_path: Path):
+    from src.totp_service import generate_totp, normalize_secret
+
+    uri = "otpauth://totp/Google:test%40gmail.com?secret=jbsw-y3dp%20ehpk3pxp&issuer=Google"
+    assert normalize_secret(uri) == "JBSWY3DPEHPK3PXP"
+    assert normalize_secret("backup2fa:mfrg gzdf mztw q2lk") == "MFRGGZDFMZTWQ2LK"
+
+    t0 = generate_totp("JBSWY3DPEHPK3PXP", at_time=1700000000, offset_seconds=0)
+    t30 = generate_totp("JBSWY3DPEHPK3PXP", at_time=1700000000, offset_seconds=30)
+    assert t0["valid"] is True and t30["valid"] is True
+    assert t0["code"] != t30["code"]
+
+    api = AccountApi(data_dir=tmp_path / "data")
+    pwd_res = api.generate_strong_password(16)
+    assert pwd_res["ok"] is True
+    assert len(pwd_res["password"]) == 16
+    assert len(pwd_res["secret_key"]) == 16
+
+    persona = api.generate_account_persona(region="JP", domain="gmail.com")["persona"]
+    assert persona["region"] == "JP"
+    assert persona["suggested_email"].endswith("@gmail.com")
+    assert len(persona["password"]) >= 12
+
+
+def test_rt_inspect_save_batch_export_and_inject(tmp_path: Path, monkeypatch):
+    api = AccountApi(data_dir=tmp_path / "data")
+    acc = api.save_account({
+        "account_type": "Google",
+        "account": "rt_owner@gmail.com",
+        "password": "pw",
+    })["account"]
+
+    insp = api.inspect_rt_json("1//09abcdef_test_refresh_token")
+    assert insp["ok"] is True
+    assert insp["refresh_token"] == "1//09abcdef_test_refresh_token"
+
+    saved = api.save_account_rt(acc["id"], "1//09abcdef_test_refresh_token")
+    assert saved["ok"] is True
+    assert saved["account"]["has_rt"] is True
+    assert saved["account"]["rt_status"] == "active"
+
+    batch_res = api.batch_import_rt_json(
+        '[{"email":"rt_new@gmail.com","refresh_token":"1//09xyz_new_token"}]'
+    )
+    assert batch_res["ok"] is True
+    assert batch_res["imported"] == 1
+
+    exp = api.export_rt_json()
+    assert exp["ok"] is True
+    assert exp["count"] == 2
+
+    appdata_dir = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(appdata_dir))
+    inj = api.inject_rt_to_antigravity(acc["id"])
+    assert inj["ok"] is True
+    cred_file = appdata_dir / "Antigravity" / "oauth_credentials.json"
+    assert cred_file.exists()
+    assert "1//09abcdef_test_refresh_token" in cred_file.read_text(encoding="utf-8")
+
+
+def test_probe_ai_and_appeal_channels_and_backup_endpoints(tmp_path: Path):
+    import base64
+    import json
+
+    api = AccountApi(data_dir=tmp_path / "data")
+    channels = api.get_appeal_channels()
+    assert channels["ok"] is True
+    assert len(channels["channels"]) >= 5
+
+    # Construct an already-expired JWT session token for ChatGPT local probe verification
+    hdr = base64.urlsafe_b64encode(b'{"alg":"none"}').rstrip(b"=").decode()
+    pay = base64.urlsafe_b64encode(b'{"exp":1000000}').rstrip(b"=").decode()
+    acc = api.save_account({
+        "account_type": "ChatGPT",
+        "account": "ai_jwt@example.com",
+        "password": "pw",
+        "custom_fields": {"session_token": f"{hdr}.{pay}.sig"},
+    })["account"]
+
+    probe = api.probe_ai_account(acc["id"])
+    assert probe["ok"] is False
+    assert "过期" in probe["error"]
+
+    b1 = api.create_backup("manual")
+    assert b1["ok"] is True
+    blist = api.list_backups()
+    assert any(x["filename"] == b1["filename"] for x in blist["backups"])

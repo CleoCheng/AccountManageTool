@@ -1,8 +1,9 @@
 import re
+import shutil
 import time
 from collections.abc import Iterator
 from contextlib import closing, contextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import json
 import sqlite3
 from pathlib import Path
@@ -27,6 +28,11 @@ DEFAULT_ATTRIBUTES = [
     ("wb_reg_status", "WorkBuddy注册", "select", '["域名邮箱"]', "wb_reg_status", 15, 1, 0, 1),
     ("device_tag", "设备标记", "select", '["Google"]', "device_tag", 20, 1, 0, 1),
     ("antigravity_tier", "Pro 选项", "select", '["Google"]', "antigravity_tier", 30, 1, 0, 1),
+    ("subscription_plan", "订阅计划", "select", '["Google"]', "subscription_plan", 35, 1, 0, 1),
+    ("gcp_status", "GCP 状态", "select", '["Google"]', "gcp_status", 36, 1, 0, 1),
+    ("rt_status", "RT 凭据", "select", '["Google"]', "rt_status", 37, 1, 0, 1),
+    ("openai_plan", "AI 订阅方案", "select", '["ChatGPT", "Claude"]', "openai_plan", 38, 1, 0, 1),
+    ("warming_group", "养号分组", "select", "All", "warming_group", 40, 1, 0, 1),
 ]
 
 DEFAULT_DICTS = [
@@ -56,7 +62,176 @@ DEFAULT_DICTS = [
     ("wb_reg_status", "未完成", "未完成", "未完成", "wb-pending", "⏳", 1, 1, 1),
     ("wb_reg_status", "进行中", "进行中", "进行中", "wb-progress", "🔄", 2, 0, 1),
     ("wb_reg_status", "已完成", "已完成", "已完成", "wb-done", "✅", 3, 0, 1),
+    # Google 订阅计划
+    ("subscription_plan", "Free", "Free", "Free", "sub-free", "🆓", 1, 1, 1),
+    ("subscription_plan", "Pro", "Pro", "Pro", "sub-pro", "💎", 2, 0, 1),
+    ("subscription_plan", "Ultra", "Ultra", "Ultra", "sub-ultra", "👑", 3, 0, 1),
+    ("subscription_plan", "Trial", "Trial", "Trial", "sub-trial", "🎁", 4, 0, 1),
+    # GCP 状态
+    ("gcp_status", "none", "未检测", "none", "gcp-none", "⚪", 1, 1, 1),
+    ("gcp_status", "active", "可用", "active", "gcp-active", "🟢", 2, 0, 1),
+    ("gcp_status", "no_billing", "无结算", "no_billing", "gcp-nobilling", "🟡", 3, 0, 1),
+    ("gcp_status", "validation", "需验证", "validation", "gcp-validation", "🟠", 4, 0, 1),
+    ("gcp_status", "unsupported", "地区受限", "unsupported", "gcp-unsupported", "🟣", 5, 0, 1),
+    ("gcp_status", "suspended", "已封停", "suspended", "gcp-suspended", "🔴", 6, 0, 1),
+    # RT 凭据状态
+    ("rt_status", "none", "未绑定", "none", "rt-none", "⚪", 1, 1, 1),
+    ("rt_status", "active", "活跃", "active", "rt-active", "🟢", 2, 0, 1),
+    ("rt_status", "invalid_grant", "已失效", "invalid_grant", "rt-invalid", "🔴", 3, 0, 1),
+    ("rt_status", "unsupported", "地区受限", "unsupported", "rt-unsupported", "🟠", 4, 0, 1),
+    ("rt_status", "suspended", "已封停", "suspended", "rt-suspended", "🟣", 5, 0, 1),
+    # ChatGPT / Claude AI 方案
+    ("openai_plan", "free", "Free", "free", "ai-free", "🆓", 1, 1, 1),
+    ("openai_plan", "plus", "Plus", "plus", "ai-plus", "✨", 2, 0, 1),
+    ("openai_plan", "pro", "Pro", "pro", "ai-pro", "👑", 3, 0, 1),
+    ("openai_plan", "team", "Team", "team", "ai-team", "👥", 4, 0, 1),
+    ("openai_plan", "api", "API Key", "api", "ai-api", "🔑", 5, 0, 1),
+    # 养号分组
+    ("warming_group", "默认组", "默认组", "默认组", "wg-default", "🌱", 1, 1, 1),
+    ("warming_group", "A组(高频)", "A组(高频)", "A组(高频)", "wg-a", "🔥", 2, 0, 1),
+    ("warming_group", "B组(静默)", "B组(静默)", "B组(静默)", "wg-b", "🌙", 3, 0, 1),
+    ("warming_group", "C组(备用)", "C组(备用)", "C组(备用)", "wg-c", "📦", 4, 0, 1),
+    ("warming_group", "沙盒组", "沙盒组", "沙盒组", "wg-sandbox", "🧪", 5, 0, 1),
 ]
+
+MAINTENANCE_CF_KEYS = (
+    "sec_recovery_modified",
+    "sec_devices_cleared",
+    "recovery_password",
+    "scan_qr_mode",
+    "warming_reset_at",
+    "warming_group",
+    "subscription_plan",
+    "gcp_status",
+    "rt_status",
+    "openai_plan",
+    "api_key",
+    "session_token",
+    "rt_json",
+    "rt_refresh_token",
+    "rt_access_token",
+    "rt_expiry",
+    "rt_email",
+    "rt_project_id",
+    "rt_tier",
+    "rt_validation_url",
+    "rt_last_checked",
+    "rt_last_error",
+    "ai_last_checked",
+    "ai_models_count",
+    "ai_last_error",
+)
+
+
+def normalize_gmail_address(email: str) -> str:
+    cleaned = (email or "").strip().lower()
+    if "@" not in cleaned:
+        return cleaned
+    local, domain = cleaned.split("@", 1)
+    if domain in ("gmail.com", "googlemail.com"):
+        local = local.split("+", 1)[0].replace(".", "")
+        return f"{local}@gmail.com"
+    return f"{local}@{domain}"
+
+
+def compute_security_info(
+    password_modified: int | bool,
+    twofa_modified: int | bool,
+    custom_fields: dict,
+    recovery_email: str = "",
+) -> dict:
+    cf = custom_fields if isinstance(custom_fields, dict) else {}
+    sec_pwd = bool(password_modified)
+    sec_2fa = bool(twofa_modified)
+    sec_recovery = bool(cf.get("sec_recovery_modified"))
+    sec_devices = bool(cf.get("sec_devices_cleared"))
+    completed = int(sec_pwd) + int(sec_2fa) + int(sec_recovery) + int(sec_devices)
+    if completed == 4:
+        status = "secured"
+        label = "🔒 安全"
+    elif completed > 0:
+        status = "partial"
+        label = f"🔧 改密中 ({completed}/4)"
+    else:
+        status = "unmodified"
+        label = "⚠️ 未改密"
+    return {
+        "status": status,
+        "label": label,
+        "completed": completed,
+        "total": 4,
+        "password_modified": sec_pwd,
+        "twofa_modified": sec_2fa,
+        "recovery_modified": sec_recovery,
+        "devices_cleared": sec_devices,
+        "has_recovery_email": bool((recovery_email or "").strip()),
+    }
+
+
+def compute_warming_info(
+    created_at: str,
+    purchase_date: str,
+    health_status: str,
+    custom_fields: dict,
+    today_dt: date | None = None,
+) -> dict:
+    cf = custom_fields if isinstance(custom_fields, dict) else {}
+    today = today_dt or date.today()
+    anchor_raw = str(cf.get("warming_reset_at") or "").strip()
+    if not anchor_raw:
+        anchor_raw = (purchase_date or "").strip()
+    if not anchor_raw and created_at:
+        anchor_raw = str(created_at).strip()[:10]
+    anchor_dt = _parse_date(anchor_raw) or today
+    elapsed = max((today - anchor_dt).days, 0)
+    is_risk = (health_status or "").strip() in ("人机", "短信", "验证")
+    is_scan_qr = bool(cf.get("scan_qr_mode"))
+
+    if is_risk:
+        target_days = 7
+        remaining = max(target_days - elapsed, 0)
+        ready = elapsed >= target_days
+        phase = "rewarm_ready" if ready else "rewarm"
+        label = "风控静默已满" if ready else f"二次养号 {elapsed}/{target_days}天"
+        hint = (
+            f"风控状态已静默 {elapsed} 天，可尝试重测解控"
+            if ready
+            else f"触发风控后需静默 {target_days} 天再试（还差 {remaining} 天）"
+        )
+    elif is_scan_qr:
+        target_days = 30
+        remaining = max(target_days - elapsed, 0)
+        ready = elapsed >= target_days
+        phase = "scan_qr_ready" if ready else "scan_qr"
+        label = "扫码期已满" if ready else f"扫码养号 {elapsed}/{target_days}天"
+        hint = (
+            f"扫码养号已满 {elapsed} 天，可转入常规改密"
+            if ready
+            else f"扫码防风控养号第 {elapsed}/{target_days} 天（还差 {remaining} 天）"
+        )
+    else:
+        target_days = 7
+        remaining = max(target_days - elapsed, 0)
+        ready = elapsed >= target_days
+        phase = "ready" if ready else "warming"
+        label = "可改密" if ready else f"养号 {elapsed}/{target_days}天"
+        hint = (
+            f"已稳定养护 {elapsed} 天，可安全修改密码/2FA"
+            if ready
+            else f"新号第 {elapsed}/{target_days} 天养号期，建议第7天后再改密（还差 {remaining} 天）"
+        )
+
+    return {
+        "phase": phase,
+        "days_elapsed": elapsed,
+        "target_days": target_days,
+        "days_remaining": remaining,
+        "ready": ready,
+        "anchor_date": anchor_dt.strftime("%Y-%m-%d"),
+        "scan_qr_mode": is_scan_qr,
+        "label": label,
+        "hint": hint,
+    }
 
 
 def _parse_date(d_str: str) -> date | None:
@@ -105,6 +280,7 @@ class DatabaseService:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.totp_offset_seconds = 0
         self._init_db()
 
     @contextmanager
@@ -233,6 +409,26 @@ class DatabaseService:
                 )
 
 
+            # Credential change history archive table
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS credential_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id INTEGER NOT NULL,
+                    change_type TEXT NOT NULL DEFAULT 'update',
+                    old_password TEXT DEFAULT '',
+                    old_recovery_email TEXT DEFAULT '',
+                    old_secret_key TEXT DEFAULT '',
+                    old_recovery_password TEXT DEFAULT '',
+                    reason TEXT DEFAULT '',
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                );
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cred_hist_account ON credential_history(account_id, id DESC);"
+            )
+
             # Backfill permanent paired fingerprint config for any account missing it
             rows = conn.execute(
                 "SELECT id, account, fp_config_json FROM accounts WHERE fp_config_json IS NULL OR fp_config_json = ''"
@@ -258,9 +454,14 @@ class DatabaseService:
                         "UPDATE accounts SET secret_key = ?, initial_secret_key = ? WHERE id = ?",
                         (clean_sk, clean_isk, r["id"]),
                     )
+            cnt_row = conn.execute("SELECT COUNT(1) AS cnt FROM accounts").fetchone()
+            has_rows = bool(cnt_row and cnt_row["cnt"] > 0)
+        if has_rows:
+            self.create_rolling_backup(reason="startup", max_keep=15, min_interval_minutes=30)
 
-    def _enrich_row(self, row: sqlite3.Row) -> dict:
+    def _enrich_row(self, row: sqlite3.Row, offset_seconds: int | None = None) -> dict:
         item = dict(row)
+        eff_offset = self.totp_offset_seconds if offset_seconds is None else int(offset_seconds or 0)
         item["health_status"] = (item.get("health_status") or "可用").strip()
         raw_ag = (item.get("antigravity_tier") or "无").strip()
         if raw_ag in ("蓝色Pro", "蓝色背景色Pro", "蓝Pro"):
@@ -282,7 +483,7 @@ class DatabaseService:
         item["masked_recovery_email"] = mask_email(item["recovery_email"]) if item["recovery_email"] else ""
         item["masked_secret"] = mask_secret(item["secret_key"])
         item["masked_initial_secret"] = mask_secret(item["initial_secret_key"]) if item["initial_secret_key"] else ""
-        item["totp"] = generate_totp(item["secret_key"])
+        item["totp"] = generate_totp(item["secret_key"], offset_seconds=eff_offset)
         item["usage"] = compute_usage_info(item["purchase_date"], item["deactivated_date"])
 
         raw_cf = item.get("custom_fields_json") or "{}"
@@ -295,6 +496,31 @@ class DatabaseService:
         if item.get("account_type") == "域名邮箱":
             if item["custom_fields"].get("wb_reg_status") not in ("已完成", "进行中", "未完成"):
                 item["custom_fields"]["wb_reg_status"] = "未完成"
+
+        cf = item["custom_fields"]
+        item["sec_recovery_modified"] = 1 if cf.get("sec_recovery_modified") else 0
+        item["sec_devices_cleared"] = 1 if cf.get("sec_devices_cleared") else 0
+        item["recovery_password"] = str(cf.get("recovery_password") or "")
+        item["masked_recovery_password"] = mask_password(item["recovery_password"]) if item["recovery_password"] else ""
+        item["security"] = compute_security_info(
+            item["password_modified"], item["twofa_modified"], cf, item["recovery_email"]
+        )
+        item["warming"] = compute_warming_info(
+            str(item.get("created_at") or ""), item["purchase_date"], item["health_status"], cf
+        )
+        item["has_rt"] = bool(cf.get("rt_json") or cf.get("rt_refresh_token"))
+        item["rt_status"] = str(cf.get("rt_status") or ("active" if item["has_rt"] else "none"))
+        item["gcp_status"] = str(cf.get("gcp_status") or "none")
+        item["subscription_plan"] = str(cf.get("subscription_plan") or "Free")
+        item["openai_plan"] = str(cf.get("openai_plan") or "free")
+        item["warming_group"] = str(cf.get("warming_group") or "默认组")
+        item["api_key"] = str(cf.get("api_key") or "")
+        item["masked_api_key"] = (
+            mask_secret(item["api_key"])
+            if len(item["api_key"]) >= 8
+            else ("****" if item["api_key"] else "")
+        )
+        item["has_ai_cred"] = bool(cf.get("api_key") or cf.get("session_token"))
 
         raw_fp = item.get("fp_config_json") or ""
         try:
@@ -432,8 +658,62 @@ class DatabaseService:
             custom_fields_json,
         )
 
+    def _merge_maintenance_cf(self, data: dict, base_cf: dict | None = None) -> dict:
+        cf = dict(base_cf) if isinstance(base_cf, dict) else {}
+        if isinstance(data.get("custom_fields"), dict):
+            cf.update(data["custom_fields"])
+        elif isinstance(data.get("custom_fields_json"), str) and data.get("custom_fields_json").strip():
+            try:
+                parsed = json.loads(data["custom_fields_json"].strip())
+                if isinstance(parsed, dict):
+                    cf.update(parsed)
+            except Exception:
+                pass
+        for key in MAINTENANCE_CF_KEYS:
+            if key in data:
+                cf[key] = data[key]
+        return cf
+
+    def _record_credential_history(
+        self,
+        conn: sqlite3.Connection,
+        account_id: int,
+        existing: dict,
+        new_pwd: str,
+        new_rec: str,
+        new_sk: str,
+        new_rpwd: str,
+        reason: str = "update",
+    ) -> bool:
+        old_pwd = existing.get("password") or ""
+        old_rec = existing.get("recovery_email") or ""
+        old_sk = normalize_secret(existing.get("secret_key") or "")
+        old_rpwd = str((existing.get("custom_fields") or {}).get("recovery_password") or "")
+        changed = (
+            (bool(old_pwd) and new_pwd != old_pwd)
+            or (bool(old_rec) and new_rec != old_rec)
+            or (bool(old_sk) and new_sk != old_sk)
+            or (bool(old_rpwd) and new_rpwd != old_rpwd)
+        )
+        if not changed:
+            return False
+        conn.execute(
+            """
+            INSERT INTO credential_history (
+                account_id, change_type, old_password, old_recovery_email,
+                old_secret_key, old_recovery_password, reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (int(account_id), reason, old_pwd, old_rec, old_sk, old_rpwd, reason),
+        )
+        return True
+
     def add_account(self, data: dict) -> dict:
-        fields = self._prepare_fields(data)
+        prepared_input = dict(data)
+        cf_dict = self._merge_maintenance_cf(prepared_input)
+        if cf_dict:
+            prepared_input["custom_fields"] = cf_dict
+        fields = self._prepare_fields(prepared_input)
         proxy = (data.get("proxy") or "").strip()
         with self._connect() as conn:
             cur = conn.execute(
@@ -463,38 +743,106 @@ class DatabaseService:
         return self._enrich_row(row)
 
     def batch_add_accounts(self, items: list[dict]) -> int:
-        count = 0
-        with self._connect() as conn:
-            for data in items:
-                account = (data.get("account") or "").strip()
-                if not account:
+        res = self.batch_import_accounts(items, duplicate_strategy="none")
+        return int(res["imported"])
+
+    def batch_import_accounts(self, items: list[dict], duplicate_strategy: str = "skip") -> dict:
+        strategy = (duplicate_strategy or "skip").strip().lower()
+        if strategy not in ("skip", "fill_empty", "overwrite", "none"):
+            strategy = "skip"
+
+        existing_map: dict[tuple[str, str], dict] = {}
+        if strategy != "none":
+            for acc in self.list_accounts():
+                atype = (acc.get("account_type") or "").strip().lower()
+                email_key = (
+                    normalize_gmail_address(acc.get("account") or "")
+                    if atype == "google"
+                    else (acc.get("account") or "").strip().lower()
+                )
+                if email_key:
+                    existing_map[(atype, email_key)] = acc
+
+        imported = 0
+        updated = 0
+        skipped = 0
+        for data in items:
+            account = (data.get("account") or "").strip()
+            if not account:
+                continue
+            atype = (data.get("account_type") or "ChatGPT").strip().lower()
+            email_key = normalize_gmail_address(account) if atype == "google" else account.lower()
+            dup = existing_map.get((atype, email_key)) if strategy != "none" else None
+
+            if dup is not None:
+                if strategy == "skip":
+                    skipped += 1
                     continue
-                fields = self._prepare_fields(data)
-                cur = conn.execute(
-                    """
-                    INSERT INTO accounts (
-                        account_type, health_status, antigravity_tier, device_tag, account, password, password_modified, recovery_email,
-                        secret_key, initial_secret_key, twofa_modified,
-                        purchase_date, deactivated_date, reg_year, reg_region, note, custom_fields_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    fields,
-                )
-                new_id = cur.lastrowid
-                fp = generate_fingerprint_config(
-                    new_id,
-                    account,
-                    proxy=str(data.get("proxy") or "").strip(),
-                    timezone=str(data.get("timezone") or "").strip(),
-                    locale=str(data.get("locale") or "").strip(),
-                    accept_languages=str(data.get("accept_languages") or "").strip(),
-                )
-                conn.execute(
-                    "UPDATE accounts SET fp_config_json = ? WHERE id = ?",
-                    (json.dumps(fp, ensure_ascii=False), new_id),
-                )
-                count += 1
-        return count
+                if strategy == "fill_empty":
+                    patch: dict = {}
+                    for col in ("password", "recovery_email", "secret_key", "initial_secret_key",
+                                "purchase_date", "deactivated_date", "reg_year", "reg_region", "note"):
+                        new_val = str(data.get(col) or "").strip()
+                        old_val = str(dup.get(col) or "").strip()
+                        if new_val and not old_val:
+                            patch[col] = new_val
+                    fp_old = dup.get("fp_config") or {}
+                    for fkey in ("proxy", "timezone", "locale", "accept_languages"):
+                        new_fval = str(data.get(fkey) or "").strip()
+                        old_fval = str(fp_old.get(fkey) or "").strip()
+                        if new_fval and not old_fval:
+                            patch[fkey] = new_fval
+                    cf_in = self._merge_maintenance_cf(data)
+                    cf_old = dup.get("custom_fields") or {}
+                    cf_patch = {}
+                    for ck, cv in cf_in.items():
+                        if cv not in ("", None, False) and cf_old.get(ck) in ("", None, False):
+                            cf_patch[ck] = cv
+                    if cf_patch:
+                        patch["custom_fields"] = cf_patch
+                    if patch:
+                        updated_row = self.update_account(dup["id"], patch)
+                        if updated_row:
+                            existing_map[(atype, email_key)] = updated_row
+                            updated += 1
+                        else:
+                            skipped += 1
+                    else:
+                        skipped += 1
+                    continue
+                if strategy == "overwrite":
+                    patch = {}
+                    for col in ("health_status", "antigravity_tier", "device_tag", "password",
+                                "recovery_email", "secret_key", "initial_secret_key",
+                                "purchase_date", "deactivated_date", "reg_year", "reg_region", "note"):
+                        val = data.get(col)
+                        if val not in (None, ""):
+                            patch[col] = val
+                    for fkey in ("proxy", "timezone", "locale", "accept_languages"):
+                        val = str(data.get(fkey) or "").strip()
+                        if val:
+                            patch[fkey] = val
+                    cf_in = self._merge_maintenance_cf(data)
+                    cf_non_empty = {k: v for k, v in cf_in.items() if v not in ("", None)}
+                    if cf_non_empty:
+                        patch["custom_fields"] = cf_non_empty
+                    if patch:
+                        updated_row = self.update_account(dup["id"], patch)
+                        if updated_row:
+                            existing_map[(atype, email_key)] = updated_row
+                            updated += 1
+                        else:
+                            skipped += 1
+                    else:
+                        skipped += 1
+                    continue
+
+            created = self.add_account(data)
+            imported += 1
+            if strategy != "none" and email_key:
+                existing_map[(atype, email_key)] = created
+
+        return {"imported": imported, "updated": updated, "skipped": skipped}
 
     def update_account(self, account_id: int, data: dict) -> dict | None:
         existing = self.get_account(account_id)
@@ -502,11 +850,16 @@ class DatabaseService:
             return None
         merged = dict(existing)
         merged.update(data)
-        if "custom_fields" in data:
-            if isinstance(data["custom_fields"], dict):
-                merged["custom_fields"] = {**(existing.get("custom_fields") or {}), **data["custom_fields"]}
-            else:
-                merged["custom_fields"] = data["custom_fields"]
+        cf_dict = self._merge_maintenance_cf(data, existing.get("custom_fields"))
+        if data.get("health_status") in ("人机", "短信", "验证") and existing.get("health_status") != data.get("health_status"):
+            has_explicit_reset = (
+                "warming_reset_at" in data
+                or (isinstance(data.get("custom_fields"), dict) and "warming_reset_at" in data["custom_fields"])
+            )
+            if not has_explicit_reset:
+                cf_dict["warming_reset_at"] = date.today().strftime("%Y-%m-%d")
+        if cf_dict:
+            merged["custom_fields"] = cf_dict
             merged.pop("custom_fields_json", None)
         elif "custom_fields_json" in data:
             merged["custom_fields_json"] = data["custom_fields_json"]
@@ -517,6 +870,13 @@ class DatabaseService:
                 merged["password_modified"] = 1
             else:
                 merged["password_modified"] = existing.get("password_modified", 0)
+        if "twofa_modified" not in data:
+            new_sk_norm = normalize_secret(data.get("secret_key") or "")
+            old_sk_norm = normalize_secret(existing.get("secret_key") or "")
+            if new_sk_norm and old_sk_norm and new_sk_norm != old_sk_norm:
+                merged["twofa_modified"] = 1
+                if not merged.get("initial_secret_key"):
+                    merged["initial_secret_key"] = old_sk_norm
         fields = self._prepare_fields(merged)
         fp_cfg = existing.get("fp_config") or generate_fingerprint_config(account_id, fields[4])
         if not fp_cfg.get("node_locked"):
@@ -535,6 +895,16 @@ class DatabaseService:
             fp_cfg.setdefault(key, "")
 
         with self._connect() as conn:
+            self._record_credential_history(
+                conn,
+                account_id,
+                existing,
+                new_pwd=fields[5],
+                new_rec=fields[7],
+                new_sk=fields[8],
+                new_rpwd=str(cf_dict.get("recovery_password") or ""),
+                reason=str(data.get("_history_reason") or "update"),
+            )
             conn.execute(
                 """
                 UPDATE accounts SET
@@ -753,10 +1123,22 @@ class DatabaseService:
         status_val = (health_status or "可用").strip()
         if status_val not in VALID_HEALTH_STATUSES:
             status_val = "可用"
+        existing = self.get_account(int(account_id))
+        if not existing:
+            return None
+        cf = dict(existing.get("custom_fields") or {})
+        if status_val in ("人机", "短信", "验证") and existing.get("health_status") != status_val:
+            cf["warming_reset_at"] = date.today().strftime("%Y-%m-%d")
         with self._connect() as conn:
             conn.execute(
-                "UPDATE accounts SET health_status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (status_val, int(account_id)),
+                """
+                UPDATE accounts SET
+                    health_status = ?,
+                    custom_fields_json = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (status_val, json.dumps(cf, ensure_ascii=False), int(account_id)),
             )
             row = conn.execute("SELECT * FROM accounts WHERE id = ?", (int(account_id),)).fetchone()
         return self._enrich_row(row) if row else None
@@ -951,10 +1333,11 @@ class DatabaseService:
             "antigravity": antigravity_counts,
         }
 
-    def refresh_totp_codes(self) -> dict[int, dict]:
+    def refresh_totp_codes(self, offset_seconds: int | None = None) -> dict[int, dict]:
+        eff_offset = self.totp_offset_seconds if offset_seconds is None else int(offset_seconds or 0)
         with self._connect() as conn:
             rows = conn.execute("SELECT id, secret_key FROM accounts WHERE secret_key != ''").fetchall()
-        return {row["id"]: generate_totp(row["secret_key"]) for row in rows}
+        return {row["id"]: generate_totp(row["secret_key"], offset_seconds=eff_offset) for row in rows}
 
     def export_accounts_text(self, account_type: str = "") -> str:
         items = self.list_accounts(account_type=account_type)
@@ -1400,4 +1783,165 @@ class DatabaseService:
             "json_text": json.dumps(doc, ensure_ascii=False, indent=2),
             "error": "" if rows else "所选账号尚未保存 WorkBuddy 登录凭据，请先完成注册与凭据授权。",
         }
+
+    # --- Maintenance, Credential History, Warming & Rolling Backups ---
+
+    def get_credential_history(self, account_id: int) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, account_id, change_type, old_password, old_recovery_email,
+                       old_secret_key, old_recovery_password, reason, created_at
+                FROM credential_history
+                WHERE account_id = ?
+                ORDER BY id DESC
+                """,
+                (int(account_id),),
+            ).fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["masked_old_password"] = mask_password(d.get("old_password") or "")
+            d["masked_old_secret_key"] = mask_secret(d.get("old_secret_key") or "")
+            d["masked_old_recovery_password"] = mask_password(d.get("old_recovery_password") or "")
+            result.append(d)
+        return result
+
+    def quick_update_credentials(self, account_id: int, payload: dict) -> dict | None:
+        existing = self.get_account(int(account_id))
+        if not existing:
+            return None
+        patch: dict = {"_history_reason": str(payload.get("reason") or "quick_edit")}
+        for key in ("password", "recovery_email", "note"):
+            if key in payload:
+                patch[key] = payload[key]
+        if "secret_key" in payload:
+            new_sk = normalize_secret(payload.get("secret_key") or "")
+            old_sk = normalize_secret(existing.get("secret_key") or "")
+            patch["secret_key"] = new_sk
+            if new_sk and old_sk and new_sk != old_sk and not existing.get("initial_secret_key"):
+                patch["initial_secret_key"] = old_sk
+                patch["twofa_modified"] = 1
+        for flag_key in ("password_modified", "twofa_modified"):
+            if flag_key in payload:
+                patch[flag_key] = 1 if payload[flag_key] else 0
+        for cf_flag in ("sec_recovery_modified", "sec_devices_cleared", "scan_qr_mode"):
+            if cf_flag in payload:
+                patch[cf_flag] = bool(payload[cf_flag])
+        if "recovery_password" in payload:
+            patch["recovery_password"] = str(payload.get("recovery_password") or "")
+        return self.update_account(int(account_id), patch)
+
+    def reset_warming_time(
+        self,
+        account_id: int,
+        scan_qr_mode: bool | None = None,
+        reset_date: str = "",
+    ) -> dict | None:
+        existing = self.get_account(int(account_id))
+        if not existing:
+            return None
+        cf = dict(existing.get("custom_fields") or {})
+        anchor = normalize_date_str(reset_date.strip()) if reset_date and reset_date.strip() else ""
+        cf["warming_reset_at"] = anchor or date.today().strftime("%Y-%m-%d")
+        if scan_qr_mode is not None:
+            cf["scan_qr_mode"] = bool(scan_qr_mode)
+        return self.update_account(int(account_id), {"custom_fields": cf})
+
+    def get_top_recovery_emails(self, limit: int = 8) -> list[dict]:
+        lim = max(1, min(50, int(limit or 8)))
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT LOWER(TRIM(recovery_email)) AS email_norm,
+                       MAX(TRIM(recovery_email)) AS email,
+                       COUNT(1) AS cnt
+                FROM accounts
+                WHERE TRIM(COALESCE(recovery_email, '')) != ''
+                GROUP BY LOWER(TRIM(recovery_email))
+                ORDER BY cnt DESC, email_norm ASC
+                LIMIT ?
+                """,
+                (lim,),
+            ).fetchall()
+        return [{"email": r["email"], "count": int(r["cnt"])} for r in rows]
+
+    @property
+    def backups_dir(self) -> Path:
+        return self.db_path.parent / "backups"
+
+    def create_rolling_backup(
+        self,
+        reason: str = "manual",
+        max_keep: int = 15,
+        min_interval_minutes: int = 0,
+    ) -> dict:
+        if not self.db_path.exists():
+            return {"ok": False, "error": "数据库文件不存在"}
+        bdir = self.backups_dir
+        bdir.mkdir(parents=True, exist_ok=True)
+        existing_files = sorted(bdir.glob("accounts_*.db"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if min_interval_minutes > 0 and existing_files:
+            age_sec = time.time() - existing_files[0].stat().st_mtime
+            if age_sec < min_interval_minutes * 60:
+                return {"ok": True, "skipped": True, "filename": existing_files[0].name}
+
+        safe_reason = re.sub(r"[^a-zA-Z0-9_-]", "", (reason or "manual")) or "manual"
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:21]
+        dest_path = bdir / f"accounts_{ts}_{safe_reason}.db"
+        try:
+            with closing(sqlite3.connect(self.db_path)) as src_conn:
+                with closing(sqlite3.connect(dest_path)) as dst_conn:
+                    src_conn.backup(dst_conn)
+            all_backups = sorted(bdir.glob("accounts_*.db"), key=lambda p: p.stat().st_mtime, reverse=True)
+            for stale in all_backups[max(1, int(max_keep)):]:
+                try:
+                    stale.unlink()
+                except Exception:
+                    pass
+            return {
+                "ok": True,
+                "filename": dest_path.name,
+                "path": str(dest_path),
+                "size_bytes": dest_path.stat().st_size,
+            }
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def list_backups(self) -> list[dict]:
+        bdir = self.backups_dir
+        if not bdir.exists():
+            return []
+        files = sorted(bdir.glob("accounts_*.db"), key=lambda p: p.stat().st_mtime, reverse=True)
+        items = []
+        for f in files:
+            st = f.stat()
+            items.append({
+                "filename": f.name,
+                "size_bytes": st.st_size,
+                "created_at": datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+            })
+        return items
+
+    def restore_backup(self, filename: str) -> dict:
+        fname = Path(str(filename or "")).name
+        if not fname or fname != str(filename).strip() or not fname.endswith(".db"):
+            return {"ok": False, "error": "非法的备份文件名"}
+        src_path = (self.backups_dir / fname).resolve()
+        try:
+            src_path.relative_to(self.backups_dir.resolve())
+        except Exception:
+            return {"ok": False, "error": "非法的备份路径"}
+        if not src_path.exists():
+            return {"ok": False, "error": f"备份文件不存在: {fname}"}
+
+        self.create_rolling_backup(reason="pre_restore", max_keep=15, min_interval_minutes=0)
+        try:
+            with closing(sqlite3.connect(src_path)) as src_conn:
+                with closing(sqlite3.connect(self.db_path)) as dst_conn:
+                    src_conn.backup(dst_conn)
+            self._init_db()
+            return {"ok": True, "restored": fname}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
 

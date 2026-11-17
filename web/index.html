@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>KeyVault · 全平台账号与凭据管家</title>
-  <link rel="stylesheet" href="style.css?v=20261105_2" />
+  <link rel="stylesheet" href="style.css?v=20261117_1" />
 </head>
 <body>
   <div class="app-shell">
@@ -63,6 +63,12 @@
         </div>
 
         <div class="top-actions">
+          <button class="btn btn-secondary" id="btn-rt-oauth" onclick="openRtOAuthModal()" title="Antigravity / GCP RT 诊断与内置 OAuth 抓包授权">
+            <span>🛸 RT/OAuth</span>
+          </button>
+          <button class="btn btn-secondary" id="btn-appeal" onclick="openAppealModal()" title="Google / GCP 封禁申诉与风控救号通道">
+            <span>🏥 申诉救号</span>
+          </button>
           <button class="icon-btn" id="btn-settings" onclick="openSettingsModal()" title="系统常用设置与字典表维护">
             <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2">
               <circle cx="12" cy="12" r="3"></circle>
@@ -254,11 +260,18 @@
         <div class="batch-banner" id="batch-banner" style="display: none;">
           <div class="batch-info">
             <strong>检测到多条账号记录 (<span id="batch-count">0</span> 条)</strong>
-            <span>您可以直接点击右侧按钮一键全部导入数据库！</span>
+            <span>可直接选择重复策略后一键全部导入数据库！</span>
           </div>
-          <button type="button" class="btn btn-primary" onclick="confirmBatchImport()">
-            一键批量导入全部 (<span id="batch-btn-count">0</span>)
-          </button>
+          <div class="batch-actions-wrap">
+            <select id="batch-dup-strategy" class="settings-select compact-select" title="遇到相同账号时的处理方式">
+              <option value="skip">重复时跳过</option>
+              <option value="fill_empty">仅补全空字段</option>
+              <option value="overwrite">覆盖并归档旧凭据</option>
+            </select>
+            <button type="button" class="btn btn-primary" onclick="confirmBatchImport()">
+              一键批量导入全部 (<span id="batch-btn-count">0</span>)
+            </button>
+          </div>
         </div>
 
         <!-- Manual / Auto-filled Form -->
@@ -317,6 +330,25 @@
 
           <!-- Dynamic Platform-bound Attributes Section -->
           <div id="form-dynamic-attributes-container" class="dynamic-form-section"></div>
+
+          <!-- Persona / Strong Password Quick Generator Bar -->
+          <div class="persona-helper-bar">
+            <div class="persona-helper-left">
+              <span class="persona-label">🎭 新号注册辅助：</span>
+              <select id="persona-region" class="settings-select compact-select">
+                <option value="US">美国 (US)</option>
+                <option value="JP">日本 (JP)</option>
+                <option value="DE">德国 (DE)</option>
+              </select>
+              <button type="button" class="btn btn-secondary btn-xs" onclick="onClickGeneratePersona()">
+                🎲 生成拟真身份
+              </button>
+              <button type="button" class="btn btn-secondary btn-xs" onclick="onClickFillStrongPassword()">
+                🔑 随机强密
+              </button>
+            </div>
+            <span class="persona-preview-text" id="persona-preview-text"></span>
+          </div>
 
           <!-- Row 2: Account Email + Password -->
           <div class="form-grid-2">
@@ -377,7 +409,8 @@
 
             <div class="form-group">
               <label for="field-recovery">辅助邮箱 (Google)</label>
-              <input type="text" id="field-recovery" placeholder="backup@mail.com" />
+              <input type="text" id="field-recovery" list="recovery-email-suggestions" placeholder="backup@mail.com" />
+              <datalist id="recovery-email-suggestions"></datalist>
             </div>
           </div>
 
@@ -399,8 +432,20 @@
             </div>
 
             <div class="form-group" style="flex: 1.4;">
-              <label for="field-proxy">专属代理 IP (留空直连)</label>
+              <label for="field-proxy">专属代理 IP (留空直连，支持 host:port:user:pass)</label>
               <input type="text" id="field-proxy" placeholder="如 http://127.0.0.1:7890" />
+            </div>
+          </div>
+
+          <!-- Row 6: Optional Extended Maintenance Credentials -->
+          <div class="form-grid-2" style="margin-top: 4px;">
+            <div class="form-group">
+              <label for="field-recovery-password">辅助邮箱密码 (选填)</label>
+              <input type="text" id="field-recovery-password" placeholder="辅助邮箱独立登录密码" />
+            </div>
+            <div class="form-group">
+              <label for="field-api-key">AI API Key / Session Token (ChatGPT / Claude 选填)</label>
+              <input type="text" id="field-api-key" placeholder="sk-... / sk-ant-... / eyJ..." />
             </div>
           </div>
 
@@ -661,6 +706,34 @@
             </div>
           </div>
 
+          <div class="settings-section" style="margin-top: 14px;">
+            <div class="settings-section-head">
+              <span class="sec-dot dot-blue"></span>
+              <h3 class="settings-section-title">TOTP 时间校准（防本地时钟偏差）</h3>
+            </div>
+            <div class="maintenance-bar-row">
+              <span class="maintenance-bar-desc">当前偏移量：<strong id="lbl-totp-offset">0 秒</strong>（与 Google 服务器响应头比对）</span>
+              <button type="button" class="btn btn-secondary btn-sm" id="btn-sync-google-time" onclick="onClickSyncGoogleTime()">
+                ⏱️ 与 Google 服务器同步时间
+              </button>
+            </div>
+          </div>
+
+          <div class="settings-section" style="margin-top: 14px;">
+            <div class="settings-section-head" style="justify-content: space-between;">
+              <div style="display:flex;align-items:center;gap:8px;">
+                <span class="sec-dot dot-green"></span>
+                <h3 class="settings-section-title">数据库滚动备份与安全恢复（最多保留 15 份）</h3>
+              </div>
+              <button type="button" class="btn btn-secondary btn-xs" onclick="onClickCreateBackup()">
+                💾 立即创建备份
+              </button>
+            </div>
+            <div id="settings-backup-list" class="backup-list-box">
+              <div class="backup-empty">点击加载备份列表...</div>
+            </div>
+          </div>
+
           <div class="settings-footer">
             <button type="button" class="btn btn-secondary btn-close-settings" onclick="closeSettingsModal()">关闭</button>
             <button type="button" class="btn btn-primary btn-save-settings" onclick="saveGeneralSettings()">
@@ -854,7 +927,223 @@
   </div>
 
 
-  <script src="app.js?v=20261105_2"></script>
-  <script src="workbuddy.js?v=20261105_2"></script>
+  <!-- Quick Credential Maintenance & Warming Modal -->
+  <div class="modal-backdrop" id="quick-cred-modal" style="display: none;" onclick="if(event.target === this) closeQuickCredModal()">
+    <div class="modal-card" onclick="event.stopPropagation()">
+      <div class="modal-header">
+        <div>
+          <h2 id="qc-modal-title">🛡️ 账号养护与快捷改密</h2>
+          <p class="modal-subtitle" id="qc-modal-subtitle">四步安全加固清单 · 科学养号周期 · 凭据变更自动归档历史</p>
+        </div>
+        <button class="modal-close" onclick="closeQuickCredModal()">×</button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="qc-account-id" value="" />
+
+        <!-- Warming Cycle Status Bar -->
+        <div class="qc-warming-box">
+          <div class="qc-warming-info">
+            <span class="warm-badge" id="qc-warming-badge">养号中</span>
+            <span class="qc-warming-hint" id="qc-warming-hint">加载中...</span>
+          </div>
+          <div class="qc-warming-actions">
+            <label class="switch-row" title="针对扫码登录获取的高防号，开启 30 天长养号周期">
+              <input type="checkbox" id="qc-scan-qr-mode" />
+              <span class="switch-slider"></span>
+              <span class="switch-text">30天扫码养号</span>
+            </label>
+            <button type="button" class="btn btn-secondary btn-xs" onclick="onClickResetWarming()">
+              🔄 从今日重新计时
+            </button>
+          </div>
+        </div>
+
+        <!-- 4-Step Security Hardening Checklist -->
+        <div class="qc-section-title">四步安全加固检查清单（全勾选自动标记为「🔒 安全」）</div>
+        <div class="qc-checklist-grid">
+          <label class="qc-check-card">
+            <input type="checkbox" id="qc-sec-pwd" />
+            <span>1. 已修改登录密码</span>
+          </label>
+          <label class="qc-check-card">
+            <input type="checkbox" id="qc-sec-2fa" />
+            <span>2. 已重置 2FA 密钥</span>
+          </label>
+          <label class="qc-check-card">
+            <input type="checkbox" id="qc-sec-recovery" />
+            <span>3. 已更换辅助邮箱</span>
+          </label>
+          <label class="qc-check-card">
+            <input type="checkbox" id="qc-sec-devices" />
+            <span>4. 已清理旧登录设备</span>
+          </label>
+        </div>
+
+        <form onsubmit="saveQuickCredModal(event)">
+          <div class="form-grid-2" style="margin-top: 12px;">
+            <div class="form-group">
+              <label for="qc-password">
+                登录密码
+                <button type="button" class="btn-link" onclick="onClickQcGenPassword()">🎲 生成16位强密并复制</button>
+              </label>
+              <input type="text" id="qc-password" placeholder="输入新密码（变更将自动归档旧密码）" />
+            </div>
+            <div class="form-group">
+              <label for="qc-secret">
+                2FA 密钥 (Base32)
+                <button type="button" class="btn-link" onclick="onClickQcGenSecret()">🎲 随机新密钥</button>
+              </label>
+              <input type="text" id="qc-secret" oninput="onQcSecretInput(this.value)" placeholder="输入或生成 Base32 密钥" />
+              <span class="field-hint" id="qc-totp-preview">实时验证码预览: —</span>
+            </div>
+          </div>
+
+          <div class="form-grid-2" style="margin-top: 8px;">
+            <div class="form-group">
+              <label for="qc-recovery-email">辅助恢复邮箱</label>
+              <input type="text" id="qc-recovery-email" placeholder="backup@mail.com" />
+              <div class="qc-chips-row" id="qc-top-recovery-chips"></div>
+            </div>
+            <div class="form-group">
+              <label for="qc-recovery-password">辅助邮箱密码 (选填)</label>
+              <input type="text" id="qc-recovery-password" placeholder="辅助邮箱独立密码" />
+            </div>
+          </div>
+
+          <div class="form-group" style="margin-top: 8px;">
+            <label for="qc-note">养护备注</label>
+            <input type="text" id="qc-note" placeholder="记录风控情况、设备或更改说明" />
+          </div>
+
+          <!-- Credential Change History Archive -->
+          <div class="qc-history-section">
+            <div class="qc-section-title" style="display:flex;justify-content:space-between;align-items:center;">
+              <span>📜 凭据变更历史归档 (只增不删，随时找回旧密码 / 旧 2FA)</span>
+              <span class="text-muted" id="qc-history-count">0 条记录</span>
+            </div>
+            <div id="qc-history-list" class="qc-history-list">
+              <div class="backup-empty">暂无变更历史记录</div>
+            </div>
+          </div>
+
+          <div class="modal-footer">
+            <button type="button" class="btn btn-ghost" onclick="closeQuickCredModal()">取消</button>
+            <button type="submit" class="btn btn-primary">💾 保存并归档变更</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- Antigravity / GCP RT Diagnostic & Built-in OAuth Modal -->
+  <div class="modal-backdrop" id="rt-oauth-modal" style="display: none;" onclick="if(event.target === this) closeRtOAuthModal()">
+    <div class="modal-card modal-lg" onclick="event.stopPropagation()">
+      <div class="modal-header">
+        <div>
+          <h2>🛸 Antigravity / GCP RT 诊断与 OAuth 抓包工作台</h2>
+          <p class="modal-subtitle">内置 Loopback PKCE OAuth 授权 · 4 步直连探测 Pro/Ultra 与封控 · 注入本地 Antigravity 客户端</p>
+        </div>
+        <button class="modal-close" onclick="closeRtOAuthModal()">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-grid-2">
+          <div class="form-group">
+            <label for="rt-modal-account-select">选择目标 Google 账号</label>
+            <select id="rt-modal-account-select" class="settings-select" onchange="onRtAccountSelectChange(this.value)">
+              <!-- populated dynamically -->
+            </select>
+          </div>
+          <div class="form-group" style="display:flex;align-items:flex-end;gap:8px;flex-wrap:wrap;">
+            <button type="button" class="btn btn-secondary btn-sm" onclick="onClickProbeProxyGeo()" title="检测当前绑定代理出口归属地并匹配时区">
+              🌍 检测代理出口/同步时区
+            </button>
+            <button type="button" class="btn btn-secondary btn-sm" onclick="onClickResetRejectedSession()" title="清理被 Google 拒绝登录会话残留锁与 DevToolsActivePort">
+              🧹 重置被拒会话
+            </button>
+          </div>
+        </div>
+
+        <div id="rt-account-status-banner" class="rt-status-banner">请选择一个 Google 账号</div>
+
+        <!-- OAuth 2.0 + PKCE Loopback -->
+        <div class="rt-box">
+          <div class="rt-box-head">
+            <strong>🔐 1. 内置 OAuth 2.0 PKCE 抓包授权（自动获取并绑定 RT）</strong>
+            <label class="switch-row">
+              <input type="checkbox" id="rt-oauth-pure-native" checked />
+              <span class="switch-slider"></span>
+              <span class="switch-text">纯净无扩展启动（防风控推荐）</span>
+            </label>
+          </div>
+          <div class="rt-btn-row">
+            <button type="button" class="btn btn-primary btn-sm" onclick="onClickStartBuiltinOAuth()">
+              🚀 在隔离浏览器启动 OAuth 授权
+            </button>
+            <button type="button" class="btn btn-ghost btn-sm" id="btn-cancel-oauth" style="display:none;" onclick="onClickCancelBuiltinOAuth()">
+              ⏹ 取消监听
+            </button>
+            <button type="button" class="btn btn-secondary btn-sm" id="btn-copy-oauth-url" style="display:none;" onclick="onClickCopyOAuthUrl()">
+              📋 复制授权 URL
+            </button>
+          </div>
+          <div id="oauth-loopback-status" class="oauth-status-line">待启动：点击上方按钮将开启本地 127.0.0.1 回调服务并用账号专属代理拉起授权页</div>
+        </div>
+
+        <!-- RT JSON Import/Inspect/Inject/Probe -->
+        <div class="rt-box" style="margin-top: 12px;">
+          <div class="rt-box-head">
+            <strong>📋 2. RT 凭据 JSON 导入、诊断与一键客户端注入</strong>
+            <div class="rt-mini-actions">
+              <button type="button" class="btn btn-secondary btn-xs" onclick="onClickInspectRtJson()">🔍 校验格式</button>
+              <button type="button" class="btn btn-secondary btn-xs" onclick="onClickSaveAccountRt()">💾 保存到当前账号</button>
+              <button type="button" class="btn btn-secondary btn-xs" onclick="onClickBatchImportRtJson()">📥 批量导入数组/多条RT</button>
+              <button type="button" class="btn btn-secondary btn-xs" onclick="onClickExportRtJson()">📤 导出全部RT</button>
+            </div>
+          </div>
+          <textarea id="rt-json-textarea" rows="4" placeholder='粘贴单个 RT JSON、{"refresh_token":"1//..."}、RT JSON 数组或 1//... 裸 Token'></textarea>
+          <div class="rt-btn-row" style="margin-top: 10px;">
+            <button type="button" class="btn btn-primary btn-sm" onclick="onClickProbeGcpRt()">
+              🩺 4步深度诊断 (Token → loadCodeAssist → onboardUser → 模型配额)
+            </button>
+            <button type="button" class="btn btn-secondary btn-sm" onclick="onClickBatchProbeGcpRt()">
+              ⚡ 批量探测所有 RT 账号
+            </button>
+            <button type="button" class="btn btn-secondary btn-sm" onclick="onClickInjectAntigravity()">
+              💉 注入到本地 Antigravity 客户端
+            </button>
+          </div>
+          <pre id="rt-probe-result" class="rt-probe-pre" style="display: none;"></pre>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Google / GCP Appeal & Recovery Channels Modal -->
+  <div class="modal-backdrop" id="appeal-modal" style="display: none;" onclick="if(event.target === this) closeAppealModal()">
+    <div class="modal-card modal-lg" onclick="event.stopPropagation()">
+      <div class="modal-header">
+        <div>
+          <h2>🏥 Google / GCP 申诉与风控救号中心</h2>
+          <p class="modal-subtitle">选择需救号的账号环境，一键在绑定专属代理的指纹浏览器或纯净模式中打开官方申诉表单</p>
+        </div>
+        <button class="modal-close" onclick="closeAppealModal()">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group" style="margin-bottom: 12px;">
+          <label for="appeal-account-select">指定使用哪个账号的代理与指纹环境打开申诉页</label>
+          <select id="appeal-account-select" class="settings-select" onchange="renderAppealValidationBanner()">
+            <!-- populated dynamically -->
+          </select>
+        </div>
+        <div id="appeal-validation-banner" class="appeal-val-banner" style="display: none;"></div>
+        <div id="appeal-channels-list" class="appeal-channels-grid">
+          <!-- populated dynamically from server appeal_channels -->
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js?v=20261117_1"></script>
+  <script src="workbuddy.js?v=20261117_1"></script>
 </body>
 </html>

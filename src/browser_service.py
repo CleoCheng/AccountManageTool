@@ -348,6 +348,11 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
                 (account.get("account") or "").strip()
             ),
             "recoveryEmail": (account.get("recovery_email") or "").strip(),
+            "recoveryPassword": str(
+                account.get("recovery_password")
+                or (account.get("custom_fields") or {}).get("recovery_password")
+                or ""
+            ).strip(),
             "secretKey": (account.get("secret_key") or "").strip(),
             "initialSecretKey": (account.get("initial_secret_key") or "").strip(),
             "twofaModified": bool(account.get("twofa_modified")),
@@ -501,10 +506,15 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
   }}
 
   // --- DOM Helpers for React / Google Wiz ---
-  let autoEnabled = safeGetSession('kv_autologin_enabled') !== '0';
-  let statusText = '⚡ 正在检测登录表单...';
+  // Default silent (manual click-to-fill) to avoid synthetic auto-submit anti-bot signals.
+  let autoEnabled = safeGetSession('kv_autologin_enabled') === '1';
+  let capsuleHidden = safeGetSession('kv_capsule_hidden') === '1';
+  let statusText = autoEnabled
+    ? '⚡ 正在检测登录表单...'
+    : '🛡️ 静默防风控模式（点下方按钮填入 · Alt+K 隐藏）';
   let statusUiUpdater = null;
   let lastFocusedInput = null;
+  let hotkeyBound = false;
 
   document.addEventListener('focusin', (e) => {{
     if (e.target && e.target.tagName === 'INPUT') {{
@@ -1111,9 +1121,33 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
     }}, 2200);
   }}
 
+  function bindToggleHotkey() {{
+    if (hotkeyBound) return;
+    hotkeyBound = true;
+    document.addEventListener('keydown', (e) => {{
+      if (e.altKey && (e.key === 'k' || e.key === 'K' || e.code === 'KeyK')) {{
+        e.preventDefault();
+        capsuleHidden = !capsuleHidden;
+        safeSetSession('kv_capsule_hidden', capsuleHidden ? '1' : '0');
+        const existing = document.getElementById('__kv_autologin_host');
+        if (capsuleHidden) {{
+          if (existing) existing.remove();
+        }} else {{
+          mountCapsule();
+        }}
+      }}
+    }}, true);
+  }}
+
   function mountCapsule() {{
+    bindToggleHotkey();
+    const existingHost = document.getElementById('__kv_autologin_host');
+    if (capsuleHidden) {{
+      if (existingHost) existingHost.remove();
+      return;
+    }}
     const rootTarget = document.documentElement || document.body;
-    if (!rootTarget || document.getElementById('__kv_autologin_host')) return;
+    if (!rootTarget || existingHost) return;
     const hostEl = document.createElement('div');
     hostEl.id = '__kv_autologin_host';
     hostEl.style.cssText = 'all: initial; position: fixed; top: 14px; right: 14px; z-index: 2147483647; font-family: system-ui, -apple-system, "Segoe UI", sans-serif;';
@@ -1446,17 +1480,25 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
           e.stopPropagation();
           autoEnabled = !autoEnabled;
           safeSetSession('kv_autologin_enabled', autoEnabled ? '1' : '0');
-          setStatus(autoEnabled ? '⚡ 已开启自动登录检测' : '⏸ 已暂停自动提交，可点击下方按钮手动填入');
+          setStatus(autoEnabled ? '⚡ 已开启自动登录检测' : '🛡️ 静默防风控模式（点下方按钮填入 · Alt+K 隐藏）');
           if (autoEnabled) runAutoLoginTick(true);
         }};
         const minBtn = mkEl('button', 'kv-mini-btn', '—');
-        minBtn.title = '收起';
+        minBtn.title = '收起为小胶囊';
         minBtn.onclick = (e) => {{
           e.stopPropagation();
           minimized = true;
           render();
         }};
-        actionsTop.append(toggleBtn, minBtn);
+        const hideBtn = mkEl('button', 'kv-mini-btn', '×');
+        hideBtn.title = '暂时隐藏 (按 Alt+K 恢复显示)';
+        hideBtn.onclick = (e) => {{
+          e.stopPropagation();
+          capsuleHidden = true;
+          safeSetSession('kv_capsule_hidden', '1');
+          hostEl.remove();
+        }};
+        actionsTop.append(toggleBtn, minBtn, hideBtn);
         head.append(title, actionsTop);
 
         // 域名邮箱 accounts get a credential + quick-navigation helper panel.
@@ -1552,7 +1594,62 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
           btns.appendChild(fillRecBtn);
         }}
 
-        container.replaceChildren(head, row, statusEl, btns);
+        if (AUTH.recoveryPassword) {{
+          const fillRecPwdBtn = mkEl('button', 'kv-btn', '填辅密');
+          fillRecPwdBtn.onclick = (e) => {{
+            e.stopPropagation();
+            fillIntoFocusedOrTarget(AUTH.recoveryPassword, '辅助邮箱密码', ['input[type="password"]']);
+          }};
+          btns.appendChild(fillRecPwdBtn);
+        }}
+
+        const genPwdBtn = mkEl('button', 'kv-btn', '🎲 强密');
+        genPwdBtn.title = '生成 16 位高强度随机密码并复制到剪贴板';
+        genPwdBtn.onclick = (e) => {{
+          e.stopPropagation();
+          const pool = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*_-+=';
+          const rnd = new Uint32Array(16);
+          crypto.getRandomValues(rnd);
+          let out = '';
+          for (let i = 0; i < 16; i++) out += pool[rnd[i] % pool.length];
+          copyText(out, '强密码 ' + out);
+          const pwdInputs = Array.from(document.querySelectorAll('input[type="password"]')).filter(isVisible);
+          const active = document.activeElement;
+          const target = (active && active.tagName === 'INPUT') ? active : (pwdInputs[pwdInputs.length - 1] || null);
+          if (target) {{
+            setNativeInputValue(target, out);
+            setStatus('🎲 已生成强密并填入 & 复制: ' + out);
+          }}
+        }};
+        btns.appendChild(genPwdBtn);
+
+        const nav = mkEl('div', 'kv-nav');
+        const rescueLinks = AUTH.accountType === 'Google'
+          ? [
+              ['安全中心', 'https://myaccount.google.com/security'],
+              ['受限诊断', 'https://myaccount.google.com/restrictions'],
+              ['TOS申诉', 'https://forms.gle/hGzM9MEUv2azZsrb9'],
+              ['IP检测', 'https://ipinfo.io/json'],
+            ]
+          : AUTH.accountType === 'Claude'
+            ? [
+                ['Console', 'https://console.anthropic.com/'],
+                ['IP检测', 'https://ipinfo.io/json'],
+              ]
+            : [
+                ['API平台', 'https://platform.openai.com/api-keys'],
+                ['IP检测', 'https://ipinfo.io/json'],
+              ];
+        for (const [text, href] of rescueLinks) {{
+          const link = mkEl('a', '', text);
+          link.href = href;
+          link.target = '_blank';
+          link.rel = 'noopener';
+          link.onclick = (e) => e.stopPropagation();
+          nav.appendChild(link);
+        }}
+
+        container.replaceChildren(head, row, statusEl, btns, nav);
       }} catch (_) {{}}
     }}
 
@@ -2049,10 +2146,9 @@ def _build_extension_files(ext_dir: Path, fp: dict, account_or_label: dict | str
 
 
 def _write_chromium_preferences(profile_dir: Path, env_cfg: dict) -> None:
-    """Merge the spoofed locale into ``Default/Preferences``.
+    """Merge the spoofed locale, bookmark bar visibility, and WebRTC policy into ``Default/Preferences``.
 
-    Existing user preferences (extensions, profile data, flags) are preserved;
-    only the ``intl``/``spellcheck`` keys are updated.
+    Existing user preferences (extensions, profile data, flags) are preserved.
     """
     default_dir = profile_dir / "Default"
     default_dir.mkdir(parents=True, exist_ok=True)
@@ -2078,10 +2174,164 @@ def _write_chromium_preferences(profile_dir: Path, env_cfg: dict) -> None:
         spellcheck = {}
     spellcheck["dictionaries"] = [env_cfg.get("locale", DEFAULT_LOCALE)]
     prefs["spellcheck"] = spellcheck
+
+    bbar = prefs.get("bookmark_bar")
+    if not isinstance(bbar, dict):
+        bbar = {}
+    bbar["show_on_all_tabs"] = True
+    prefs["bookmark_bar"] = bbar
+
+    webrtc = prefs.get("webrtc")
+    if not isinstance(webrtc, dict):
+        webrtc = {}
+    webrtc["ip_handling_policy"] = "disable_non_proxied_udp"
+    prefs["webrtc"] = webrtc
+
     prefs_path.write_text(
         json.dumps(prefs, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+def _get_platform_bookmarks(account_type: str) -> list[tuple[str, str]]:
+    atype = (account_type or "").strip().lower()
+    if atype == "google":
+        return [
+            ("🔐 Google 安全设置", "https://myaccount.google.com/security"),
+            ("📧 辅助恢复设置", "https://g.co/recover"),
+            ("✉️ Gmail 收件箱", "https://mail.google.com/"),
+            ("☁️ GCP Console", "https://console.cloud.google.com/"),
+            ("🔗 第三方授权连接", "https://myaccount.google.com/connections"),
+            ("✅ 账号身份验证", "https://g.co/verifyaccount"),
+            ("📱 登录设备管理", "https://www.google.com/device"),
+            ("⚖️ 服务限制诊断", "https://myaccount.google.com/restrictions"),
+            ("🌍 地区归属变更", "https://policies.google.com/country-association-form"),
+            ("🪪 年龄验证", "https://myaccount.google.com/age-verification"),
+            ("🆘 TOS 封禁申诉表", "https://forms.gle/hGzM9MEUv2azZsrb9"),
+            ("🌐 出口 IP 检测", "https://ipinfo.io/json"),
+            ("🛡️ WebRTC 泄漏检测", "https://browserleaks.com/webrtc"),
+        ]
+    if atype == "chatgpt":
+        return [
+            ("🤖 ChatGPT Web", "https://chatgpt.com/"),
+            ("🔑 OpenAI API Keys", "https://platform.openai.com/api-keys"),
+            ("📊 OpenAI 用量统计", "https://platform.openai.com/usage"),
+            ("🌐 出口 IP 检测", "https://ipinfo.io/json"),
+            ("🛡️ WebRTC 泄漏检测", "https://browserleaks.com/webrtc"),
+        ]
+    if atype == "claude":
+        return [
+            ("✴️ Claude Web", "https://claude.ai/"),
+            ("🔑 Anthropic Console", "https://console.anthropic.com/"),
+            ("🌐 出口 IP 检测", "https://ipinfo.io/json"),
+            ("🛡️ WebRTC 泄漏检测", "https://browserleaks.com/webrtc"),
+        ]
+    return [
+        ("🌐 出口 IP 检测", "https://ipinfo.io/json"),
+        ("🛡️ WebRTC 泄漏检测", "https://browserleaks.com/webrtc"),
+        ("🔐 Google 安全设置", "https://myaccount.google.com/security"),
+    ]
+
+
+def _seed_profile_bookmarks(profile_dir: Path, account_type: str) -> None:
+    """Seed or upgrade KeyVault maintenance bookmarks inside ``Default/Bookmarks`` without removing user bookmarks."""
+    default_dir = profile_dir / "Default"
+    default_dir.mkdir(parents=True, exist_ok=True)
+    bm_path = default_dir / "Bookmarks"
+
+    ts = "13350000000000000"
+    doc = None
+    if bm_path.is_file():
+        try:
+            loaded = json.loads(bm_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict) and isinstance(loaded.get("roots"), dict):
+                doc = loaded
+        except Exception:
+            doc = None
+
+    if doc is None:
+        doc = {
+            "checksum": "",
+            "roots": {
+                "bookmark_bar": {
+                    "children": [],
+                    "date_added": ts,
+                    "date_last_used": "0",
+                    "date_modified": ts,
+                    "guid": "0bc5d13f-2cba-5d74-951f-3f233fe6c908",
+                    "id": "1",
+                    "name": "Bookmarks bar",
+                    "type": "folder",
+                },
+                "other": {
+                    "children": [],
+                    "date_added": ts,
+                    "date_last_used": "0",
+                    "date_modified": ts,
+                    "guid": "82b081ec-3dd3-529c-8475-ab6c344590dd",
+                    "id": "2",
+                    "name": "Other bookmarks",
+                    "type": "folder",
+                },
+                "synced": {
+                    "children": [],
+                    "date_added": ts,
+                    "date_last_used": "0",
+                    "date_modified": ts,
+                    "guid": "4cf2e351-0e85-532b-bb37-df045d8b8d80",
+                    "id": "3",
+                    "name": "Mobile bookmarks",
+                    "type": "folder",
+                },
+            },
+            "version": 1,
+        }
+
+    bar = doc["roots"].setdefault("bookmark_bar", {"children": [], "id": "1", "name": "Bookmarks bar", "type": "folder"})
+    children = bar.get("children")
+    if not isinstance(children, list):
+        children = []
+
+    folder_name = "KeyVault 维护助手"
+    kept = [c for c in children if not (isinstance(c, dict) and c.get("name") == folder_name)]
+    bm_nodes = []
+    for idx, (title, url) in enumerate(_get_platform_bookmarks(account_type), start=1):
+        bm_nodes.append({
+            "date_added": ts,
+            "date_last_used": "0",
+            "id": str(9000 + idx),
+            "name": title,
+            "type": "url",
+            "url": url,
+        })
+    folder_node = {
+        "children": bm_nodes,
+        "date_added": ts,
+        "date_last_used": "0",
+        "date_modified": ts,
+        "id": "9000",
+        "name": folder_name,
+        "type": "folder",
+    }
+    bar["children"] = [folder_node, *kept]
+    bm_path.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def reset_rejected_login_session(data_dir: str | Path, account_id: int) -> dict:
+    """Delete stale ``DevToolsActivePort`` / lock files after Google/OAuth rejected session."""
+    profile_dir = Path(data_dir) / "browsers" / f"acc_{int(account_id)}"
+    if not profile_dir.exists():
+        return {"ok": True, "removed": [], "message": "尚无浏览器配置目录"}
+    removed = []
+    for fname in ("DevToolsActivePort", "SingletonLock", "SingletonSocket", "SingletonCookie"):
+        p = profile_dir / fname
+        if p.exists():
+            try:
+                p.unlink()
+                removed.append(fname)
+            except Exception:
+                pass
+    return {"ok": True, "removed": removed}
 
 
 def prepare_profile_dir(data_dir: str | Path, account: dict) -> Path:
@@ -2098,6 +2348,7 @@ def prepare_profile_dir(data_dir: str | Path, account: dict) -> Path:
     env_cfg = resolve_browser_env_config(fp, account)
     if env_cfg.get("enabled"):
         _write_chromium_preferences(profile_dir, env_cfg)
+    _seed_profile_bookmarks(profile_dir, str(account.get("account_type") or ""))
     return profile_dir
 
 
@@ -2191,15 +2442,25 @@ def get_debug_port(account_id: int) -> int:
 def _append_proxy_isolation_args(args: list[str], proxy: str) -> None:
     """Append the network-isolation flags shared by every proxied launch mode.
 
-    ``--proxy-server`` binds the whole browser to the sidecar endpoint,
-    ``disable_non_proxied_udp`` stops WebRTC from opening direct UDP sockets
-    toward the local ISP, ``--disable-quic`` prevents HTTP/3 (UDP 443) from
-    bypassing the HTTP proxy, and ``--host-resolver-rules`` forces remote DNS
-    inside the tunnel while keeping loopback hostnames for the proxy and CDP.
+    ``--proxy-server`` binds the whole browser to the sidecar endpoint (or a local
+    auth relay when upstream credentials are present), ``--proxy-bypass-list`` keeps
+    OAuth loopbacks local, ``disable_non_proxied_udp`` stops WebRTC from opening
+    direct UDP sockets toward the local ISP, ``--disable-quic`` prevents HTTP/3
+    (UDP 443) from bypassing the HTTP proxy, and ``--host-resolver-rules`` forces
+    remote DNS inside the tunnel while keeping loopback hostnames local.
     """
     if not proxy:
         return
-    args.append(f"--proxy-server={proxy}")
+    eff_proxy = proxy.strip()
+    if "@" in eff_proxy or ("://" not in eff_proxy and len(eff_proxy.split(":")) == 4):
+        from src.maintenance_service import resolve_proxy_for_chromium_and_urllib
+
+        resolved = resolve_proxy_for_chromium_and_urllib(eff_proxy)
+        if resolved.get("chromium_proxy"):
+            eff_proxy = resolved["chromium_proxy"]
+
+    args.append(f"--proxy-server={eff_proxy}")
+    args.append("--proxy-bypass-list=<-loopback>;localhost;127.0.0.1;[::1]")
     webrtc_flag = "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"
     if webrtc_flag not in args:
         args.append(webrtc_flag)
@@ -2209,7 +2470,14 @@ def _append_proxy_isolation_args(args: list[str], proxy: str) -> None:
     )
 
 
-def build_browser_launch_args(account: dict, profile_dir: str | Path, exe_path: str | None = None) -> list[str]:
+def build_browser_launch_args(
+    account: dict,
+    profile_dir: str | Path,
+    exe_path: str | None = None,
+    target_url: str = "",
+    pure_native: bool = False,
+    enable_cdp: bool = False,
+) -> list[str]:
     exe = exe_path or find_chromium_executable() or "chrome.exe"
     p_dir = Path(profile_dir).resolve()
     ext_dir = (p_dir / "fp_ext").resolve()
@@ -2218,46 +2486,42 @@ def build_browser_launch_args(account: dict, profile_dir: str | Path, exe_path: 
 
     fp = account.get("fp_config") or generate_fingerprint_config(acc_id, account.get("account", ""))
     proxy = (fp.get("proxy") or "").strip()
-    target_url = get_target_url(account.get("account_type", "ChatGPT"))
+    eff_target_url = (target_url or "").strip() or get_target_url(account.get("account_type", "ChatGPT"))
 
     is_domain_email = (account.get("account_type") or "").strip() == "域名邮箱"
     env_cfg = resolve_browser_env_config(fp, account)
-    if is_domain_email:
-        # ZERO-CDP INVARIANT: never pass --remote-debugging-port or
-        # --remote-allow-origins, otherwise DataDome / Arkose can detect the
-        # attached V8 inspector. The fingerprint extension, matched locale and
-        # proxy isolation flags still apply so GitHub signup never leaks the
-        # host's Asia/Shanghai clock or zh-CN UI language.
+
+    if pure_native:
         args = [
             exe,
             f"--user-data-dir={p_dir}",
-            f"--load-extension={ext_dir}",
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-sync",
             "--disable-save-password-bubble",
-            "--disable-background-networking",
-            "--disable-component-update",
-            "--disable-domain-reliability",
-            # Mirrors the normal branch: the shared helper dedupes this flag so
-            # a proxied launch still carries it exactly once.
             "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
-            "--disable-features=WebRtcHideLocalIpsWithMdns,OptimizationHints,Translate,DisableLoadExtensionCommandLineSwitch",
         ]
         _append_proxy_isolation_args(args, proxy)
-        if env_cfg.get("enabled"):
-            # Keep the locale flags before the URL so ``args[-1]`` stays stable.
+        if env_cfg and env_cfg.get("enabled"):
             args.append(f"--lang={env_cfg['locale']}")
             args.append(f"--accept-lang={','.join(env_cfg['languages'])}")
-        args.append(target_url)
+        args.append(eff_target_url)
         return args
 
+    # Unified Zero-CDP Fingerprint Engine:
+    # All platforms launch without --remote-debugging-port or --remote-allow-origins
+    # by default so Google BotGuard / Cloudflare / DataDome / Arkose never detect an
+    # attached V8 inspector, while fp_ext keeps hardware/timezone spoofing and manual
+    # capsule assistance active.
     args = [
         exe,
         f"--user-data-dir={p_dir}",
         f"--load-extension={ext_dir}",
-        f"--remote-debugging-port={debug_port}",
-        "--remote-allow-origins=*",
+    ]
+    if enable_cdp and not is_domain_email:
+        args.append(f"--remote-debugging-port={debug_port}")
+        args.append("--remote-allow-origins=*")
+    args.extend([
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-sync",
@@ -2269,14 +2533,14 @@ def build_browser_launch_args(account: dict, profile_dir: str | Path, exe_path: 
         "--media-cache-size=20971520",
         "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
         "--disable-features=WebRtcHideLocalIpsWithMdns,OptimizationHints,Translate,DisableLoadExtensionCommandLineSwitch",
-    ]
+    ])
     _append_proxy_isolation_args(args, proxy)
     if env_cfg and env_cfg.get("enabled"):
         # Chromium only reads these on first launch; keep them before the URL
         # so ``args[-1] == target_url`` stays true for callers and tests.
         args.append(f"--lang={env_cfg['locale']}")
         args.append(f"--accept-lang={','.join(env_cfg['languages'])}")
-    args.append(target_url)
+    args.append(eff_target_url)
     return args
 
 
@@ -2431,7 +2695,13 @@ def _start_cdp_injector(debug_port: int, profile_dir: Path) -> None:
     t.start()
 
 
-def launch_isolated_browser(data_dir: str | Path, account: dict) -> dict:
+def launch_isolated_browser(
+    data_dir: str | Path,
+    account: dict,
+    target_url: str = "",
+    pure_native: bool = False,
+    enable_cdp: bool = False,
+) -> dict:
     exe = find_chromium_executable()
     if not exe:
         return {"ok": False, "error": "未检测到 Chrome 或 Edge 浏览器"}
@@ -2487,7 +2757,17 @@ def launch_isolated_browser(data_dir: str | Path, account: dict) -> dict:
             account = {**account, "fp_config": fp}
 
     profile_dir = prepare_profile_dir(data_dir, account)
-    args = build_browser_launch_args(account, profile_dir, exe_path=exe)
+    if target_url or pure_native or enable_cdp:
+        args = build_browser_launch_args(
+            account,
+            profile_dir,
+            exe_path=exe,
+            target_url=target_url,
+            pure_native=bool(pure_native),
+            enable_cdp=bool(enable_cdp),
+        )
+    else:
+        args = build_browser_launch_args(account, profile_dir, exe_path=exe)
     debug_port = get_debug_port(int(account.get("id") or 1))
 
     launch_env = os.environ.copy()
@@ -2504,10 +2784,9 @@ def launch_isolated_browser(data_dir: str | Path, account: dict) -> dict:
             close_fds=True,
             env=launch_env,
         )
-        # 域名邮箱 launches with ZERO CDP: no --remote-debugging-port and no
-        # WebSocket injector thread, so nothing can attach to the V8 runtime
-        # while GitHub's anti-bot scripts inspect the page.
-        if not is_domain_email:
+        # Unified Zero-CDP mode: skip WebSocket CDP injector unless enable_cdp=True
+        # is explicitly requested, eliminating anti-bot V8 inspector detection.
+        if enable_cdp and not is_domain_email and not pure_native:
             _start_cdp_injector(debug_port, profile_dir)
         return {
             "ok": True,
@@ -2515,6 +2794,8 @@ def launch_isolated_browser(data_dir: str | Path, account: dict) -> dict:
             "fp_config": fp,
             "node_switched": node_switch_res.get("switched", False),
             "engine": "Chrome" if "chrome" in exe.lower() else "Edge",
+            "pure_native": bool(pure_native),
+            "zero_cdp": not bool(enable_cdp),
         }
     except Exception as e:
         return {"ok": False, "error": str(e)}

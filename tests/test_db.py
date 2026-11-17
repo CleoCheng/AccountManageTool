@@ -395,3 +395,143 @@ def test_attributes_and_custom_fields(tmp_path: Path):
     search_res = svc.list_accounts(search="proj_888")
     assert len(search_res) == 1
     assert search_res[0]["account"] == "custom_team@workbuddy.ai"
+
+
+def test_security_checklist_and_credential_history_archiving(tmp_path: Path):
+    svc = DatabaseService(tmp_path / "data" / "accounts.db")
+    acc = svc.add_account({
+        "account_type": "Google",
+        "account": "sec.user@gmail.com",
+        "password": "OldPassword!1",
+        "recovery_email": "old.rec@example.com",
+        "secret_key": "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+        "recovery_password": "OldRecPwd!1",
+    })
+    assert acc["security"]["status"] == "unmodified"
+    assert acc["security"]["completed"] == 0
+
+    partial = svc.quick_update_credentials(acc["id"], {
+        "password": "NewStrongPassword#2026",
+        "password_modified": True,
+        "sec_recovery_modified": True,
+        "recovery_email": "new.rec@example.com",
+        "recovery_password": "NewRecPwd#2",
+    })
+    assert partial["security"]["status"] == "partial"
+    assert partial["security"]["completed"] == 2
+    assert partial["recovery_password"] == "NewRecPwd#2"
+
+    secured = svc.quick_update_credentials(acc["id"], {
+        "secret_key": "MFRGGZDFMZTWQ2LKMFRGGZDFMZTWQ2LK",
+        "twofa_modified": True,
+        "sec_devices_cleared": True,
+    })
+    assert secured["security"]["status"] == "secured"
+    assert secured["security"]["completed"] == 4
+    assert secured["initial_secret_key"] == "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
+
+    history = svc.get_credential_history(acc["id"])
+    assert len(history) == 2
+    assert history[0]["old_secret_key"] == "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
+    assert history[1]["old_password"] == "OldPassword!1"
+    assert history[1]["old_recovery_email"] == "old.rec@example.com"
+    assert history[1]["old_recovery_password"] == "OldRecPwd!1"
+
+
+def test_warming_lifecycle_and_risk_rewarm_reset(tmp_path: Path):
+    from datetime import date, timedelta
+    from src.db_service import compute_warming_info
+
+    svc = DatabaseService(tmp_path / "data" / "accounts.db")
+    today = date.today()
+    two_days_ago = (today - timedelta(days=2)).strftime("%Y-%m-%d")
+    ten_days_ago = (today - timedelta(days=10)).strftime("%Y-%m-%d")
+
+    w_new = compute_warming_info("", two_days_ago, "可用", {}, today_dt=today)
+    assert w_new["phase"] == "warming"
+    assert w_new["days_remaining"] == 5
+    assert w_new["ready"] is False
+
+    w_ready = compute_warming_info("", ten_days_ago, "可用", {}, today_dt=today)
+    assert w_ready["phase"] == "ready"
+    assert w_ready["ready"] is True
+
+    acc = svc.add_account({
+        "account_type": "Google",
+        "account": "warm_test@gmail.com",
+        "password": "pw",
+        "purchase_date": ten_days_ago,
+    })
+    assert acc["warming"]["phase"] == "ready"
+
+    risk_acc = svc.set_health_status(acc["id"], "人机")
+    assert risk_acc["warming"]["phase"] == "rewarm"
+    assert risk_acc["custom_fields"]["warming_reset_at"] == today.strftime("%Y-%m-%d")
+
+    svc.set_health_status(acc["id"], "可用")
+    scan_acc = svc.reset_warming_time(acc["id"], scan_qr_mode=True, reset_date=ten_days_ago)
+    assert scan_acc["warming"]["phase"] == "scan_qr"
+    assert scan_acc["warming"]["target_days"] == 30
+    assert scan_acc["warming"]["days_remaining"] == 20
+
+
+def test_batch_import_duplicate_strategies_and_top_recovery(tmp_path: Path):
+    svc = DatabaseService(tmp_path / "data" / "accounts.db")
+    svc.add_account({
+        "account_type": "Google",
+        "account": "Alice.Demo@gmail.com",
+        "password": "Pass1",
+        "recovery_email": "shared_rec@outlook.com",
+    })
+    svc.add_account({
+        "account_type": "Google",
+        "account": "other_demo@gmail.com",
+        "password": "Pass2",
+        "recovery_email": "shared_rec@outlook.com",
+    })
+
+    tops = svc.get_top_recovery_emails(5)
+    assert tops[0]["email"] == "shared_rec@outlook.com"
+    assert tops[0]["count"] == 2
+
+    # Gmail dot normalization matches Alice.Demo@gmail.com -> fill_empty fills empty secret_key
+    res_skip = svc.batch_import_accounts(
+        [{"account_type": "Google", "account": "alicedemo@gmail.com", "password": "New", "note": "filled"}],
+        duplicate_strategy="skip",
+    )
+    assert res_skip == {"imported": 0, "updated": 0, "skipped": 1}
+
+    res_fill = svc.batch_import_accounts(
+        [{"account_type": "Google", "account": "alicedemo@gmail.com", "password": "IgnoredPassword", "note": "filled"}],
+        duplicate_strategy="fill_empty",
+    )
+    assert res_fill == {"imported": 0, "updated": 1, "skipped": 0}
+    alice = svc.list_accounts(search="Alice.Demo")[0]
+    assert alice["password"] == "Pass1"
+    assert alice["note"] == "filled"
+
+    res_over = svc.batch_import_accounts(
+        [{"account_type": "Google", "account": "alicedemo@gmail.com", "password": "ReplacedPassword"}],
+        duplicate_strategy="overwrite",
+    )
+    assert res_over == {"imported": 0, "updated": 1, "skipped": 0}
+    alice_after = svc.list_accounts(search="Alice.Demo")[0]
+    assert alice_after["password"] == "ReplacedPassword"
+    assert svc.get_credential_history(alice_after["id"])[0]["old_password"] == "Pass1"
+
+
+def test_rolling_backups_and_restore(tmp_path: Path):
+    svc = DatabaseService(tmp_path / "data" / "accounts.db")
+    a1 = svc.add_account({"account_type": "ChatGPT", "account": "keep@example.com", "password": "p1"})
+    bak = svc.create_rolling_backup(reason="unit", max_keep=5, min_interval_minutes=0)
+    assert bak["ok"] is True
+
+    svc.add_account({"account_type": "ChatGPT", "account": "temp@example.com", "password": "p2"})
+    assert len(svc.list_accounts()) == 2
+
+    restore_res = svc.restore_backup(bak["filename"])
+    assert restore_res["ok"] is True
+    accounts = svc.list_accounts()
+    assert len(accounts) == 1
+    assert accounts[0]["id"] == a1["id"]
+    assert any("pre_restore" in b["filename"] for b in svc.list_backups())

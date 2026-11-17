@@ -28,6 +28,14 @@ const state = {
   _initialFilterRestored: false,
   nodeCodeStats: {},
   autoMailCodePolling: false,
+  // Maintenance, Warming, OAuth & Appeal State
+  topRecoveryEmails: [],
+  appealChannels: [],
+  activeQuickCredAccountId: null,
+  activeRtAccountId: null,
+  oauthSessionId: "",
+  oauthAuthUrl: "",
+  oauthPollTimer: null,
   // System Settings State
   currentDictTab: "account_type",
   editingDictId: null,
@@ -97,6 +105,13 @@ async function loadDashboard() {
     state.accounts = data.accounts || [];
     if (data.node_code_stats) {
       state.nodeCodeStats = data.node_code_stats;
+    }
+    if (Array.isArray(data.top_recovery_emails)) {
+      state.topRecoveryEmails = data.top_recovery_emails;
+      syncRecoveryEmailDatalist();
+    }
+    if (Array.isArray(data.appeal_channels)) {
+      state.appealChannels = data.appeal_channels;
     }
     updateWorkBuddyQueue(data.workbuddy);
     state.stats = data.stats || { total: 0, google: 0, chatgpt: 0, types: {}, devices: {}, other: 0, active: 0, deactivated: 0, available: 0, unavailable: 0, health: {}, antigravity: {} };
@@ -985,6 +1000,15 @@ function renderCardItem(item, remaining) {
       </span>`
     : "";
 
+  const secInfo = item.security || { status: "unmodified", label: "⚠️ 未改密", completed: 0, total: 4 };
+  const warmInfo = item.warming || { phase: "ready", label: "可改密", hint: "" };
+  const secBadgeHtml = `<button class="sec-badge sec-${escapeHtml(secInfo.status)}" onclick="openQuickCredModal(${item.id})" title="点击进入4步安全改密与历史凭据归档 (${secInfo.completed || 0}/4)">${escapeHtml(secInfo.label)}</button>`;
+  const warmBadgeHtml = `<button class="warm-badge warm-${escapeHtml(warmInfo.phase)}" onclick="openQuickCredModal(${item.id})" title="${escapeHtml(warmInfo.hint || warmInfo.label)}">🌱 ${escapeHtml(warmInfo.label)}</button>`;
+  const rtBadgeHtml =
+    item.account_type === "Google" && (item.has_rt || (item.gcp_status && item.gcp_status !== "none"))
+      ? `<button class="rt-pill rt-${escapeHtml(item.rt_status || "none")}" onclick="openRtOAuthModal(${item.id})" title="RT 状态: ${escapeHtml(item.rt_status || "none")} · GCP: ${escapeHtml(item.gcp_status || "none")} · 订阅: ${escapeHtml(item.subscription_plan || "Free")}">🛸 ${escapeHtml(item.rt_status === "active" ? (item.gcp_status === "validation" ? "需验证" : (item.subscription_plan || "RT在线")) : (item.rt_status || "RT"))}</button>`
+      : "";
+
   return `
     <article class="u-card health-border-${hMeta.key} ag-card-${showAgBadge ? agMeta.key : "none"} ${isDeactivated ? "is-deactivated" : ""}" data-id="${item.id}">
       <!-- Line 1: Header (Account Identity & 1-Click Health Status Badge) -->
@@ -1009,12 +1033,13 @@ function renderCardItem(item, remaining) {
       <!-- Line 2: Security Flags & Antigravity Option Marker Row -->
       <div class="u-sec-row">
         <div class="u-sec-left">
-          <span class="u-sec-label">安全状态:</span>
+          ${secBadgeHtml}
           ${pwdFlagHtml}
           ${twofaFlagHtml}
         </div>
         <div class="u-sec-right" style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
           ${renderWorkBuddyItemBadges(item)}
+          ${rtBadgeHtml}
           ${showDevBadge ? devBadgeHtml : ""}
           ${showAgBadge ? agBadgeHtml : ""}
         </div>
@@ -1022,7 +1047,7 @@ function renderCardItem(item, remaining) {
 
       <!-- Line 3: Usage Timeline & Proxy Node Row (时长与绑定节点独立行) -->
       <div class="u-status-row">
-        <div class="u-status-left">
+        <div class="u-status-left" style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
           <span class="u-usage-badge ${usage.status}">
             <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2">
               <circle cx="12" cy="12" r="10"></circle>
@@ -1030,6 +1055,7 @@ function renderCardItem(item, remaining) {
             </svg>
             ${escapeHtml(statusText)}
           </span>
+          ${warmBadgeHtml}
         </div>
         <div class="u-status-right">
           <button class="u-node-pill ${fpInfo.locked ? "locked" : ""} ${isUnboundClaude ? "unbound-warn" : ""}" onclick="openNodeModal(${item.id})" title="专属代理节点">
@@ -1066,6 +1092,17 @@ function renderCardItem(item, remaining) {
         </div>
 
         <div class="u-card-tools">
+          <button class="tool-link" onclick="openQuickCredModal(${item.id})" title="4步安全改密、养号进度与历史凭据">🛡️ 养护</button>
+          ${
+            item.account_type === "Google"
+              ? `<button class="tool-link" onclick="openRtOAuthModal(${item.id})" title="Antigravity RT 探测与 OAuth 授权">🛸 RT</button>`
+              : ""
+          }
+          ${
+            (item.account_type === "ChatGPT" || item.account_type === "Claude") && item.has_ai_cred
+              ? `<button class="tool-link" onclick="onClickProbeAiAccount(${item.id})" title="检测 API Key / Session Token 活性">🩺 测活</button>`
+              : ""
+          }
           ${
             item.account_type === "域名邮箱"
               ? `<button class="tool-link danger" onclick="confirmResetDomainEmailNodes(${item.id})" title="重置该邮箱绑定的代理节点与收码记录">重置节点</button>`
@@ -1233,6 +1270,7 @@ function renderTableView(remaining, list = state.accounts) {
           <td>
             <div class="tb-col-security">
               <div class="tb-sec-flags">
+                <button class="sec-badge sec-${escapeHtml((item.security || {}).status || "unmodified")}" onclick="openQuickCredModal(${item.id})" title="点击打开4步安全加固与历史凭据">${escapeHtml((item.security || {}).label || "⚠️ 未改密")}</button>
                 <button class="u-2fa-flag ${isPwdModified ? "modified" : "unmodified"}" onclick="toggleCardPasswordModified(${item.id}, ${isPwdModified ? 0 : 1})" title="密码修改状态">
                   ${isPwdModified ? "🔑 改✓" : "🔑 初始"}
                 </button>
@@ -1246,6 +1284,7 @@ function renderTableView(remaining, list = state.accounts) {
               </div>
               <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap;">
                 ${showAgBadge ? agBadgeTableHtml : ""}
+                <button class="warm-badge warm-${escapeHtml((item.warming || {}).phase || "ready")}" onclick="openQuickCredModal(${item.id})" title="${escapeHtml((item.warming || {}).hint || "")}">🌱 ${escapeHtml((item.warming || {}).label || "可改密")}</button>
                 <span class="u-usage-badge ${usage.status}">${escapeHtml(usage.duration_text)}</span>
               </div>
             </div>
@@ -1278,6 +1317,17 @@ function renderTableView(remaining, list = state.accounts) {
             <div class="tb-col-actions">
               <button class="btn-browser tb-btn-browser" onclick="onClickLaunchBrowser(${item.id}, this)" title="${escapeHtml(fpInfo.tooltip)}">🌐 启动</button>
               <div class="u-card-tools tb-tools">
+                <button class="tool-link" onclick="openQuickCredModal(${item.id})" title="4步安全改密与养号进度">养护</button>
+                ${
+                  item.account_type === "Google"
+                    ? `<button class="tool-link" onclick="openRtOAuthModal(${item.id})" title="RT 诊断与 OAuth 授权">RT</button>`
+                    : ""
+                }
+                ${
+                  (item.account_type === "ChatGPT" || item.account_type === "Claude") && item.has_ai_cred
+                    ? `<button class="tool-link" onclick="onClickProbeAiAccount(${item.id})" title="测活 API/Session">测活</button>`
+                    : ""
+                }
                 ${
                   item.account_type === "域名邮箱"
                     ? `<button class="tool-link danger" onclick="confirmResetDomainEmailNodes(${item.id})" title="重置该邮箱绑定的代理节点">重置节点</button>`
@@ -1723,8 +1773,9 @@ function startZeroOverheadTotpTicker() {
   const remEl = document.getElementById("global-remaining");
 
   setInterval(async () => {
-    const nowSec = Math.floor(Date.now() / 1000);
-    const remaining = 30 - (nowSec % 30);
+    const totpOffsetSec = Number(state.settings?.totp_offset_seconds || 0);
+    const nowSec = Math.floor(Date.now() / 1000) + totpOffsetSec;
+    const remaining = 30 - (((nowSec % 30) + 30) % 30);
     const currentSlot = Math.floor(nowSec / 30);
 
     if (remEl) remEl.textContent = remaining;
@@ -2172,6 +2223,10 @@ function openEditModal(accountId) {
   document.getElementById("field-year").value = item.reg_year || "";
   document.getElementById("field-region").value = item.reg_region || "";
   document.getElementById("field-note").value = item.note || "";
+  const recPwdEl = document.getElementById("field-recovery-password");
+  if (recPwdEl) recPwdEl.value = (item.custom_fields && item.custom_fields.recovery_password) || "";
+  const apiKeyEl = document.getElementById("field-api-key");
+  if (apiKeyEl) apiKeyEl.value = (item.custom_fields && (item.custom_fields.api_key || item.custom_fields.session_token)) || "";
   const isLocked = !!(item.fp_config && item.fp_config.node_locked);
   const proxyInput = document.getElementById("field-proxy");
   proxyInput.value = (item.fp_config && item.fp_config.proxy) || "";
@@ -2240,6 +2295,12 @@ function resetFormFields() {
   document.getElementById("field-year").value = "";
   document.getElementById("field-region").value = "";
   document.getElementById("field-note").value = "";
+  const recPwdEl = document.getElementById("field-recovery-password");
+  if (recPwdEl) recPwdEl.value = "";
+  const apiKeyEl = document.getElementById("field-api-key");
+  if (apiKeyEl) apiKeyEl.value = "";
+  const personaPrev = document.getElementById("persona-preview-text");
+  if (personaPrev) personaPrev.textContent = "";
   const proxyInput = document.getElementById("field-proxy");
   proxyInput.value = "";
   proxyInput.disabled = false;
@@ -2283,7 +2344,15 @@ async function pasteFromClipboard() {
 }
 
 function normalizeSecretString(val) {
-  return String(val || "").replace(/[\s\-]+/g, "").toUpperCase();
+  let raw = String(val || "").trim();
+  if (/^otpauth:\/\//i.test(raw)) {
+    try {
+      const u = new URL(raw);
+      const sec = u.searchParams.get("secret");
+      if (sec) raw = sec;
+    } catch (_) {}
+  }
+  return raw.replace(/[\s\-]+/g, "").toUpperCase();
 }
 
 let smartParseRevision = 0;
@@ -2419,6 +2488,19 @@ async function submitAccountForm(e) {
       custom_fields[attr.attr_key] = dynVals[attr.attr_key];
     }
   });
+  const recPwdVal = (document.getElementById("field-recovery-password")?.value || "").trim();
+  const apiKeyOrSessionVal = (document.getElementById("field-api-key")?.value || "").trim();
+  if (recPwdVal || document.getElementById("field-id").value) {
+    custom_fields.recovery_password = recPwdVal;
+  }
+  if (apiKeyOrSessionVal.startsWith("sk-")) {
+    custom_fields.api_key = apiKeyOrSessionVal;
+  } else if (apiKeyOrSessionVal) {
+    custom_fields.session_token = apiKeyOrSessionVal;
+  } else if (document.getElementById("field-id").value) {
+    custom_fields.api_key = "";
+    custom_fields.session_token = "";
+  }
 
   const payload = {
     id: document.getElementById("field-id").value || null,
@@ -2459,11 +2541,16 @@ async function submitAccountForm(e) {
 async function confirmBatchImport() {
   const rawText = document.getElementById("smart-paste-input").value;
   if (!rawText.trim()) return;
+  const strategy = document.getElementById("batch-dup-strategy")?.value || "skip";
   try {
-    const res = await callApi("batch_import", rawText, state.importAccountType);
+    const res = await callApi("batch_import", rawText, state.importAccountType, strategy);
     if (res.ok) {
       closeAccountModal();
-      showToast(`✓ 成功批量导入 ${res.imported} 条账号记录`);
+      const parts = [];
+      if (res.imported) parts.push(`新增 ${res.imported} 条`);
+      if (res.updated) parts.push(`更新 ${res.updated} 条`);
+      if (res.skipped) parts.push(`跳过 ${res.skipped} 条`);
+      showToast(`✓ 批量导入完成：${parts.join("，") || `导入 ${res.imported} 条`}`);
       await loadDashboard();
     } else {
       showToast(res.error || "批量导入失败");
@@ -2568,6 +2655,13 @@ function openSettingsModal() {
   syncCustomSelect(document.getElementById("set-totp-interval"));
   syncCustomSelect(selPlat);
   syncCustomSelect(selDev);
+
+  const offsetEl = document.getElementById("lbl-totp-offset");
+  if (offsetEl) {
+    const off = Number(state.settings?.totp_offset_seconds || 0);
+    offsetEl.textContent = `${off > 0 ? "+" : ""}${off} 秒`;
+  }
+  loadBackupsList();
 }
 
 function closeSettingsModal() {
@@ -2931,6 +3025,21 @@ document.addEventListener("click", (e) => {
 window.addEventListener("keydown", (e) => {
   if (e.key === "Escape" || e.keyCode === 27) {
     closeAllCustomSelects();
+    const quickCredModal = document.getElementById("quick-cred-modal");
+    if (quickCredModal && quickCredModal.style.display !== "none") {
+      closeQuickCredModal();
+      return;
+    }
+    const rtOAuthModal = document.getElementById("rt-oauth-modal");
+    if (rtOAuthModal && rtOAuthModal.style.display !== "none") {
+      closeRtOAuthModal();
+      return;
+    }
+    const appealModal = document.getElementById("appeal-modal");
+    if (appealModal && appealModal.style.display !== "none") {
+      closeAppealModal();
+      return;
+    }
     const dictEditModal = document.getElementById("dict-edit-modal");
     if (dictEditModal && dictEditModal.style.display !== "none") {
       closeDictEditModal();
@@ -3518,4 +3627,774 @@ function renderCustomDrawerRows(item) {
     }
   });
   return rows.join("");
+}
+
+
+// ============================================================
+// MAINTENANCE, WARMING, BACKUPS, CLOCK SYNC, RT/OAUTH & APPEALS
+// ============================================================
+
+function copyPlainText(val, label = "内容") {
+  const text = String(val || "");
+  if (!text) return;
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(() => showToast(`📋 已复制${label}`)).catch(() => {
+        _fallbackCopy(text, label);
+      });
+      return;
+    }
+  } catch (_) {}
+  _fallbackCopy(text, label);
+}
+
+function _fallbackCopy(text, label) {
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.cssText = "position:fixed;left:-9999px;top:-9999px;opacity:0;";
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand("copy");
+    ta.remove();
+    showToast(`📋 已复制${label}`);
+  } catch (_) {
+    showToast("复制失败，请手动复制");
+  }
+}
+
+function syncRecoveryEmailDatalist() {
+  const dl = document.getElementById("recovery-email-suggestions");
+  if (!dl) return;
+  const list = state.topRecoveryEmails || [];
+  dl.innerHTML = list
+    .map((x) => `<option value="${escapeHtml(x.email)}">使用 ${x.count} 次</option>`)
+    .join("");
+}
+
+async function onClickGeneratePersona() {
+  const region = document.getElementById("persona-region")?.value || "US";
+  const curType = getRadioType();
+  const domain = curType === "Google" ? "gmail.com" : "outlook.com";
+  try {
+    const res = await callApi("generate_account_persona", region, domain);
+    if (!res.ok || !res.persona) return;
+    const p = res.persona;
+    const accEl = document.getElementById("field-account");
+    const pwdEl = document.getElementById("field-password");
+    const regEl = document.getElementById("field-region");
+    const yearEl = document.getElementById("field-year");
+    const noteEl = document.getElementById("field-note");
+    if (accEl && !accEl.value.trim()) accEl.value = p.suggested_email;
+    if (pwdEl) pwdEl.value = p.password;
+    if (regEl && !regEl.value.trim()) regEl.value = p.country;
+    if (yearEl && !yearEl.value.trim()) yearEl.value = String(new Date().getFullYear());
+    if (noteEl && !noteEl.value.trim()) noteEl.value = `${p.full_name} · ${p.gender_label} · ${p.birth_date}`;
+    const prevEl = document.getElementById("persona-preview-text");
+    if (prevEl) {
+      prevEl.textContent = `${p.full_name} (${p.gender_label}) · 生日 ${p.birth_date} · 建议邮箱 ${p.suggested_email}`;
+    }
+    copyPlainText(`${p.full_name} / ${p.birth_date} / ${p.password}`, "拟真身份资料");
+  } catch (err) {
+    showToast("生成身份失败: " + err.message);
+  }
+}
+
+async function onClickFillStrongPassword() {
+  try {
+    const res = await callApi("generate_strong_password", 16);
+    if (res && res.password) {
+      const pwdEl = document.getElementById("field-password");
+      if (pwdEl) pwdEl.value = res.password;
+      copyPlainText(res.password, "16位强密码");
+    }
+  } catch (err) {
+    showToast("生成强密失败: " + err.message);
+  }
+}
+
+async function onClickSyncGoogleTime() {
+  const btn = document.getElementById("btn-sync-google-time");
+  if (btn) btn.disabled = true;
+  try {
+    const res = await callApi("sync_google_time", "");
+    if (res && res.ok) {
+      state.settings = { ...(state.settings || {}), totp_offset_seconds: res.offset_seconds };
+      const offsetEl = document.getElementById("lbl-totp-offset");
+      if (offsetEl) {
+        const off = Number(res.offset_seconds || 0);
+        offsetEl.textContent = `${off > 0 ? "+" : ""}${off} 秒`;
+      }
+      showToast(`⏱️ 时间同步成功，已校准偏差 ${res.offset_seconds} 秒`);
+      await loadDashboard();
+    } else {
+      showToast("同步失败: " + (res?.error || "无法连接 Google 服务器"));
+    }
+  } catch (err) {
+    showToast("同步时间异常: " + err.message);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function loadBackupsList() {
+  const box = document.getElementById("settings-backup-list");
+  if (!box) return;
+  try {
+    const res = await callApi("list_backups");
+    const list = (res && res.backups) || [];
+    if (!list.length) {
+      box.innerHTML = `<div class="backup-empty">暂无历史备份文件</div>`;
+      return;
+    }
+    box.innerHTML = list
+      .map(
+        (b) => `
+        <div class="backup-row">
+          <div class="backup-meta">
+            <strong>${escapeHtml(b.filename)}</strong>
+            <span>${escapeHtml(b.created_at)} · ${(Number(b.size_bytes || 0) / 1024).toFixed(1)} KB</span>
+          </div>
+          <button type="button" class="btn btn-secondary btn-xs" onclick="onClickRestoreBackup('${escapeHtml(b.filename)}')">
+            ♻️ 恢复到此版本
+          </button>
+        </div>
+      `
+      )
+      .join("");
+  } catch (err) {
+    box.innerHTML = `<div class="backup-empty">加载失败: ${escapeHtml(err.message)}</div>`;
+  }
+}
+
+async function onClickCreateBackup() {
+  try {
+    const res = await callApi("create_backup", "manual");
+    if (res && res.ok) {
+      showToast(`💾 备份已创建: ${res.filename}`);
+      await loadBackupsList();
+    } else {
+      showToast("创建备份失败: " + (res?.error || "未知错误"));
+    }
+  } catch (err) {
+    showToast("备份异常: " + err.message);
+  }
+}
+
+async function onClickRestoreBackup(filename) {
+  if (!confirm(`确定恢复数据库到备份 [${filename}] 吗？\n系统会在恢复前自动创建一个 pre_restore 安全保护备份。`)) return;
+  try {
+    const res = await callApi("restore_backup", filename);
+    if (res && res.ok) {
+      showToast(`♻️ 已恢复到 ${res.restored}`);
+      closeSettingsModal();
+      await loadDashboard();
+    } else {
+      showToast("恢复失败: " + (res?.error || "未知错误"));
+    }
+  } catch (err) {
+    showToast("恢复异常: " + err.message);
+  }
+}
+
+// --- Quick Credential & Warming Modal ---
+
+async function openQuickCredModal(accountId) {
+  const acc = state.accounts.find((a) => a.id === accountId);
+  if (!acc) return;
+  state.activeQuickCredAccountId = accountId;
+
+  document.getElementById("qc-account-id").value = String(accountId);
+  document.getElementById("qc-modal-title").textContent = `🛡️ 养护与快捷改密 · ${acc.account}`;
+  document.getElementById("qc-modal-subtitle").textContent = `${acc.account_type} · 当前健康状态: ${acc.health_status || "可用"}`;
+
+  const warm = acc.warming || { phase: "ready", label: "可改密", hint: "" };
+  const wb = document.getElementById("qc-warming-badge");
+  wb.className = `warm-badge warm-${warm.phase}`;
+  wb.textContent = `🌱 ${warm.label}`;
+  document.getElementById("qc-warming-hint").textContent = warm.hint || "";
+  document.getElementById("qc-scan-qr-mode").checked = !!(acc.custom_fields && acc.custom_fields.scan_qr_mode);
+
+  const sec = acc.security || {};
+  document.getElementById("qc-sec-pwd").checked = !!acc.password_modified;
+  document.getElementById("qc-sec-2fa").checked = !!acc.twofa_modified;
+  document.getElementById("qc-sec-recovery").checked = !!sec.recovery_modified;
+  document.getElementById("qc-sec-devices").checked = !!sec.devices_cleared;
+
+  document.getElementById("qc-password").value = acc.password || "";
+  document.getElementById("qc-secret").value = acc.secret_key || "";
+  document.getElementById("qc-recovery-email").value = acc.recovery_email || "";
+  document.getElementById("qc-recovery-password").value = acc.recovery_password || "";
+  document.getElementById("qc-note").value = acc.note || "";
+  onQcSecretInput(acc.secret_key || "");
+
+  const chipsEl = document.getElementById("qc-top-recovery-chips");
+  if (chipsEl) {
+    const tops = state.topRecoveryEmails || [];
+    chipsEl.innerHTML = tops.length
+      ? tops
+          .slice(0, 6)
+          .map(
+            (x) =>
+              `<button type="button" class="recovery-chip" onclick="document.getElementById('qc-recovery-email').value='${escapeHtml(
+                x.email
+              )}'" title="已使用 ${x.count} 次">${escapeHtml(x.email)} (${x.count})</button>`
+          )
+          .join("")
+      : "";
+  }
+
+  document.getElementById("quick-cred-modal").style.display = "flex";
+  await loadQuickCredHistory(accountId);
+}
+
+function closeQuickCredModal() {
+  const modal = document.getElementById("quick-cred-modal");
+  if (modal) modal.style.display = "none";
+}
+
+async function loadQuickCredHistory(accountId) {
+  const listEl = document.getElementById("qc-history-list");
+  const countEl = document.getElementById("qc-history-count");
+  if (!listEl) return;
+  try {
+    const res = await callApi("get_credential_history", accountId);
+    const hist = (res && res.history) || [];
+    if (countEl) countEl.textContent = `${hist.length} 条记录`;
+    if (!hist.length) {
+      listEl.innerHTML = `<div class="backup-empty">暂无历史变更记录（修改密码 / 2FA / 辅助邮箱后将自动归档旧凭据）</div>`;
+      return;
+    }
+    listEl.innerHTML = hist
+      .map((h) => {
+        const parts = [];
+        if (h.old_password) {
+          parts.push(`<span class="hist-chip" onclick="copyPlainText('${escapeHtml(h.old_password)}','历史密码')" title="点击复制旧密码">🔑 ${escapeHtml(h.old_password)}</span>`);
+        }
+        if (h.old_secret_key) {
+          parts.push(`<span class="hist-chip" onclick="copyPlainText('${escapeHtml(h.old_secret_key)}','历史2FA')" title="点击复制旧2FA">🛡️ ${escapeHtml(h.old_secret_key)}</span>`);
+        }
+        if (h.old_recovery_email) {
+          parts.push(`<span class="hist-chip" onclick="copyPlainText('${escapeHtml(h.old_recovery_email)}','历史辅助邮箱')" title="点击复制旧辅助邮箱">📧 ${escapeHtml(h.old_recovery_email)}</span>`);
+        }
+        if (h.old_recovery_password) {
+          parts.push(`<span class="hist-chip" onclick="copyPlainText('${escapeHtml(h.old_recovery_password)}','历史辅助密码')" title="点击复制旧辅助邮箱密码">🔐 ${escapeHtml(h.old_recovery_password)}</span>`);
+        }
+        return `
+          <div class="cred-history-item">
+            <div class="cred-history-meta">
+              <span>${escapeHtml(h.created_at || "")}</span>
+              <span class="hist-reason">${escapeHtml(h.reason || "update")}</span>
+            </div>
+            <div class="cred-history-vals">${parts.join("")}</div>
+          </div>
+        `;
+      })
+      .join("");
+  } catch (err) {
+    listEl.innerHTML = `<div class="backup-empty">加载失败: ${escapeHtml(err.message)}</div>`;
+  }
+}
+
+async function onQcSecretInput(val) {
+  const el = document.getElementById("qc-totp-preview");
+  if (!el) return;
+  const cleaned = normalizeSecretString(val);
+  if (!cleaned) {
+    el.textContent = "实时验证码预览: 无";
+    return;
+  }
+  try {
+    const res = await callApi("preview_totp", cleaned);
+    if (res && res.totp && res.totp.valid) {
+      el.textContent = `✓ 当前动态码: ${formatTotpCode(res.totp.code)} (剩余 ${res.totp.remaining}s)`;
+    } else {
+      el.textContent = "⚠ 非标准 Base32 格式";
+    }
+  } catch (_) {}
+}
+
+async function onClickQcGenPassword() {
+  try {
+    const res = await callApi("generate_strong_password", 16);
+    if (res && res.password) {
+      document.getElementById("qc-password").value = res.password;
+      document.getElementById("qc-sec-pwd").checked = true;
+      copyPlainText(res.password, "16位强密码");
+    }
+  } catch (err) {
+    showToast("生成密码失败: " + err.message);
+  }
+}
+
+async function onClickQcGenSecret() {
+  try {
+    const res = await callApi("generate_strong_password", 16);
+    if (res && res.secret_key) {
+      document.getElementById("qc-secret").value = res.secret_key;
+      document.getElementById("qc-sec-2fa").checked = true;
+      onQcSecretInput(res.secret_key);
+      copyPlainText(res.secret_key, "2FA密钥");
+    }
+  } catch (err) {
+    showToast("生成密钥失败: " + err.message);
+  }
+}
+
+async function onClickResetWarming() {
+  const accountId = Number(document.getElementById("qc-account-id").value);
+  if (!accountId) return;
+  const scanQr = !!document.getElementById("qc-scan-qr-mode")?.checked;
+  try {
+    const res = await callApi("reset_warming_time", accountId, scanQr, "");
+    if (res && res.ok) {
+      showToast("🔄 已从今日重新开始计算养号周期");
+      await loadDashboard();
+      openQuickCredModal(accountId);
+    }
+  } catch (err) {
+    showToast("重置养号计时失败: " + err.message);
+  }
+}
+
+async function saveQuickCredModal(e) {
+  e.preventDefault();
+  const accountId = Number(document.getElementById("qc-account-id").value);
+  if (!accountId) return;
+  const payload = {
+    password: document.getElementById("qc-password").value.trim(),
+    secret_key: normalizeSecretString(document.getElementById("qc-secret").value),
+    recovery_email: document.getElementById("qc-recovery-email").value.trim(),
+    recovery_password: document.getElementById("qc-recovery-password").value.trim(),
+    note: document.getElementById("qc-note").value.trim(),
+    password_modified: document.getElementById("qc-sec-pwd").checked ? 1 : 0,
+    twofa_modified: document.getElementById("qc-sec-2fa").checked ? 1 : 0,
+    sec_recovery_modified: !!document.getElementById("qc-sec-recovery").checked,
+    sec_devices_cleared: !!document.getElementById("qc-sec-devices").checked,
+    scan_qr_mode: !!document.getElementById("qc-scan-qr-mode").checked,
+    reason: "quick_edit",
+  };
+  try {
+    const res = await callApi("quick_update_credentials", accountId, payload);
+    if (res && res.ok) {
+      showToast("🛡️ 安全凭据已保存（旧凭据已自动归档历史）");
+      closeQuickCredModal();
+      await loadDashboard();
+    } else {
+      showToast("保存失败: " + (res?.error || "未知错误"));
+    }
+  } catch (err) {
+    showToast("保存异常: " + err.message);
+  }
+}
+
+// --- Antigravity / GCP RT Diagnostic & OAuth Workbench ---
+
+function openRtOAuthModal(accountId = null) {
+  const modal = document.getElementById("rt-oauth-modal");
+  if (!modal) return;
+
+  const googleAccs = state.accounts.filter((a) => a.account_type === "Google");
+  const pool = googleAccs.length ? googleAccs : state.accounts;
+  const sel = document.getElementById("rt-modal-account-select");
+  if (sel) {
+    sel.innerHTML = pool
+      .map(
+        (a) =>
+          `<option value="${a.id}">${escapeHtml(a.account)} (${escapeHtml(a.account_type)}${a.has_rt ? " · 已绑RT" : ""})</option>`
+      )
+      .join("");
+    if (accountId && pool.some((a) => a.id === accountId)) {
+      sel.value = String(accountId);
+    }
+  }
+  const chosenId = Number(sel?.value || accountId || (pool[0] && pool[0].id) || 0);
+  state.activeRtAccountId = chosenId || null;
+  onRtAccountSelectChange(chosenId);
+  const pre = document.getElementById("rt-probe-result");
+  if (pre) pre.style.display = "none";
+  modal.style.display = "flex";
+}
+
+function closeRtOAuthModal() {
+  const modal = document.getElementById("rt-oauth-modal");
+  if (modal) modal.style.display = "none";
+}
+
+function onRtAccountSelectChange(val) {
+  const accId = Number(val || 0);
+  state.activeRtAccountId = accId || null;
+  const acc = state.accounts.find((a) => a.id === accId);
+  const banner = document.getElementById("rt-account-status-banner");
+  const ta = document.getElementById("rt-json-textarea");
+  if (!acc) {
+    if (banner) banner.textContent = "请先添加一个 Google 账号";
+    if (ta) ta.value = "";
+    return;
+  }
+  const cf = acc.custom_fields || {};
+  if (ta) ta.value = cf.rt_json || "";
+  if (banner) {
+    const proxyTxt = (acc.fp_config && acc.fp_config.proxy) ? acc.fp_config.proxy : "直连(无代理)";
+    const tzTxt = (acc.fp_config && acc.fp_config.timezone) ? acc.fp_config.timezone : "默认时区";
+    banner.innerHTML = `
+      <span><strong>RT:</strong> ${escapeHtml(acc.rt_status || "none")}</span>
+      <span><strong>GCP:</strong> ${escapeHtml(acc.gcp_status || "none")}</span>
+      <span><strong>订阅:</strong> ${escapeHtml(acc.subscription_plan || "Free")}</span>
+      <span><strong>代理:</strong> ${escapeHtml(proxyTxt)} (${escapeHtml(tzTxt)})</span>
+      ${cf.rt_last_checked ? `<span><strong>上次探测:</strong> ${escapeHtml(cf.rt_last_checked)}</span>` : ""}
+    `;
+  }
+}
+
+async function onClickStartBuiltinOAuth() {
+  const accId = Number(document.getElementById("rt-modal-account-select")?.value || state.activeRtAccountId || 0);
+  if (!accId) {
+    showToast("请先选择一个 Google 账号");
+    return;
+  }
+  const pureNative = !!document.getElementById("rt-oauth-pure-native")?.checked;
+  const statusEl = document.getElementById("oauth-loopback-status");
+  try {
+    const res = await callApi("start_builtin_oauth", accId, true, pureNative);
+    if (!res || !res.ok) {
+      showToast("启动 OAuth 失败: " + (res?.error || "未知错误"));
+      return;
+    }
+    state.oauthSessionId = res.session_id;
+    state.oauthAuthUrl = res.auth_url;
+    document.getElementById("btn-cancel-oauth").style.display = "inline-flex";
+    document.getElementById("btn-copy-oauth-url").style.display = "inline-flex";
+    if (statusEl) {
+      statusEl.textContent = `⏳ 已在隔离浏览器打开授权页，正在本地监听回调 (${res.redirect_uri})...`;
+    }
+    startOAuthStatusPoller(res.session_id, accId);
+  } catch (err) {
+    showToast("启动 OAuth 异常: " + err.message);
+  }
+}
+
+function startOAuthStatusPoller(sessionId, accId) {
+  if (state.oauthPollTimer) clearInterval(state.oauthPollTimer);
+  state.oauthPollTimer = setInterval(async () => {
+    try {
+      const st = await callApi("get_builtin_oauth_status", sessionId);
+      const statusEl = document.getElementById("oauth-loopback-status");
+      if (!st || !st.ok || st.status !== "pending") {
+        clearInterval(state.oauthPollTimer);
+        state.oauthPollTimer = null;
+        document.getElementById("btn-cancel-oauth").style.display = "none";
+        if (st && st.status === "success") {
+          if (statusEl) statusEl.textContent = `✅ OAuth 授权完成并已自动保存 RT 凭据 (${st.email || "已绑定"})`;
+          showToast("✅ OAuth 授权完成，已绑定 RT 凭据！");
+          await loadDashboard();
+          onRtAccountSelectChange(accId);
+        } else if (st) {
+          if (statusEl) statusEl.textContent = `⚠️ OAuth 状态: ${st.status} ${st.error || ""}`;
+        }
+      }
+    } catch (_) {}
+  }, 1500);
+}
+
+async function onClickCancelBuiltinOAuth() {
+  if (state.oauthPollTimer) {
+    clearInterval(state.oauthPollTimer);
+    state.oauthPollTimer = null;
+  }
+  if (state.oauthSessionId) {
+    await callApi("cancel_builtin_oauth", state.oauthSessionId);
+    state.oauthSessionId = "";
+  }
+  document.getElementById("btn-cancel-oauth").style.display = "none";
+  const statusEl = document.getElementById("oauth-loopback-status");
+  if (statusEl) statusEl.textContent = "已取消本地 OAuth 回调监听";
+}
+
+function onClickCopyOAuthUrl() {
+  if (state.oauthAuthUrl) copyPlainText(state.oauthAuthUrl, "OAuth 授权链接");
+}
+
+async function onClickInspectRtJson() {
+  const raw = document.getElementById("rt-json-textarea")?.value || "";
+  const pre = document.getElementById("rt-probe-result");
+  try {
+    const res = await callApi("inspect_rt_json", raw);
+    if (pre) {
+      pre.style.display = "block";
+      pre.textContent = JSON.stringify(res, null, 2);
+    }
+    showToast(res.ok ? "✅ RT 格式校验通过" : `❌ ${res.error || "格式无效"}`);
+  } catch (err) {
+    showToast("校验异常: " + err.message);
+  }
+}
+
+async function onClickSaveAccountRt() {
+  const accId = Number(document.getElementById("rt-modal-account-select")?.value || 0);
+  const raw = document.getElementById("rt-json-textarea")?.value || "";
+  if (!accId || !raw.trim()) {
+    showToast("请选择账号并填入 RT 内容");
+    return;
+  }
+  try {
+    const res = await callApi("save_account_rt", accId, raw);
+    if (res && res.ok) {
+      showToast("💾 RT 凭据已保存到当前账号");
+      await loadDashboard();
+      onRtAccountSelectChange(accId);
+    } else {
+      showToast("保存失败: " + (res?.error || "格式无效"));
+    }
+  } catch (err) {
+    showToast("保存失败: " + err.message);
+  }
+}
+
+async function onClickBatchImportRtJson() {
+  const raw = document.getElementById("rt-json-textarea")?.value || "";
+  if (!raw.trim()) {
+    showToast("请先粘贴 RT JSON 数组或对象");
+    return;
+  }
+  try {
+    const res = await callApi("batch_import_rt_json", raw);
+    if (res && res.ok) {
+      showToast(`📥 批量导入 RT 完成：新建 ${res.imported} · 更新 ${res.updated}`);
+      await loadDashboard();
+    } else {
+      showToast("导入失败: " + (res?.error || "未能匹配账号"));
+    }
+  } catch (err) {
+    showToast("批量导入 RT 异常: " + err.message);
+  }
+}
+
+async function onClickExportRtJson() {
+  try {
+    const res = await callApi("export_rt_json", null);
+    if (res && res.ok) {
+      document.getElementById("rt-json-textarea").value = res.json_text;
+      copyPlainText(res.json_text, `全部 ${res.count} 份 RT JSON`);
+    } else {
+      showToast(res?.error || "没有可导出的 RT 凭据");
+    }
+  } catch (err) {
+    showToast("导出 RT 异常: " + err.message);
+  }
+}
+
+async function onClickProbeGcpRt() {
+  const accId = Number(document.getElementById("rt-modal-account-select")?.value || 0);
+  if (!accId) return;
+  const pre = document.getElementById("rt-probe-result");
+  if (pre) {
+    pre.style.display = "block";
+    pre.textContent = "⏳ 正在通过账号专属代理连接 daily-cloudcode-pa.googleapis.com 执行 4 步探测...";
+  }
+  try {
+    const res = await callApi("probe_account_gcp_rt", accId);
+    if (pre) {
+      const displayObj = { ...res };
+      delete displayObj.account;
+      delete displayObj.access_token;
+      pre.textContent = JSON.stringify(displayObj, null, 2);
+    }
+    showToast(res.ok ? `🩺 探测成功：${res.subscription_plan || "Free"} · 模型 ${res.models_count || 0} 个` : `⚠️ ${res.error || "探测异常"}`);
+    await loadDashboard();
+    onRtAccountSelectChange(accId);
+  } catch (err) {
+    if (pre) pre.textContent = "探测异常: " + err.message;
+  }
+}
+
+async function onClickBatchProbeGcpRt() {
+  const pre = document.getElementById("rt-probe-result");
+  if (pre) {
+    pre.style.display = "block";
+    pre.textContent = "⏳ 正在批量诊断全部已绑定 RT 的 Google 账号...";
+  }
+  try {
+    const res = await callApi("batch_probe_gcp_rt", null);
+    if (pre) pre.textContent = JSON.stringify(res, null, 2);
+    showToast(res.ok ? `⚡ 批量探测完成：${res.active}/${res.total} 个 RT 有效` : (res.error || "批量探测无目标"));
+    await loadDashboard();
+  } catch (err) {
+    if (pre) pre.textContent = "批量探测异常: " + err.message;
+  }
+}
+
+async function onClickInjectAntigravity() {
+  const accId = Number(document.getElementById("rt-modal-account-select")?.value || 0);
+  if (!accId) return;
+  try {
+    const res = await callApi("inject_rt_to_antigravity", accId);
+    if (res && res.ok) {
+      showToast(`💉 已成功注入到 ${res.path}`);
+    } else {
+      showToast("注入失败: " + (res?.error || "未知错误"));
+    }
+  } catch (err) {
+    showToast("注入异常: " + err.message);
+  }
+}
+
+async function onClickResetRejectedSession() {
+  const accId = Number(document.getElementById("rt-modal-account-select")?.value || 0);
+  if (!accId) return;
+  try {
+    const res = await callApi("reset_rejected_session", accId);
+    if (res && res.ok) {
+      showToast(`🧹 会话锁清理完成 (${(res.removed || []).join(", ") || "无残留锁文件"})`);
+    }
+  } catch (err) {
+    showToast("重置会话异常: " + err.message);
+  }
+}
+
+async function onClickProbeProxyGeo() {
+  const accId = Number(document.getElementById("rt-modal-account-select")?.value || 0);
+  if (!accId) return;
+  const pre = document.getElementById("rt-probe-result");
+  if (pre) {
+    pre.style.display = "block";
+    pre.textContent = "⏳ 正在探测代理出口 IP 归属地与时区...";
+  }
+  try {
+    const res = await callApi("probe_account_proxy_geo", accId, true);
+    if (pre) {
+      const displayObj = { ...res };
+      delete displayObj.account;
+      pre.textContent = JSON.stringify(displayObj, null, 2);
+    }
+    if (res && res.ok) {
+      showToast(res.warning ? `⚠️ ${res.warning}` : `🌍 出口 ${res.country_code} (${res.ip}) · 已同步时区 ${res.timezone}`);
+      await loadDashboard();
+      onRtAccountSelectChange(accId);
+    } else {
+      showToast("代理探测失败: " + (res?.error || "超时"));
+    }
+  } catch (err) {
+    if (pre) pre.textContent = "探测异常: " + err.message;
+  }
+}
+
+// --- ChatGPT / Claude AI Credential Health Probe ---
+
+async function onClickProbeAiAccount(accountId) {
+  showToast("🩺 正在探测 AI API / Session Token...");
+  try {
+    const res = await callApi("probe_ai_account", accountId);
+    if (res && res.ok) {
+      const extra = res.models_count ? `可用模型 ${res.models_count} 个` : (res.expires_at ? `有效期至 ${res.expires_at}` : "有效");
+      showToast(`✅ ${res.provider} 测活通过 (${extra})`);
+    } else {
+      showToast(`❌ ${res?.error || "凭据无效或已过期"}`);
+    }
+    await loadDashboard();
+  } catch (err) {
+    showToast("测活异常: " + err.message);
+  }
+}
+
+// --- Google / GCP Appeal & Recovery Channels Modal ---
+
+async function openAppealModal(accountId = null) {
+  const modal = document.getElementById("appeal-modal");
+  if (!modal) return;
+  if (!state.appealChannels || !state.appealChannels.length) {
+    try {
+      const res = await callApi("get_appeal_channels");
+      if (res && res.channels) state.appealChannels = res.channels;
+    } catch (_) {}
+  }
+
+  const sel = document.getElementById("appeal-account-select");
+  if (sel) {
+    sel.innerHTML = state.accounts
+      .map((a) => `<option value="${a.id}">${escapeHtml(a.account)} (${escapeHtml(a.account_type)} · ${escapeHtml(a.health_status || "可用")})</option>`)
+      .join("");
+    if (accountId && state.accounts.some((a) => a.id === accountId)) {
+      sel.value = String(accountId);
+    }
+  }
+  renderAppealValidationBanner();
+  renderAppealChannelsList();
+  modal.style.display = "flex";
+}
+
+function closeAppealModal() {
+  const modal = document.getElementById("appeal-modal");
+  if (modal) modal.style.display = "none";
+}
+
+function renderAppealValidationBanner() {
+  const banner = document.getElementById("appeal-validation-banner");
+  const accId = Number(document.getElementById("appeal-account-select")?.value || 0);
+  const acc = state.accounts.find((a) => a.id === accId);
+  if (!banner) return;
+  const valUrl = acc && acc.custom_fields && acc.custom_fields.rt_validation_url;
+  if (valUrl) {
+    banner.style.display = "flex";
+    banner.innerHTML = `
+      <div>
+        <strong>⚠️ 检测到该账号有专属风控验证直链 (VALIDATION_REQUIRED)</strong>
+        <div class="appeal-val-url">${escapeHtml(valUrl)}</div>
+      </div>
+      <div style="display:flex;gap:8px;">
+        <button type="button" class="btn btn-primary btn-xs" onclick="onClickOpenAppealUrl('${escapeHtml(valUrl)}', true)">🛡️ 纯净浏览器立即验证</button>
+        <button type="button" class="btn btn-secondary btn-xs" onclick="copyPlainText('${escapeHtml(valUrl)}','验证链接')">📋 复制</button>
+      </div>
+    `;
+  } else {
+    banner.style.display = "none";
+  }
+}
+
+function renderAppealChannelsList() {
+  const box = document.getElementById("appeal-channels-list");
+  if (!box) return;
+  const channels = state.appealChannels || [];
+  box.innerHTML = channels
+    .map(
+      (ch) => `
+      <div class="appeal-channel-card">
+        <div class="appeal-ch-head">
+          <div>
+            <span class="appeal-ch-cat">${escapeHtml(ch.category)}</span>
+            <h4>${escapeHtml(ch.title)}</h4>
+          </div>
+          <span class="appeal-ch-badge">${escapeHtml(ch.badge)}</span>
+        </div>
+        <p class="appeal-ch-summary">${escapeHtml(ch.summary)}</p>
+        <ul class="appeal-ch-steps">
+          ${(ch.steps || []).map((s) => `<li>${escapeHtml(s)}</li>`).join("")}
+        </ul>
+        <div class="appeal-ch-actions">
+          <button type="button" class="btn btn-primary btn-xs" onclick="onClickOpenAppealUrl('${escapeHtml(ch.url)}', false)">🌐 指纹浏览器打开</button>
+          <button type="button" class="btn btn-secondary btn-xs" onclick="onClickOpenAppealUrl('${escapeHtml(ch.url)}', true)">🛡️ 纯净无扩展打开</button>
+          <button type="button" class="btn btn-ghost btn-xs" onclick="copyPlainText('${escapeHtml(ch.url)}','申诉链接')">📋 复制链接</button>
+        </div>
+      </div>
+    `
+    )
+    .join("");
+}
+
+async function onClickOpenAppealUrl(url, pureNative = false) {
+  const accId = Number(document.getElementById("appeal-account-select")?.value || 0);
+  if (!accId) {
+    showToast("请先选择一个账号以使用其专属代理容器打开");
+    return;
+  }
+  try {
+    const res = await callApi("launch_browser", accId, url, !!pureNative);
+    if (res && res.ok) {
+      showToast(`🌐 已在${pureNative ? "纯净无扩展" : "指纹隔离"}浏览器打开申诉通道`);
+    } else {
+      showToast("打开失败: " + (res?.error || "未知错误"));
+    }
+  } catch (err) {
+    showToast("打开浏览器异常: " + err.message);
+  }
 }

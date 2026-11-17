@@ -3,12 +3,30 @@ import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from src.browser_service import launch_isolated_browser
-from src.db_service import DatabaseService, compute_usage_info
+from src.browser_service import launch_isolated_browser, reset_rejected_login_session
+from src.db_service import DatabaseService, compute_usage_info, normalize_gmail_address
 from src.github_mail import fetch_latest_mail_code
+from src.maintenance_service import (
+    GCP_APPEAL_CHANNELS,
+    OAuthLoopbackManager,
+    inspect_rt_json,
+    inject_rt_to_antigravity_client,
+    probe_ai_credential,
+    probe_antigravity_rt,
+    probe_proxy_geo,
+    shutdown_auth_relays,
+)
 from src.parser import parse_account_text, parse_domain_email_file, parse_domain_email_text
 from src.proxy_service import detect_proxy_environment
-from src.totp_service import generate_totp, mask_secret, normalize_secret
+from src.totp_service import (
+    generate_account_persona,
+    generate_random_base32_secret,
+    generate_strong_password,
+    generate_totp,
+    mask_secret,
+    normalize_secret,
+    sync_google_time_offset,
+)
 from src.workbuddy import WorkBuddyQueue
 
 
@@ -18,6 +36,7 @@ DEFAULT_SETTINGS = {
     "default_account_type": "ChatGPT",
     "default_device_tag": "主机",
     "totp_interval": 30,
+    "totp_offset_seconds": 0,
     "domain_email_login_url": "https://mail.ggb6.com",
     "last_filter_type": "All",
 }
@@ -29,11 +48,17 @@ class AccountApi:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.db = DatabaseService(self.data_dir / "accounts.db")
         self._workbuddy = WorkBuddyQueue(self.db, self.data_dir)
+        self._oauth = OAuthLoopbackManager(on_success_callback=self._on_oauth_success)
         self.settings_path = self.data_dir / "settings.json"
-        self._ensure_settings()
+        settings = self._ensure_settings()
+        self.db.totp_offset_seconds = int(settings.get("totp_offset_seconds") or 0)
         self.auto_sync_result: dict | None = None
         if auto_sync_account_data:
             self.auto_sync_result = self._auto_sync_account_data_silent()
+
+    def _on_oauth_success(self, account_id: int, rt_payload: dict, rt_json_str: str) -> None:
+        if int(account_id or 0) > 0:
+            self.save_account_rt(int(account_id), rt_json_str)
 
     def _auto_sync_account_data_silent(self) -> dict | None:
         try:
@@ -90,6 +115,9 @@ class AccountApi:
         health_filter = "" if health_status in ("", "All") else health_status
         ag_filter = "" if antigravity_tier in ("", "All") else antigravity_tier
         device_filter = "" if device_tag in ("", "All") else device_tag
+        settings = self._ensure_settings()
+        offset = int(settings.get("totp_offset_seconds") or 0)
+        self.db.totp_offset_seconds = offset
         accounts = self.db.list_accounts(
             account_type=account_type,
             search=search,
@@ -99,10 +127,9 @@ class AccountApi:
             device_tag=device_filter,
         )
         stats = self.db.get_stats()
-        settings = self._ensure_settings()
         dicts = self.db.list_system_dicts()
         attributes = self.db.list_attributes()
-        now = int(time.time())
+        now = int(time.time()) + offset
         return {
             "accounts": accounts,
             "stats": stats,
@@ -111,6 +138,8 @@ class AccountApi:
             "attributes": attributes,
             "workbuddy": self._workbuddy.snapshot(),
             "node_code_stats": self.db.get_node_code_stats(),
+            "top_recovery_emails": self.db.get_top_recovery_emails(8),
+            "appeal_channels": GCP_APPEAL_CHANNELS,
             "server_time": now,
             "remaining": 30 - (now % 30),
         }
@@ -153,6 +182,7 @@ class AccountApi:
             )
         except ValueError as exc:
             return {"records": [], "count": 0, "error": str(exc)}
+        offset = int(self._ensure_settings().get("totp_offset_seconds") or 0)
         if not records and raw_text and raw_text.strip():
             stripped = raw_text.strip()
             m_new = re.match(r"^(?:新2FA|new\s*2fa)\s*[-|]*\s*(.+)$", stripped, flags=re.IGNORECASE)
@@ -166,14 +196,14 @@ class AccountApi:
                         "secret_key": cleaned,
                         "twofa_modified": 1 if m_new else 0,
                         "masked_secret": mask_secret(cleaned),
-                        "totp": generate_totp(cleaned),
+                        "totp": generate_totp(cleaned, offset_seconds=offset),
                     },
                 }
 
         for rec in records:
             rec["secret_key"] = normalize_secret(rec.get("secret_key", ""))
             rec["initial_secret_key"] = normalize_secret(rec.get("initial_secret_key", ""))
-            rec["totp"] = generate_totp(rec.get("secret_key", ""))
+            rec["totp"] = generate_totp(rec.get("secret_key", ""), offset_seconds=offset)
             rec["masked_secret"] = mask_secret(rec.get("secret_key", ""))
             rec["masked_initial_secret"] = mask_secret(rec.get("initial_secret_key", ""))
             rec["usage"] = compute_usage_info(
@@ -187,10 +217,11 @@ class AccountApi:
 
     def preview_totp(self, secret_key: str) -> dict:
         cleaned = normalize_secret(secret_key)
+        offset = int(self._ensure_settings().get("totp_offset_seconds") or 0)
         return {
             "cleaned_secret": cleaned,
             "masked_secret": mask_secret(cleaned),
-            "totp": generate_totp(cleaned),
+            "totp": generate_totp(cleaned, offset_seconds=offset),
         }
 
     def save_account(self, data: dict) -> dict:
@@ -257,7 +288,12 @@ class AccountApi:
     def update_attribute_bindings(self, attr_id: int, bound_platforms) -> dict:
         return self.db.update_attribute_bindings(int(attr_id), bound_platforms)
 
-    def launch_browser(self, account_id: int) -> dict:
+    def launch_browser(
+        self,
+        account_id: int,
+        target_url: str = "",
+        pure_native: bool = False,
+    ) -> dict:
         import src.browser_service as bs
         account = self.db.get_account(int(account_id))
         if not account:
@@ -267,13 +303,29 @@ class AccountApi:
             if not (fp_cfg.get("node_locked") and str(fp_cfg.get("proxy_node") or "").strip()):
                 self.allocate_node_for_domain_email(int(account_id))
                 account = self.db.get_account(int(account_id)) or account
-            result = bs.launch_isolated_browser(self.data_dir, account)
+            result = (
+                bs.launch_isolated_browser(
+                    self.data_dir,
+                    account,
+                    target_url=target_url,
+                    pure_native=bool(pure_native),
+                )
+                if (target_url or pure_native)
+                else bs.launch_isolated_browser(self.data_dir, account)
+            )
             result.setdefault("fp_config", account.get("fp_config") or {})
             result.setdefault(
                 "profile_dir",
                 str(self.data_dir / "browsers" / f"acc_{int(account_id)}"),
             )
             return result
+        if target_url or pure_native:
+            return bs.launch_isolated_browser(
+                self.data_dir,
+                account,
+                target_url=target_url,
+                pure_native=bool(pure_native),
+            )
         return bs.launch_isolated_browser(self.data_dir, account)
 
     def allocate_node_for_domain_email(self, account_id: int) -> str:
@@ -366,7 +418,12 @@ class AccountApi:
             return {"ok": False, "error": "账号不存在"}
         return {"ok": True, "account": updated}
 
-    def batch_import(self, raw_text: str, account_type: str = "") -> dict:
+    def batch_import(
+        self,
+        raw_text: str,
+        account_type: str = "",
+        duplicate_strategy: str = "skip",
+    ) -> dict:
         try:
             records = (
                 parse_domain_email_text(raw_text)
@@ -383,8 +440,13 @@ class AccountApi:
             if res.get("skipped"):
                 out["skipped"] = res["skipped"]
             return out
-        count = self.db.batch_add_accounts(records)
-        return {"ok": True, "imported": count}
+        res = self.db.batch_import_accounts(records, duplicate_strategy=duplicate_strategy)
+        out = {"ok": True, "imported": res["imported"]}
+        if res.get("updated"):
+            out["updated"] = res["updated"]
+        if res.get("skipped"):
+            out["skipped"] = res["skipped"]
+        return out
 
     def import_domain_email_file(self, base64_data: str, filename: str = "") -> dict:
         raw_str = (base64_data or "").strip()
@@ -484,6 +546,14 @@ class AccountApi:
             self._workbuddy.close()
         finally:
             try:
+                self._oauth.shutdown()
+            except Exception:
+                pass
+            try:
+                shutdown_auth_relays()
+            except Exception:
+                pass
+            try:
                 from src.sidecar_proxy import shutdown_sidecar_proxy
                 shutdown_sidecar_proxy()
             except Exception:
@@ -494,8 +564,10 @@ class AccountApi:
         return {"ok": deleted}
 
     def refresh_totp(self) -> dict:
-        now = int(time.time())
-        codes = self.db.refresh_totp_codes()
+        offset = int(self._ensure_settings().get("totp_offset_seconds") or 0)
+        self.db.totp_offset_seconds = offset
+        now = int(time.time()) + offset
+        codes = self.db.refresh_totp_codes(offset_seconds=offset)
         return {
             "codes": {str(k): v for k, v in codes.items()},
             "remaining": 30 - (now % 30),
@@ -508,8 +580,310 @@ class AccountApi:
     def save_settings(self, new_settings: dict) -> dict:
         current = self._ensure_settings()
         current.update(new_settings or {})
+        self.db.totp_offset_seconds = int(current.get("totp_offset_seconds") or 0)
         self.settings_path.write_text(
             json.dumps(current, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
         return current
+
+    # --- Maintenance, Security, Warming, Backups, RT/OAuth & Appeal APIs ---
+
+    def get_credential_history(self, account_id: int) -> dict:
+        return {"ok": True, "history": self.db.get_credential_history(int(account_id))}
+
+    def quick_update_credentials(self, account_id: int, payload: dict) -> dict:
+        updated = self.db.quick_update_credentials(int(account_id), payload or {})
+        if not updated:
+            return {"ok": False, "error": "账号不存在"}
+        return {"ok": True, "account": updated}
+
+    def generate_strong_password(self, length: int = 16) -> dict:
+        return {
+            "ok": True,
+            "password": generate_strong_password(length),
+            "secret_key": generate_random_base32_secret(16),
+        }
+
+    def generate_account_persona(self, region: str = "US", domain: str = "gmail.com") -> dict:
+        return {
+            "ok": True,
+            "persona": generate_account_persona(region=region, domain=domain),
+        }
+
+    def get_top_recovery_emails(self, limit: int = 8) -> dict:
+        return {"ok": True, "emails": self.db.get_top_recovery_emails(limit)}
+
+    def reset_warming_time(
+        self,
+        account_id: int,
+        scan_qr_mode: bool | None = None,
+        reset_date: str = "",
+    ) -> dict:
+        updated = self.db.reset_warming_time(
+            int(account_id),
+            scan_qr_mode=scan_qr_mode,
+            reset_date=reset_date,
+        )
+        if not updated:
+            return {"ok": False, "error": "账号不存在"}
+        return {"ok": True, "account": updated}
+
+    def sync_google_time(self, proxy_url: str = "") -> dict:
+        res = sync_google_time_offset(proxy_url=proxy_url)
+        if res.get("ok"):
+            self.save_settings({"totp_offset_seconds": int(res.get("offset_seconds") or 0)})
+        return res
+
+    def list_backups(self) -> dict:
+        return {"ok": True, "backups": self.db.list_backups()}
+
+    def create_backup(self, reason: str = "manual") -> dict:
+        return self.db.create_rolling_backup(reason=reason, max_keep=15, min_interval_minutes=0)
+
+    def restore_backup(self, filename: str) -> dict:
+        return self.db.restore_backup(filename)
+
+    def inspect_rt_json(self, raw_text: str) -> dict:
+        return inspect_rt_json(raw_text)
+
+    def save_account_rt(self, account_id: int, raw_rt_text: str) -> dict:
+        inspected = inspect_rt_json(raw_rt_text)
+        if not inspected.get("ok") or inspected.get("is_array"):
+            return {"ok": False, "error": inspected.get("error") or "请提供单个有效的 RT JSON 或 Refresh Token"}
+        existing = self.db.get_account(int(account_id))
+        if not existing:
+            return {"ok": False, "error": "账号不存在"}
+        cf_patch = {
+            "rt_json": inspected["normalized_json"],
+            "rt_refresh_token": inspected.get("refresh_token", ""),
+            "rt_access_token": inspected.get("access_token", ""),
+            "rt_email": inspected.get("email", ""),
+            "rt_project_id": inspected.get("project_id", ""),
+            "rt_status": "active",
+        }
+        updated = self.db.update_account(int(account_id), {"custom_fields": cf_patch})
+        return {"ok": True, "account": updated}
+
+    def batch_import_rt_json(self, raw_text: str) -> dict:
+        inspected = inspect_rt_json(raw_text)
+        if not inspected.get("ok"):
+            return {"ok": False, "error": inspected.get("error") or "未解析出有效的 RT 凭据"}
+        items = inspected["items"] if inspected.get("is_array") else [json.loads(inspected["normalized_json"])]
+
+        existing_google = {
+            normalize_gmail_address(acc.get("account") or ""): acc
+            for acc in self.db.list_accounts(account_type="Google")
+        }
+        imported = 0
+        updated = 0
+        skipped = 0
+        for obj in items:
+            if not isinstance(obj, dict):
+                continue
+            item_json = json.dumps(obj, ensure_ascii=False)
+            check = inspect_rt_json(item_json)
+            if not check.get("ok") or check.get("is_array"):
+                skipped += 1
+                continue
+            email = str(check.get("email") or "").strip()
+            norm = normalize_gmail_address(email) if email else ""
+            if norm and norm in existing_google:
+                res = self.save_account_rt(existing_google[norm]["id"], check["normalized_json"])
+                if res.get("ok"):
+                    updated += 1
+                else:
+                    skipped += 1
+            elif email:
+                created = self.db.add_account({
+                    "account_type": "Google",
+                    "account": email,
+                    "custom_fields": {
+                        "rt_json": check["normalized_json"],
+                        "rt_refresh_token": check.get("refresh_token", ""),
+                        "rt_access_token": check.get("access_token", ""),
+                        "rt_email": email,
+                        "rt_project_id": check.get("project_id", ""),
+                        "rt_status": "active",
+                    },
+                })
+                existing_google[norm] = created
+                imported += 1
+            else:
+                skipped += 1
+        return {
+            "ok": (imported + updated) > 0,
+            "imported": imported,
+            "updated": updated,
+            "skipped": skipped,
+            "error": "" if (imported + updated) > 0 else "RT JSON 缺少 email 字段且未指定绑定账号",
+        }
+
+    def export_rt_json(self, account_ids: list[int] | None = None) -> dict:
+        wanted = {int(i) for i in account_ids} if account_ids else None
+        accounts = self.db.list_accounts(account_type="Google")
+        exported = []
+        for acc in accounts:
+            if wanted is not None and acc["id"] not in wanted:
+                continue
+            cf = acc.get("custom_fields") or {}
+            raw_rt = str(cf.get("rt_json") or "").strip()
+            if not raw_rt:
+                continue
+            try:
+                obj = json.loads(raw_rt)
+            except Exception:
+                obj = {"refresh_token": cf.get("rt_refresh_token", ""), "email": acc.get("account", "")}
+            if isinstance(obj, dict):
+                obj.setdefault("email", acc.get("account", ""))
+                exported.append(obj)
+        return {
+            "ok": len(exported) > 0,
+            "count": len(exported),
+            "json_text": json.dumps(exported, ensure_ascii=False, indent=2),
+            "error": "" if exported else "没有可导出的 RT 凭据",
+        }
+
+    def probe_account_gcp_rt(self, account_id: int) -> dict:
+        acc = self.db.get_account(int(account_id))
+        if not acc:
+            return {"ok": False, "error": "账号不存在"}
+        res = probe_antigravity_rt(acc)
+        cf_patch = {
+            "rt_status": res.get("rt_status", acc.get("rt_status", "none")),
+            "gcp_status": res.get("gcp_status", acc.get("gcp_status", "none")),
+            "rt_last_checked": res.get("checked_at", ""),
+            "rt_last_error": res.get("error", ""),
+        }
+        if res.get("subscription_plan"):
+            cf_patch["subscription_plan"] = res["subscription_plan"]
+        if res.get("project_id"):
+            cf_patch["rt_project_id"] = res["project_id"]
+        if res.get("validation_url") is not None:
+            cf_patch["rt_validation_url"] = res.get("validation_url") or ""
+        if res.get("access_token"):
+            cf_patch["rt_access_token"] = res["access_token"]
+        if res.get("expiry_timestamp"):
+            cf_patch["rt_expiry"] = res["expiry_timestamp"]
+
+        update_payload: dict = {"custom_fields": cf_patch}
+        if res.get("antigravity_tier") in ("蓝色Pro", "金色Pro"):
+            update_payload["antigravity_tier"] = res["antigravity_tier"]
+        updated = self.db.update_account(int(account_id), update_payload)
+        return {**res, "account": updated}
+
+    def batch_probe_gcp_rt(self, account_ids: list[int] | None = None) -> dict:
+        wanted = {int(i) for i in account_ids} if account_ids else None
+        google_accs = self.db.list_accounts(account_type="Google")
+        targets = [
+            acc for acc in google_accs
+            if acc.get("has_rt") and (wanted is None or acc["id"] in wanted)
+        ]
+        if not targets:
+            return {"ok": False, "total": 0, "active": 0, "results": [], "error": "没有配置 RT 凭据的 Google 账号"}
+
+        with ThreadPoolExecutor(max_workers=min(4, len(targets))) as pool:
+            probe_results = list(pool.map(probe_antigravity_rt, targets))
+
+        results = []
+        active_cnt = 0
+        for acc, res in zip(targets, probe_results):
+            cf_patch = {
+                "rt_status": res.get("rt_status", acc.get("rt_status", "none")),
+                "gcp_status": res.get("gcp_status", acc.get("gcp_status", "none")),
+                "rt_last_checked": res.get("checked_at", ""),
+                "rt_last_error": res.get("error", ""),
+            }
+            if res.get("subscription_plan"):
+                cf_patch["subscription_plan"] = res["subscription_plan"]
+            if res.get("project_id"):
+                cf_patch["rt_project_id"] = res["project_id"]
+            if res.get("validation_url") is not None:
+                cf_patch["rt_validation_url"] = res.get("validation_url") or ""
+            if res.get("access_token"):
+                cf_patch["rt_access_token"] = res["access_token"]
+            if res.get("expiry_timestamp"):
+                cf_patch["rt_expiry"] = res["expiry_timestamp"]
+            up: dict = {"custom_fields": cf_patch}
+            if res.get("antigravity_tier") in ("蓝色Pro", "金色Pro"):
+                up["antigravity_tier"] = res["antigravity_tier"]
+            self.db.update_account(acc["id"], up)
+            if res.get("rt_status") == "active":
+                active_cnt += 1
+            results.append({"id": acc["id"], "account": acc["account"], **res})
+        return {"ok": True, "total": len(targets), "active": active_cnt, "results": results}
+
+    def inject_rt_to_antigravity(self, account_id: int) -> dict:
+        acc = self.db.get_account(int(account_id))
+        if not acc:
+            return {"ok": False, "error": "账号不存在"}
+        return inject_rt_to_antigravity_client(acc)
+
+    def start_builtin_oauth(
+        self,
+        account_id: int,
+        launch_isolated: bool = True,
+        pure_native: bool = True,
+    ) -> dict:
+        acc = self.db.get_account(int(account_id))
+        if not acc:
+            return {"ok": False, "error": "账号不存在"}
+        proxy = str((acc.get("fp_config") or {}).get("proxy") or "").strip()
+        sess = self._oauth.start_session(
+            account_id=int(account_id),
+            login_hint=acc.get("account", ""),
+            proxy_url=proxy,
+        )
+        if launch_isolated and sess.get("ok"):
+            launch_res = self.launch_browser(
+                int(account_id),
+                target_url=sess["auth_url"],
+                pure_native=bool(pure_native),
+            )
+            sess["browser_launch"] = launch_res
+        return sess
+
+    def get_builtin_oauth_status(self, session_id: str) -> dict:
+        return self._oauth.get_status(session_id)
+
+    def cancel_builtin_oauth(self, session_id: str) -> dict:
+        return self._oauth.cancel_session(session_id)
+
+    def probe_ai_account(self, account_id: int) -> dict:
+        acc = self.db.get_account(int(account_id))
+        if not acc:
+            return {"ok": False, "error": "账号不存在"}
+        res = probe_ai_credential(acc)
+        cf_patch = {
+            "ai_last_checked": res.get("checked_at", ""),
+            "ai_models_count": res.get("models_count", 0),
+            "ai_last_error": res.get("error", ""),
+        }
+        if res.get("ok") and "API" in str(res.get("provider") or "") and (acc.get("openai_plan") or "free") == "free":
+            cf_patch["openai_plan"] = "api"
+        updated = self.db.update_account(int(account_id), {"custom_fields": cf_patch})
+        return {**res, "account": updated}
+
+    def reset_rejected_session(self, account_id: int) -> dict:
+        return reset_rejected_login_session(self.data_dir, int(account_id))
+
+    def probe_account_proxy_geo(self, account_id: int, auto_apply_tz: bool = True) -> dict:
+        acc = self.db.get_account(int(account_id))
+        if not acc:
+            return {"ok": False, "error": "账号不存在"}
+        proxy = str((acc.get("fp_config") or {}).get("proxy") or "").strip()
+        res = probe_proxy_geo(proxy)
+        if res.get("ok") and auto_apply_tz and res.get("timezone"):
+            updated = self.db.update_account(
+                int(account_id),
+                {
+                    "timezone": res["timezone"],
+                    "locale": res.get("locale", ""),
+                    "accept_languages": res.get("accept_languages", ""),
+                },
+            )
+            return {**res, "account": updated}
+        return res
+
+    def get_appeal_channels(self) -> dict:
+        return {"ok": True, "channels": GCP_APPEAL_CHANNELS}

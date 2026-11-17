@@ -32,6 +32,7 @@ class Launcher {
         }
 
         string[] searchRoots = new string[] {
+            @"D:\Environments",
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", "Python"),
             Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
             @"C:\"

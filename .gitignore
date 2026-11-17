@@ -26,3 +26,7 @@ accountData/
 
 # 私人申诉记录（含外部链接，不入库）
 Antigravity 申诉.txt
+
+# Local reference archive & Windows shortcut
+AccountManagement.zip
+*.lnk

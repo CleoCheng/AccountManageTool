@@ -260,8 +260,8 @@ def test_non_domain_email_launch_args_keep_extension_and_cdp(tmp_path: Path):
     )
 
     assert any(a.startswith("--load-extension=") for a in args)
-    assert any(a.startswith("--remote-debugging-port=") for a in args)
-    assert "--remote-allow-origins=*" in args
+    assert not any(a.startswith("--remote-debugging-port=") for a in args)
+    assert "--remote-allow-origins=*" not in args
     assert "--proxy-server=http://127.0.0.1:17899" in args
     # The shared isolation helper must not duplicate the flag the normal branch
     # already carries in its base arg list.
@@ -333,7 +333,24 @@ def test_launch_isolated_browser_skips_cdp_injector_for_domain_email(tmp_path: P
     chatgpt_account = {**domain_account, "id": 16, "account_type": "ChatGPT", "account": "chatgpt16@example.com"}
     result = browser_service.launch_isolated_browser(tmp_path / "data", chatgpt_account)
     assert result["ok"] is True
-    assert [c[0] for c in calls] == ["popen", "cdp"]
+    assert result["zero_cdp"] is True
+    assert [c[0] for c in calls] == ["popen"]
+    autologin_code = (tmp_path / "data" / "browsers" / "acc_16" / "fp_ext" / "autologin.js").read_text(
+        encoding="utf-8"
+    )
+    assert "safeGetSession('kv_autologin_enabled') === '1'" in autologin_code
+    assert "Alt+K" in autologin_code
+    assert "setNativeInputValue(target, out)" in autologin_code
+
+    # Explicit enable_cdp=True keeps optional CDP debug flag available.
+    args_cdp = build_browser_launch_args(
+        chatgpt_account,
+        tmp_path / "data" / "browsers" / "acc_16",
+        exe_path="C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+        enable_cdp=True,
+    )
+    assert any(a.startswith("--remote-debugging-port=") for a in args_cdp)
+    assert "--remote-allow-origins=*" in args_cdp
 
 
 def test_launch_isolated_browser_applies_switched_node_proxy_url(tmp_path: Path, monkeypatch):
@@ -1060,3 +1077,69 @@ def test_launch_isolated_browser_claude_sets_tz_and_lang_env(tmp_path: Path, mon
     assert env["LANG"] == "en_US.UTF-8"
     assert popen_kwargs[0]["cwd"]
     assert popen_kwargs[0]["close_fds"] is True
+
+
+def test_prepare_profile_seeds_bookmarks_and_preferences(tmp_path: Path):
+    import json
+
+    data_dir = tmp_path / "data"
+    account = {
+        "id": 99,
+        "account_type": "Google",
+        "account": "bookmark_tester@gmail.com",
+        "password": "pw",
+    }
+    profile_dir = browser_service.prepare_profile_dir(data_dir, account)
+    prefs = json.loads((profile_dir / "Default" / "Preferences").read_text(encoding="utf-8"))
+    assert prefs["bookmark_bar"]["show_on_all_tabs"] is True
+    assert prefs["webrtc"]["ip_handling_policy"] == "disable_non_proxied_udp"
+
+    bm = json.loads((profile_dir / "Default" / "Bookmarks").read_text(encoding="utf-8"))
+    children = bm["roots"]["bookmark_bar"]["children"]
+    assert children[0]["name"] == "KeyVault 维护助手"
+    urls = {node["url"] for node in children[0]["children"]}
+    assert "https://myaccount.google.com/security" in urls
+    assert "https://forms.gle/hGzM9MEUv2azZsrb9" in urls
+
+
+def test_pure_native_and_target_url_and_reset_rejected_session(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    profile_dir = browser_service.prepare_profile_dir(
+        data_dir,
+        {"id": 101, "account_type": "Google", "account": "native_test@gmail.com"},
+    )
+    (profile_dir / "DevToolsActivePort").write_text("9222\n/devtools/browser/1", encoding="utf-8")
+    reset_res = browser_service.reset_rejected_login_session(data_dir, 101)
+    assert reset_res["ok"] is True
+    assert "DevToolsActivePort" in reset_res["removed"]
+    assert not (profile_dir / "DevToolsActivePort").exists()
+
+    custom_url = "https://accounts.google.com/o/oauth2/v2/auth?client_id=test"
+    args = browser_service.build_browser_launch_args(
+        {
+            "id": 101,
+            "account_type": "Google",
+            "account": "native_test@gmail.com",
+            "fp_config": {"proxy": "http://127.0.0.1:7890"},
+        },
+        profile_dir,
+        exe_path="C:\\fake\\chrome.exe",
+        target_url=custom_url,
+        pure_native=True,
+    )
+    assert args[-1] == custom_url
+    assert not any(a.startswith("--load-extension=") for a in args)
+    assert not any(a.startswith("--remote-debugging-port=") for a in args)
+    assert "--proxy-bypass-list=<-loopback>;localhost;127.0.0.1;[::1]" in args
+
+
+def test_proxy_relay_parses_4part_credentials():
+    from src.maintenance_service import resolve_proxy_for_chromium_and_urllib, shutdown_auth_relays
+
+    try:
+        resolved = resolve_proxy_for_chromium_and_urllib("127.0.0.1:8888:user1:pass1")
+        assert resolved["uses_relay"] is True
+        assert resolved["chromium_proxy"].startswith("http://127.0.0.1:")
+        assert resolved["urllib_proxy"] == "http://user1:pass1@127.0.0.1:8888"
+    finally:
+        shutdown_auth_relays()
