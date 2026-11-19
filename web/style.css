@@ -92,6 +92,59 @@ body {
   margin-bottom: 10px;
 }
 
+.login-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+  padding: 8px 12px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  font-size: 12px;
+}
+
+.login-tools[hidden],
+#qc-google-review[hidden],
+#qc-google-confirm-label[hidden],
+.top-actions .btn[hidden] {
+  display: none;
+}
+
+.login-tool-identity,
+.login-tool-code,
+.login-tool-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.login-tool-identity {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+#login-tool-account,
+#login-tool-totp-time {
+  color: var(--text-secondary);
+}
+
+#login-tool-totp {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.login-tool-actions .copy-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+#qc-google-confirm-label {
+  margin-top: 12px;
+}
+
 /* Topbar */
 .topbar {
   display: flex;
@@ -161,7 +214,7 @@ body.light-theme .brand-logo {
   display: flex;
   align-items: center;
   gap: 8px;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   overflow-x: auto;
   scrollbar-width: none;
   -ms-overflow-style: none;
@@ -213,6 +266,14 @@ body.light-theme .brand-logo {
 .stat-pill:hover {
   border-color: var(--border-focus);
   background: var(--bg-surface-hover);
+}
+
+.stat-pill[hidden] {
+  display: none;
+}
+
+button.stat-pill {
+  font-family: inherit;
 }
 
 .stat-pill.active {
@@ -983,6 +1044,28 @@ select.health-filter-select option {
   font-size: 11.5px;
   color: var(--text-muted);
   font-style: italic;
+}
+
+.mail-code-refresh {
+  border: 1px solid var(--border-color);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  border-radius: var(--radius-sm);
+  padding: 2px 6px;
+  font-size: 10px;
+  line-height: 1.2;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.mail-code-refresh:hover {
+  color: var(--text-primary);
+  border-color: var(--border-focus);
+}
+
+.mail-code-refresh:disabled {
+  opacity: 0.6;
+  cursor: wait;
 }
 
 .u-copy-group {
@@ -2240,7 +2323,8 @@ select.health-filter-select option {
   border-color: rgba(14, 165, 233, 0.35);
 }
 
-.u-health-btn.health-unavailable {
+.u-health-btn.health-unavailable,
+.u-health-btn.health-unreviewed {
   background: rgba(148, 163, 184, 0.13);
   color: #94a3b8;
   border-color: rgba(148, 163, 184, 0.3);
@@ -2486,6 +2570,13 @@ select.health-filter-select option {
 }
 
 @media (max-width: 980px) {
+  .topbar {
+    flex-wrap: wrap;
+  }
+  .stats-bar {
+    order: 1;
+    flex-basis: 100%;
+  }
   .toolbar {
     flex-wrap: wrap;
     gap: 8px;
@@ -3863,6 +3954,12 @@ body.light-theme .c-option-check {
   display: block;
 }
 
+.c-select-container.c-settings-select .c-select-menu,
+.c-select-container.c-port-select .c-select-menu {
+  max-width: 100%;
+  width: 100%;
+}
+
 /* Antigravity Custom Pro Trigger Styles */
 .c-select-container.ag-select-blue .c-select-trigger {
   background-color: rgba(37, 99, 235, 0.22) !important;
@@ -4063,6 +4160,81 @@ body.light-theme .platform-check-item {
   font-weight: 600;
   line-height: 1.4;
   white-space: nowrap;
+}
+
+button.u-wb-badge {
+  font-family: inherit;
+  cursor: pointer;
+}
+
+button.u-wb-badge:hover:not(:disabled) {
+  border-color: currentColor;
+}
+
+button.u-wb-badge:disabled {
+  cursor: wait;
+}
+
+.u-wb-badge.wb-unbound {
+  background: var(--bg-subtle);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+}
+
+.account-edit-history {
+  margin-top: 16px;
+}
+
+.account-edit-history h3 {
+  margin: 0 0 8px;
+  font-size: 13px;
+}
+
+.account-edit-history-list {
+  max-height: 240px;
+  overflow-y: auto;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  font-size: 12px;
+}
+
+.account-edit-history-list > p,
+.account-edit-history-entry {
+  margin: 0;
+  padding: 8px 10px;
+}
+
+.account-edit-history-entry + .account-edit-history-entry {
+  border-top: 1px solid var(--border-color);
+}
+
+.account-edit-history-meta,
+.account-edit-history-values {
+  display: flex;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 5px 12px;
+}
+
+.account-edit-history-meta {
+  align-items: center;
+  margin-bottom: 4px;
+}
+
+.account-edit-history-meta time,
+.account-edit-history-values {
+  color: var(--text-secondary);
+}
+
+.account-edit-history-values > div {
+  flex: 1 1 160px;
+  min-width: 0;
+}
+
+.account-edit-history-values span {
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .u-wb-badge.wb-pending {
@@ -4944,4 +5116,21 @@ body.light-theme .u-wb-badge.wb-cred,
   .appeal-channels-grid {
     grid-template-columns: 1fr;
   }
+}
+
+.btn-sm {
+  padding: 5px 11px;
+  font-size: 12px;
+  line-height: 1.3;
+  border-radius: 7px;
+}
+
+.modal-card.modal-md {
+  max-width: 640px;
+}
+
+.c-select-container.is-disabled .c-select-trigger {
+  opacity: 0.55;
+  cursor: not-allowed;
+  pointer-events: none;
 }

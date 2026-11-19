@@ -270,3 +270,33 @@ def test_parse_claude_hints_without_explicit_account_type():
     assert google[0]["account_type"] == "Google"
     domain = parse_account_text("mailbox01@ggb6.com----MailboxPass#2026!")
     assert domain[0]["account_type"] == "域名邮箱"
+
+
+def test_parse_6field_empty_recovery_slot_and_unnumbered_multi_blocks():
+    # Empty recovery email slot preserved cleanly (reg_year / reg_region not shifted)
+    line = "no_rec@gmail.com----Pwd#123--------JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP----2025----JP"
+    rec = parse_account_text(line)
+    assert len(rec) == 1
+    assert rec[0]["account_type"] == "Google"
+    assert rec[0]["recovery_email"] == ""
+    assert rec[0]["secret_key"] == "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
+    assert rec[0]["reg_year"] == "2025"
+    assert rec[0]["reg_region"] == "JP"
+
+    # Unnumbered multi-account paste with date lines / 新2FA parses all blocks
+    multi_unnumbered = """
+1021
+alpha_one@example.com
+----PassOne#1----JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP
+新2FA----GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ
+
+1022
+beta_two@example.com
+----PassTwo#2----JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP
+新2FA----MFRGGZDFMZTWQ2LKMFRGGZDFMZTWQ2LK
+"""
+    items = parse_account_text(multi_unnumbered, default_year=2026)
+    assert len(items) == 2
+    assert items[0]["account"] == "alpha_one@example.com"
+    assert items[1]["account"] == "beta_two@example.com"
+    assert items[1]["secret_key"] == "MFRGGZDFMZTWQ2LKMFRGGZDFMZTWQ2LK"

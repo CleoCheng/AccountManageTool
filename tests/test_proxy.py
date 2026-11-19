@@ -213,3 +213,14 @@ def test_activate_proxy_node_delegates_to_isolated_sidecar_without_touching_verg
     assert blank == {"ok": True, "switched": False, "proxy_url": "http://127.0.0.1:17899"}
     assert calls == []
     assert manager_calls == []
+
+
+def test_parse_clash_yaml_summary_handles_malformed_ports(tmp_path: Path):
+    bad_yaml = tmp_path / "bad_port.yaml"
+    bad_yaml.write_text(
+        "mixed-port: not-a-number\nsocks-port: 99999\nlisteners:\n  - name: bad\n    port: abc\n",
+        encoding="utf-8",
+    )
+    info = parse_clash_yaml_summary(bad_yaml)
+    assert info["mixed_port"] == 0
+    assert info["ports"] == []

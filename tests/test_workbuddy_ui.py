@@ -489,6 +489,8 @@ def test_domain_email_ui_elements_static():
 
     # app.js assertions
     assert "function refreshDomainEmailCodes" in js
+    assert "refreshSingleEmailCode" in js
+    assert "mail-code-refresh" in js
     assert "function confirmResetDomainEmailNodes" in js
     assert "function startMailCodePolling" in js
     assert "function stopMailCodePolling" in js

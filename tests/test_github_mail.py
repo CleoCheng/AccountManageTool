@@ -135,3 +135,15 @@ def test_fetch_latest_mail_code_returns_none_on_imap_error(monkeypatch):
     client.return_value.__enter__.return_value.login.side_effect = imaplib.IMAP4.error("auth failed")
     monkeypatch.setattr("src.github_mail.imaplib.IMAP4_SSL", client)
     assert fetch_latest_mail_code("worker@example.org", "wrong") is None
+
+
+def test_imap_logout_error_on_teardown_does_not_discard_code(monkeypatch):
+    client, _inbox = _imap_for(monkeypatch, [_mail(code="99887766")])
+    client.return_value.__exit__.side_effect = OSError("socket reset during LOGOUT")
+    res = fetch_latest_mail_code("worker@example.org", "secret-for-test")
+    assert res is not None and res["code"] == "99887766"
+
+    monkeypatch.setattr("src.github_mail.time.time", lambda: NOW)
+    client2, _inbox2 = _imap_for(monkeypatch, [message(html=True)])
+    client2.return_value.__exit__.side_effect = OSError("LOGOUT timed out")
+    assert read_github_code("worker@example.org", "secret-for-test", NOW - 40) == "12345678"

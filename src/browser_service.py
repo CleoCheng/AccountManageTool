@@ -1,12 +1,21 @@
 import asyncio
+import ctypes
 import hashlib
+import inspect
 import json
+import locale as py_locale
 import os
 import re
 import secrets
+import shutil
+import sqlite3
+import stat
 import subprocess
+import sys
+import tempfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 import websockets
@@ -91,22 +100,86 @@ _EAST_ABBREV_RE = re.compile(
 )
 
 
+_REGION_TZ_LOCALE_TABLE: dict[tuple[str, ...], tuple[str, str]] = {
+    ("us", "usa", "united states", "america", "美国"): ("America/Los_Angeles", "en-US"),
+    ("uk", "gb", "united kingdom", "britain", "england", "英国"): ("Europe/London", "en-GB"),
+    ("jp", "japan", "日本"): ("Asia/Tokyo", "ja-JP"),
+    ("kr", "korea", "south korea", "韩国"): ("Asia/Seoul", "ko-KR"),
+    ("hk", "hong kong", "hongkong", "香港"): ("Asia/Hong_Kong", "zh-HK"),
+    ("tw", "taiwan", "台湾"): ("Asia/Taipei", "zh-TW"),
+    ("sg", "singapore", "新加坡", "狮城"): ("Asia/Singapore", "en-SG"),
+    ("de", "germany", "德国"): ("Europe/Berlin", "de-DE"),
+    ("fr", "france", "法国"): ("Europe/Paris", "fr-FR"),
+    ("nl", "netherlands", "荷兰"): ("Europe/Amsterdam", "nl-NL"),
+    ("ca", "canada", "加拿大"): ("America/Toronto", "en-CA"),
+    ("au", "australia", "澳大利亚", "澳洲"): ("Australia/Sydney", "en-AU"),
+    ("in", "india", "印度"): ("Asia/Kolkata", "en-IN"),
+    ("br", "brazil", "巴西"): ("America/Sao_Paulo", "pt-BR"),
+    ("vn", "vietnam", "越南"): ("Asia/Ho_Chi_Minh", "vi-VN"),
+    ("th", "thailand", "泰国"): ("Asia/Bangkok", "th-TH"),
+    ("ph", "philippines", "菲律宾"): ("Asia/Manila", "en-PH"),
+    ("my", "malaysia", "马来西亚"): ("Asia/Kuala_Lumpur", "en-MY"),
+    ("id", "indonesia", "印尼", "印度尼西亚"): ("Asia/Jakarta", "id-ID"),
+    ("tr", "turkey", "türkiye", "土耳其"): ("Europe/Istanbul", "tr-TR"),
+    ("ru", "russia", "俄罗斯"): ("Europe/Moscow", "ru-RU"),
+}
+
+
+def resolve_timezone_and_locale_by_region(
+    region: str | None, browser_lang: str | None = None
+) -> tuple[str, str]:
+    """Resolve default IANA timezone and BCP-47 locale from an account region tag."""
+    norm = (region or "").strip().lower()
+    tz, loc = DEFAULT_TIMEZONE, DEFAULT_LOCALE
+    if norm:
+        for keys, pair in _REGION_TZ_LOCALE_TABLE.items():
+            if norm in keys:
+                tz, loc = pair
+                break
+    explicit = (browser_lang or "").strip()
+    if explicit and explicit.lower() not in ("default", "match_region", "system"):
+        loc = explicit
+    return tz, loc
+
+
+def _get_system_ui_locale() -> str:
+    """Return host OS UI locale (used only when user selects ``system`` language mode)."""
+    if sys.platform == "win32":
+        try:
+            lang_id = ctypes.windll.kernel32.GetUserDefaultUILanguage()
+            buf = ctypes.create_unicode_buffer(85)
+            if ctypes.windll.kernel32.LCIDToLocaleName(lang_id, buf, len(buf), 0) > 0 and buf.value:
+                return buf.value
+        except Exception:
+            pass
+    try:
+        loc = py_locale.getlocale()[0] or ""
+        if loc:
+            return loc.replace("_", "-")
+    except Exception:
+        pass
+    return "zh-CN"
+
+
 def _match_any_keyword(haystack: str, keywords: tuple[str, ...]) -> bool:
     return any(k in haystack for k in keywords)
 
 
-def resolve_browser_env_config(fp: dict, account: dict | None = None) -> dict:
-    """Resolve the spoofed timezone/locale for a browser profile.
+def resolve_browser_env_config(
+    fp: dict,
+    account: dict | None = None,
+    settings: dict | None = None,
+) -> dict:
+    """Resolve the browser timezone/locale/Accept-Language for a profile.
 
-    The proxy exit node (and ``reg_region``) decide the timezone so the local
-    clock matches the exit IP. US matching runs before JP/SG on purpose: relay
-    names such as ``USbyJPTT | MiyaIP-2 HY2`` describe a JP hop but a US exit.
-
-    Every account type (including ``域名邮箱``) resolves a real profile so Chrome
-    never leaks the host's ``Asia/Shanghai`` clock or ``zh-CN`` UI language.
+    The proxy exit node (and ``reg_region``) decide the timezone and default
+    locale so HTTP headers, ``--lang``, and ``Default/Preferences`` match the
+    exit IP. US matching runs before JP/SG on purpose: relay names such as
+    ``USbyJPTT | MiyaIP-2 HY2`` describe a JP hop but a US exit.
     """
     fp = fp if isinstance(fp, dict) else {}
     account = account if isinstance(account, dict) else {}
+    settings = settings if isinstance(settings, dict) else {}
 
     proxy_node = str(fp.get("proxy_node") or "")
     proxy = str(fp.get("proxy") or "")
@@ -122,6 +195,8 @@ def resolve_browser_env_config(fp: dict, account: dict | None = None) -> dict:
 
     explicit_tz = str(fp.get("timezone") or "").strip()
     explicit_locale = str(fp.get("locale") or "").strip()
+    explicit_browser_lang = str(fp.get("browser_lang") or "").strip()
+    global_lang_mode = str(settings.get("default_browser_lang") or "").strip()
 
     timezone = ""
     locale = ""
@@ -148,8 +223,8 @@ def resolve_browser_env_config(fp: dict, account: dict | None = None) -> dict:
         or re.search(r"\bjp\b", haystack)
     ):
         timezone = "Asia/Tokyo"
-        locale = "en-US"
-        languages = ["en-US", "en"]
+        locale = "ja-JP" if (reg_region.strip() and not proxy_node.strip()) else "en-US"
+        languages = ["ja-JP", "ja", "en-US", "en"] if locale == "ja-JP" else ["en-US", "en"]
     elif (
         _match_any_keyword(haystack, ("singapore", "新加坡", "狮城"))
         or "🇸🇬" in proxy_node
@@ -172,8 +247,8 @@ def resolve_browser_env_config(fp: dict, account: dict | None = None) -> dict:
         or re.search(r"\bkr\b", haystack)
     ):
         timezone = "Asia/Seoul"
-        locale = "en-US"
-        languages = ["en-US", "en"]
+        locale = "ko-KR" if (reg_region.strip() and not proxy_node.strip()) else "en-US"
+        languages = ["ko-KR", "ko", "en-US", "en"] if locale == "ko-KR" else ["en-US", "en"]
     elif (
         _match_any_keyword(
             haystack,
@@ -191,42 +266,63 @@ def resolve_browser_env_config(fp: dict, account: dict | None = None) -> dict:
         or re.search(r"\bde\b", haystack)
     ):
         timezone = "Europe/Berlin"
-        locale = "en-US"
-        languages = ["en-US", "en"]
+        locale = "de-DE" if (reg_region.strip() and not proxy_node.strip()) else "en-US"
+        languages = ["de-DE", "de", "en-US", "en"] if locale == "de-DE" else ["en-US", "en"]
     elif (
         _match_any_keyword(haystack, ("canada", "toronto", "vancouver", "加拿大", "多伦多"))
         or "🇨🇦" in proxy_node
         or re.search(r"\bca\b", haystack)
     ):
         timezone = "America/Toronto"
-        locale = "en-US"
-        languages = ["en-US", "en"]
+        locale = "en-CA" if (reg_region.strip() and not proxy_node.strip()) else "en-US"
+        languages = ["en-CA", "en-US", "en"] if locale == "en-CA" else ["en-US", "en"]
     elif (
         _match_any_keyword(haystack, ("hong kong", "hongkong", "香港"))
         or "🇭🇰" in proxy_node
         or re.search(r"\bhk\b", haystack)
     ):
         timezone = "Asia/Hong_Kong"
-        locale = "en-US"
-        languages = ["en-US", "en"]
+        locale = "zh-HK" if (reg_region.strip() and not proxy_node.strip()) else "en-US"
+        languages = ["zh-HK", "zh", "en-US", "en"] if locale == "zh-HK" else ["en-US", "en"]
+    elif reg_region.strip():
+        reg_tz, reg_loc = resolve_timezone_and_locale_by_region(reg_region)
+        if reg_tz != DEFAULT_TIMEZONE or reg_loc != DEFAULT_LOCALE:
+            timezone = reg_tz
+            locale = reg_loc
 
     # Explicit overrides win over region inference.
     if explicit_tz:
         timezone = explicit_tz
     if explicit_locale:
         locale = explicit_locale
+    if explicit_browser_lang and explicit_browser_lang.lower() not in ("default", "match_region"):
+        locale = _get_system_ui_locale() if explicit_browser_lang.lower() == "system" else explicit_browser_lang
+        languages = []
+    elif not explicit_locale and global_lang_mode and global_lang_mode.lower() not in ("default", "match_region"):
+        locale = _get_system_ui_locale() if global_lang_mode.lower() == "system" else global_lang_mode
+        languages = []
 
     if not timezone or not locale:
-        # Claude and every proxied account default to a US West Coast profile;
-        # an unproxied account with no region hint also gets en-US defaults so
-        # the extension always has a coherent locale to spoof.
         timezone = timezone or DEFAULT_TIMEZONE
         locale = locale or DEFAULT_LOCALE
         if not languages:
             languages = list(DEFAULT_LANGUAGES)
 
     if not languages:
-        languages = [locale, "en"] if locale != "en" else [locale]
+        base_lang = locale.split("-", 1)[0]
+        languages = [locale]
+        if "-" in locale and base_lang:
+            languages.append(base_lang)
+        # Bilingual hint if user runs a non-English UI on a foreign-region account
+        if reg_region.strip():
+            _, reg_loc = resolve_timezone_and_locale_by_region(reg_region)
+            reg_base = reg_loc.split("-", 1)[0]
+            if reg_base.lower() != base_lang.lower() and reg_base.lower() != "en":
+                languages.append(reg_loc)
+                if "-" in reg_loc:
+                    languages.append(reg_base)
+        if base_lang.lower() != "en":
+            languages.extend(["en-US", "en"])
 
     deduped: list[str] = []
     for lang in languages:
@@ -496,6 +592,33 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
   function safeSetSession(k, v) {{
     try {{ sessionStorage.setItem(k, v); }} catch (_) {{}}
   }}
+  function safeGetLocal(k) {{
+    try {{ return localStorage.getItem(k); }} catch (_) {{ return null; }}
+  }}
+  function safeSetLocal(k, v) {{
+    try {{ localStorage.setItem(k, v); }} catch (_) {{}}
+  }}
+  function pruneStaleLocalLaunchStates() {{
+    try {{
+      const stale = [];
+      for (let i = 0; i < localStorage.length; i++) {{
+        const k = localStorage.key(i);
+        if (k && k.indexOf('kv_launch_state_') === 0 && k !== SESSION_STATE_KEY) stale.push(k);
+      }}
+      stale.forEach((k) => {{ try {{ localStorage.removeItem(k); }} catch (_) {{}} }});
+    }} catch (_) {{}}
+  }}
+  function loadCachedLaunchState() {{
+    try {{
+      const cached = safeGetSession(SESSION_STATE_KEY);
+      if (cached) return JSON.parse(cached);
+    }} catch (_) {{}}
+    try {{
+      const cachedLocal = safeGetLocal(SESSION_STATE_KEY);
+      if (cachedLocal) return JSON.parse(cachedLocal);
+    }} catch (_) {{}}
+    return null;
+  }}
   function safeResetStepCooldowns() {{
     try {{
       const keys = [];
@@ -535,6 +658,12 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
   function persistLaunchState() {{
     try {{
       safeSetSession(SESSION_STATE_KEY, JSON.stringify(launchState));
+    }} catch (_) {{}}
+    // Mirror to localStorage so the docked bar survives CDP-injected pages
+    // (no chrome.storage.local) and full reloads within the same origin.
+    try {{
+      pruneStaleLocalLaunchStates();
+      safeSetLocal(SESSION_STATE_KEY, JSON.stringify(launchState));
     }} catch (_) {{}}
     try {{
       if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {{
@@ -623,24 +752,14 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
       if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {{
         chrome.storage.local.get([LAUNCH_STORAGE_KEY], (res) => {{
           let saved = res ? res[LAUNCH_STORAGE_KEY] : null;
-          if (!saved) {{
-            try {{
-              const cached = safeGetSession(SESSION_STATE_KEY);
-              if (cached) saved = JSON.parse(cached);
-            }} catch (_) {{}}
-          }}
+          if (!saved) saved = loadCachedLaunchState();
           finalize(saved);
         }});
         return;
       }}
     }} catch (_) {{}}
 
-    let cachedObj = null;
-    try {{
-      const cached = safeGetSession(SESSION_STATE_KEY);
-      if (cached) cachedObj = JSON.parse(cached);
-    }} catch (_) {{}}
-    finalize(cachedObj);
+    finalize(loadCachedLaunchState());
   }}
 
   document.addEventListener('focusin', (e) => {{
@@ -649,7 +768,9 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
     }}
   }}, true);
 
+  let statusSeq = 0;
   function setStatus(msg) {{
+    statusSeq += 1;
     statusText = msg;
     if (statusUiUpdater) statusUiUpdater();
   }}
@@ -1303,6 +1424,82 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
   let minimizeTimer = null;
   let currentUiMode = '';
 
+  // --- In-Page Docked Top Bar: push the page down so the bar never covers content ---
+  let docOrigMarginTop = null;
+  let docAppliedMarginTop = '';
+
+  function isDockedTop() {{
+    return !capsuleHidden && !minimized && !launchState.pos;
+  }}
+
+  function rememberDocMarginTop() {{
+    if (docOrigMarginTop !== null) return;
+    const docEl = document.documentElement;
+    if (!docEl) return;
+    let value = '';
+    let priority = '';
+    try {{
+      if (docEl.style && typeof docEl.style.getPropertyValue === 'function') {{
+        value = docEl.style.getPropertyValue('margin-top') || '';
+        priority = typeof docEl.style.getPropertyPriority === 'function'
+          ? (docEl.style.getPropertyPriority('margin-top') || '')
+          : '';
+      }} else if (docEl.style) {{
+        value = docEl.style.marginTop || '';
+      }}
+    }} catch (_) {{
+      value = '';
+      priority = '';
+    }}
+    docOrigMarginTop = {{ value: value, priority: priority }};
+  }}
+
+  function restoreDocMarginTop() {{
+    const docEl = document.documentElement;
+    if (!docEl || !docEl.style) return;
+    try {{
+      if (typeof docEl.style.removeProperty === 'function') {{
+        if (docOrigMarginTop && docOrigMarginTop.value) {{
+          docEl.style.setProperty('margin-top', docOrigMarginTop.value, docOrigMarginTop.priority || '');
+        }} else {{
+          docEl.style.removeProperty('margin-top');
+          docEl.style.marginTop = '';
+        }}
+      }} else {{
+        docEl.style.marginTop = (docOrigMarginTop && docOrigMarginTop.value) || '';
+      }}
+    }} catch (_) {{}}
+    docAppliedMarginTop = '';
+  }}
+
+  function syncPageTopOffset(barHeightHint) {{
+    const docEl = document.documentElement;
+    if (!docEl || !docEl.style) return;
+    const hostEl = document.getElementById('__kv_autologin_host');
+    if (!isDockedTop() || !hostEl) {{
+      restoreDocMarginTop();
+      return;
+    }}
+    rememberDocMarginTop();
+    let h = 0;
+    try {{
+      h = barHeightHint || (hostEl.getBoundingClientRect ? hostEl.getBoundingClientRect().height : 0);
+    }} catch (_) {{ h = 0; }}
+    h = Math.max(36, Math.round(h || 38));
+    const px = h + 'px';
+    if (docAppliedMarginTop === px) return;
+    try {{
+      if (typeof docEl.style.setProperty === 'function') {{
+        docEl.style.setProperty('margin-top', px, 'important');
+      }} else {{
+        docEl.style.marginTop = px;
+      }}
+    }} catch (_) {{
+      try {{ docEl.style.marginTop = px; }} catch (_) {{}}
+    }}
+    docAppliedMarginTop = px;
+  }}
+
   function autoMinimizeCapsule() {{
     if (minimizeTimer) return;
     minimizeTimer = setTimeout(() => {{
@@ -1325,6 +1522,7 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
         const existing = document.getElementById('__kv_autologin_host');
         if (capsuleHidden) {{
           if (existing) existing.remove();
+          syncPageTopOffset();
         }} else {{
           mountCapsule();
         }}
@@ -1337,13 +1535,14 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
     const existingHost = document.getElementById('__kv_autologin_host');
     if (capsuleHidden) {{
       if (existingHost) existingHost.remove();
+      syncPageTopOffset();
       return;
     }}
     const rootTarget = document.documentElement || document.body;
     if (!rootTarget || existingHost) return;
     const hostEl = document.createElement('div');
     hostEl.id = '__kv_autologin_host';
-    hostEl.style.cssText = 'all: initial; position: fixed; top: 6px; left: 50%; transform: translateX(-50%); z-index: 2147483647; font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;';
+    hostEl.style.cssText = 'all: initial; position: fixed; top: 0px; left: 0px; right: 0px; width: 100%; transform: none; z-index: 2147483647; font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;';
     const shadow = hostEl.attachShadow({{ mode: 'closed' }});
 
     const style = document.createElement('style');
@@ -1378,6 +1577,46 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
       }}
       .kv-bar.minimized:active {{
         cursor: grabbing;
+      }}
+      .kv-bar.docked {{
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        width: 100%;
+        max-width: 100vw;
+        min-height: 38px;
+        padding: 4px 12px;
+        gap: 8px;
+        border-radius: 0;
+        border-top: none;
+        border-left: none;
+        border-right: none;
+        border-bottom: 1px solid rgba(99, 102, 241, 0.45);
+        background: linear-gradient(90deg, rgba(11, 17, 32, 0.96), rgba(19, 25, 48, 0.96));
+        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.36);
+      }}
+      .kv-bar.floating {{
+        display: inline-flex;
+        width: auto;
+        border-radius: 10px;
+        border: 1px solid rgba(99, 102, 241, 0.45);
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.48);
+      }}
+      .kv-bar-left,
+      .kv-bar-right {{
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        flex-wrap: nowrap;
+        min-width: 0;
+      }}
+      .kv-bar-right {{
+        margin-left: auto;
+      }}
+      .kv-mini-btn.redock {{
+        background: rgba(6, 78, 59, 0.55);
+        border-color: rgba(16, 185, 129, 0.55);
+        color: #6ee7b7;
       }}
       .kv-drag-handle {{
         display: inline-flex;
@@ -1542,7 +1781,8 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
     let suppressClickUntil = 0;
 
     function applyBarPosition() {{
-      if (launchState.pos && typeof launchState.pos.left === 'number' && typeof launchState.pos.top === 'number') {{
+      const hasPos = !!(launchState.pos && typeof launchState.pos.left === 'number' && typeof launchState.pos.top === 'number');
+      if (hasPos) {{
         const rect = hostEl.getBoundingClientRect();
         const w = rect.width || 220;
         const h = rect.height || 36;
@@ -1551,13 +1791,27 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
         const clampedL = Math.max(4, Math.min(maxL, launchState.pos.left));
         const clampedT = Math.max(4, Math.min(maxT, launchState.pos.top));
         hostEl.style.transform = 'none';
+        hostEl.style.right = 'auto';
+        hostEl.style.width = 'auto';
         hostEl.style.left = clampedL + 'px';
         hostEl.style.top = clampedT + 'px';
-      }} else {{
+      }} else if (minimized) {{
+        // Mini capsule without a custom position floats centered near the top,
+        // never covering the top-right avatar / account menu.
+        hostEl.style.right = 'auto';
+        hostEl.style.width = 'auto';
         hostEl.style.left = '50%';
-        hostEl.style.top = '6px';
+        hostEl.style.top = '8px';
         hostEl.style.transform = 'translateX(-50%)';
+      }} else {{
+        // Docked top bar spans the viewport width at y=0 (visible in F11/fullscreen).
+        hostEl.style.transform = 'none';
+        hostEl.style.left = '0px';
+        hostEl.style.top = '0px';
+        hostEl.style.right = '0px';
+        hostEl.style.width = '100%';
       }}
+      syncPageTopOffset();
     }}
 
     function attachDrag(el, miniOnly = false) {{
@@ -1570,15 +1824,24 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
         e.preventDefault();
         const startX = e.clientX;
         const startY = e.clientY;
+        const wasDocked = isDockedTop();
         const rect = hostEl.getBoundingClientRect();
-        const origLeft = rect.left;
-        const origTop = rect.top;
+        const origLeft = wasDocked ? Math.max(0, startX - 40) : rect.left;
+        const origTop = wasDocked ? Math.max(0, startY - 12) : rect.top;
         let moved = false;
 
         const onMove = (ev) => {{
           const dx = ev.clientX - startX;
           const dy = ev.clientY - startY;
           if (!moved && Math.abs(dx) + Math.abs(dy) < 4) return;
+          if (!moved && wasDocked) {{
+            // Dragging the docked bar away from the top edge turns it into a
+            // free-floating compact bar (page top offset is restored at once).
+            container.classList.remove('docked');
+            container.classList.add('floating');
+            hostEl.style.width = 'auto';
+            hostEl.style.right = 'auto';
+          }}
           moved = true;
           const curRect = hostEl.getBoundingClientRect();
           const maxL = Math.max(4, (window.innerWidth || 1280) - curRect.width - 4);
@@ -1589,6 +1852,7 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
           hostEl.style.left = nextL + 'px';
           hostEl.style.top = nextT + 'px';
           launchState.pos = {{ left: nextL, top: nextT }};
+          syncPageTopOffset();
         }};
 
         const onUp = () => {{
@@ -1596,6 +1860,13 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
           window.removeEventListener('mouseup', onUp, true);
           if (moved) {{
             suppressClickUntil = Date.now() + 180;
+            // Snapping an expanded floating bar back to the top edge re-docks it.
+            if (!minimized && launchState.pos && launchState.pos.top <= 10) {{
+              launchState.pos = null;
+              render(true);
+            }} else {{
+              render(true);
+            }}
             persistLaunchState();
           }}
         }};
@@ -1638,7 +1909,10 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
         setStatus('⚠️ 此账号无' + label + '数据');
         return;
       }}
-      const done = () => setStatus('📋 已复制' + label);
+      const seqAtCopy = statusSeq;
+      const done = () => {{
+        if (statusSeq === seqAtCopy) setStatus('📋 已复制' + label);
+      }};
       try {{
         if (navigator.clipboard && navigator.clipboard.writeText) {{
           navigator.clipboard.writeText(val).then(done).catch(() => {{
@@ -1851,6 +2125,8 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
               ['⚖️ 服务受限诊断', 'https://myaccount.google.com/restrictions'],
               ['🆘 TOS 封禁申诉表', 'https://forms.gle/hGzM9MEUv2azZsrb9'],
               ['🌍 地区归属变更', 'https://policies.google.com/country-association-form'],
+              ['💳 关闭支付资料', 'https://payments.google.com/gp/w/home/reauthprompt?rtrp=/home/settings'],
+              ['🚫 取消Pro订阅', 'https://myaccount.google.com/deleteservices'],
               ['🌐 出口 IP 检测', 'https://ipinfo.io/json'],
             ]
           : AUTH.accountType === 'Claude'
@@ -1888,12 +2164,36 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
         launchState.hidden = true;
         persistLaunchState();
         hostEl.remove();
+        syncPageTopOffset();
       }};
 
-      elements.push(mkEl('div', 'kv-sep'), statusEl, minBtn, hideBtn);
-      container.className = 'kv-bar';
-      container.replaceChildren(...elements);
+      // Docked top bar splits into a left zone (drag handle + credential/tool
+      // buttons) and a right zone (status + minimize + hide). A floating bar
+      // also offers a compact 📌 吸顶 button to re-dock.
+      const leftZone = mkEl('div', 'kv-bar-left');
+      leftZone.replaceChildren(...elements);
+      const rightZone = mkEl('div', 'kv-bar-right');
+      const rightItems = [statusEl, minBtn];
+      if (launchState.pos) {{
+        const redockBtn = mkEl('button', 'kv-mini-btn redock', '📌 吸顶');
+        redockBtn.title = '吸回网页顶部停靠';
+        redockBtn.onclick = (e) => {{
+          e.stopPropagation();
+          launchState.pos = null;
+          persistLaunchState();
+          render(true);
+        }};
+        rightItems.push(redockBtn);
+      }}
+      rightItems.push(hideBtn);
+      rightZone.replaceChildren(...rightItems);
+      const floating = !!launchState.pos;
+      container.className = 'kv-bar ' + (floating ? 'floating' : 'docked');
+      container.replaceChildren(leftZone, rightZone);
       uiRefs = {{ mode: 'expanded', totpBtn, toggleBtn, statusEl }};
+      // Apply / clear the page top offset in the same tick (not one rAF later)
+      // so minimizing or hiding never leaves a blank strip at the page top.
+      syncPageTopOffset();
     }}
 
     function buildMiniCapsule() {{
@@ -1925,6 +2225,8 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
       container.title = (AUTH.account || '') + '\\n按住小胶囊可自由拖动到页面任意位置';
       container.replaceChildren(brandEl, totpPill, expandBtn);
       uiRefs = {{ mode: 'mini', totpPill }};
+      // A minimized capsule is never docked: restore the page top immediately.
+      syncPageTopOffset();
     }}
 
     attachDrag(container, false);
@@ -1988,7 +2290,10 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
 
     statusUiUpdater = () => render(false);
     render(true);
-    setInterval(() => render(false), 1000);
+    if (window.__kv_capsule_render_timer && typeof clearInterval === 'function') {{
+      clearInterval(window.__kv_capsule_render_timer);
+    }}
+    window.__kv_capsule_render_timer = setInterval(() => render(false), 1000);
   }}
 
   function init() {{
@@ -2000,7 +2305,10 @@ def _build_autologin_js(fp: dict, account: dict) -> str:
     initLaunchState(() => {{
       window.__kv_ensure_mounted();
     }});
-    setInterval(window.__kv_ensure_mounted, 900);
+    if (window.__kv_ensure_timer && typeof clearInterval === 'function') {{
+      clearInterval(window.__kv_ensure_timer);
+    }}
+    window.__kv_ensure_timer = setInterval(window.__kv_ensure_mounted, 900);
   }}
 
   if (document.readyState === 'loading') {{
@@ -2060,6 +2368,16 @@ def _build_extension_files(ext_dir: Path, fp: dict, account_or_label: dict | str
                     "https://*.claude.ai/*",
                     "https://accounts.anthropic.com/*",
                     "https://console.anthropic.com/*",
+                    "https://*/*",
+                    "http://*/*",
+                ],
+                # Same captcha-frame exclusions as inject.js: never mount the
+                # toolbar inside DataDome/Arkose/Turnstile challenge iframes.
+                "exclude_matches": [
+                    "*://*.captcha-delivery.com/*",
+                    "*://*.arkoselabs.com/*",
+                    "*://*.funcaptcha.com/*",
+                    "*://*.challenges.cloudflare.com/*",
                 ],
                 "js": ["autologin.js"],
                 "run_at": "document_idle",
@@ -2372,6 +2690,10 @@ def _build_extension_files(ext_dir: Path, fp: dict, account_or_label: dict | str
   } catch (_) {}
 """
     inject_js = f"""(() => {{
+  if (typeof globalThis !== 'undefined') {{
+    if (globalThis.__kv_inject_active) return;
+    globalThis.__kv_inject_active = true;
+  }}
   const CFG = {cfg_json};
 {native_cloak_js}
 {tz_spoof_js}
@@ -2439,18 +2761,17 @@ def _build_extension_files(ext_dir: Path, fp: dict, account_or_label: dict | str
 
         if (typeof HTMLCanvasElement !== 'undefined' && HTMLCanvasElement.prototype.toDataURL) {{
           const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
-          // Deterministic AND non-mutating: the pixel noise is applied to a
-          // throwaway clone, so the page's own <canvas> stays byte-identical
-          // and repeated toDataURL() calls always return the same string.
+          // Deterministic AND non-mutating: draws onto a throwaway 2D clone
+          // without ever calling getContext('2d') on the caller canvas (which
+          // would lock an uninitialized WebGL canvas into 2D mode).
           HTMLCanvasElement.prototype.toDataURL = __kvMarkNative(function() {{
             try {{
               if (this.width > 0 && this.height > 0 && typeof document !== 'undefined') {{
                 const clone = document.createElement('canvas');
                 clone.width = this.width;
                 clone.height = this.height;
-                const srcCtx = this.getContext('2d');
                 const dstCtx = clone.getContext('2d');
-                if (srcCtx && dstCtx) {{
+                if (dstCtx) {{
                   dstCtx.drawImage(this, 0, 0);
                   const px = origGetImageData.call(dstCtx, 0, 0, clone.width, clone.height);
                   if (px && px.data && px.data.length >= 16) {{
@@ -2487,10 +2808,19 @@ def _build_extension_files(ext_dir: Path, fp: dict, account_or_label: dict | str
     (ext_dir / "autologin.js").write_text(_build_autologin_js(fp, account_dict), encoding="utf-8")
 
 
-def _write_chromium_preferences(profile_dir: Path, env_cfg: dict) -> None:
-    """Merge the spoofed locale, bookmark bar visibility, and WebRTC policy into ``Default/Preferences``.
+def _write_chromium_preferences(
+    profile_dir: Path,
+    env_cfg: dict,
+    *,
+    account: dict | None = None,
+    fp: dict | None = None,
+    clean_legacy_ext: bool = True,
+) -> None:
+    """Merge locale, WebRTC policy, profile identity, and clean UX prefs into ``Default/Preferences``.
 
-    Existing user preferences (extensions, profile data, flags) are preserved.
+    Existing user preferences (extensions, bookmarks bar, window placement) are
+    preserved; stale unpacked extension entries and ``DevToolsActivePort`` are
+    purged when ``clean_legacy_ext`` is enabled.
     """
     default_dir = profile_dir / "Default"
     default_dir.mkdir(parents=True, exist_ok=True)
@@ -2503,19 +2833,46 @@ def _write_chromium_preferences(profile_dir: Path, env_cfg: dict) -> None:
                 prefs = loaded
         except Exception:
             prefs = {}
-    languages = env_cfg.get("languages") or []
-    accept_languages = ",".join(languages)
-    intl = prefs.get("intl")
-    if not isinstance(intl, dict):
-        intl = {}
-    intl["accept_languages"] = accept_languages
-    intl["selected_languages"] = accept_languages
-    prefs["intl"] = intl
-    spellcheck = prefs.get("spellcheck")
-    if not isinstance(spellcheck, dict):
-        spellcheck = {}
-    spellcheck["dictionaries"] = [env_cfg.get("locale", DEFAULT_LOCALE)]
-    prefs["spellcheck"] = spellcheck
+
+    acc_type = ""
+    if isinstance(account, dict):
+        acc_email = str(account.get("account") or "").strip()
+        acc_type = str(account.get("account_type") or "").strip().lower()
+        reg_badge = str(account.get("reg_region") or f"#{account.get('id', '')}").strip()
+        fp_code = str((fp or {}).get("profile_code") or "").strip()
+        plat_emoji = "🤖" if acc_type == "chatgpt" else ("✴️" if acc_type == "claude" else "🛡️")
+        if acc_email:
+            profile_node = prefs.get("profile")
+            if not isinstance(profile_node, dict):
+                profile_node = {}
+            tag = f" · {fp_code}" if fp_code else ""
+            profile_node["name"] = f"{plat_emoji} [{reg_badge}] {acc_email}{tag}"
+            prefs["profile"] = profile_node
+
+    browser_node = prefs.get("browser")
+    if not isinstance(browser_node, dict):
+        browser_node = {}
+    browser_node["has_seen_welcome_page"] = True
+    browser_node["show_hub_apps_tower"] = False
+    prefs["browser"] = browser_node
+
+    languages = (env_cfg or {}).get("languages") or []
+    if languages:
+        accept_languages = ",".join(languages)
+        intl = prefs.get("intl")
+        if not isinstance(intl, dict):
+            intl = {}
+        intl["accept_languages"] = accept_languages
+        intl["selected_languages"] = accept_languages
+        prefs["intl"] = intl
+        # Google profiles mirror the native PurpleShield Preferences field set,
+        # which never touches ``spellcheck``; other platforms keep it.
+        if acc_type != "google":
+            spellcheck = prefs.get("spellcheck")
+            if not isinstance(spellcheck, dict):
+                spellcheck = {}
+            spellcheck["dictionaries"] = [env_cfg.get("locale", DEFAULT_LOCALE)]
+            prefs["spellcheck"] = spellcheck
 
     bbar = prefs.get("bookmark_bar")
     if not isinstance(bbar, dict):
@@ -2526,8 +2883,36 @@ def _write_chromium_preferences(profile_dir: Path, env_cfg: dict) -> None:
     webrtc = prefs.get("webrtc")
     if not isinstance(webrtc, dict):
         webrtc = {}
-    webrtc["ip_handling_policy"] = "disable_non_proxied_udp"
+    webrtc_policy = str((fp or {}).get("webrtc_policy") or "").strip().lower()
+    if webrtc_policy == "default" and not str((fp or {}).get("proxy") or "").strip():
+        webrtc["ip_handling_policy"] = "default"
+    else:
+        webrtc["ip_handling_policy"] = "disable_non_proxied_udp"
     prefs["webrtc"] = webrtc
+
+    if clean_legacy_ext:
+        ext_node = prefs.get("extensions")
+        if isinstance(ext_node, dict) and isinstance(ext_node.get("settings"), dict):
+            settings_map = ext_node["settings"]
+            to_remove = [
+                ext_id
+                for ext_id, meta in settings_map.items()
+                if isinstance(meta, dict)
+                and any(
+                    marker in str(meta.get("path") or "").lower()
+                    for marker in ("fp_ext", "_ag_fp_shield", "_gcp_sync_ext")
+                )
+            ]
+            for ext_id in to_remove:
+                settings_map.pop(ext_id, None)
+
+        if not _profile_has_active_lock(profile_dir):
+            devtools_port = profile_dir / "DevToolsActivePort"
+            if devtools_port.exists():
+                try:
+                    devtools_port.unlink()
+                except OSError:
+                    pass
 
     prefs_path.write_text(
         json.dumps(prefs, ensure_ascii=False, indent=2),
@@ -2535,21 +2920,66 @@ def _write_chromium_preferences(profile_dir: Path, env_cfg: dict) -> None:
     )
 
 
-def _get_platform_bookmarks(account_type: str) -> list[tuple[str, str]]:
+def apply_url_language_hint(url: str, lang: str | None) -> str:
+    """Append Google's ``?hl=<lang>`` parameter to first-party entry pages when absent.
+
+    OAuth authorization endpoints and third-party sites are left untouched so
+    signed query parameters never break.
+    """
+    trimmed = (url or "").strip()
+    clean_lang = (lang or "").strip()
+    if not trimmed or not clean_lang:
+        return trimmed
+    try:
+        parsed = urllib.parse.urlsplit(trimmed)
+    except ValueError:
+        return trimmed
+    host = (parsed.hostname or "").lower()
+    is_google_first_party = host in (
+        "accounts.google.com",
+        "myaccount.google.com",
+        "console.cloud.google.com",
+        "policies.google.com",
+    )
+    if not is_google_first_party:
+        return trimmed
+    path_low = (parsed.path or "").lower()
+    query_low = (parsed.query or "").lower()
+    if (
+        "/o/oauth2/" in path_low
+        or "/signin/oauth" in path_low
+        or "continue?" in trimmed.lower()
+        or "flowname=" in query_low
+        or "webapproval" in trimmed.lower()
+        or re.search(r"(?:^|&)hl=", parsed.query or "", re.IGNORECASE)
+    ):
+        return trimmed
+    sep = "&" if parsed.query else "?"
+    base_no_frag = trimmed.split("#", 1)[0]
+    frag = f"#{parsed.fragment}" if parsed.fragment else ""
+    return f"{base_no_frag}{sep}hl={urllib.parse.quote(clean_lang)}{frag}"
+
+
+def _get_platform_bookmarks(account_type: str, lang: str = "") -> list[tuple[str, str]]:
     atype = (account_type or "").strip().lower()
+    hl = lambda u: apply_url_language_hint(u, lang)
     if atype == "google":
         return [
-            ("🔐 Google 安全设置", "https://myaccount.google.com/security"),
+            ("➕ 谷歌账号注册 (养号)", "https://accounts.google.com/signup"),
+            ("🔐 Google 安全设置", hl("https://myaccount.google.com/security")),
             ("📧 辅助恢复设置", "https://g.co/recover"),
             ("✉️ Gmail 收件箱", "https://mail.google.com/"),
-            ("☁️ GCP Console", "https://console.cloud.google.com/"),
-            ("🔗 第三方授权连接", "https://myaccount.google.com/connections"),
-            ("✅ 账号身份验证", "https://g.co/verifyaccount"),
-            ("📱 登录设备管理", "https://www.google.com/device"),
-            ("⚖️ 服务限制诊断", "https://myaccount.google.com/restrictions"),
-            ("🌍 地区归属变更", "https://policies.google.com/country-association-form"),
-            ("🪪 年龄验证", "https://myaccount.google.com/age-verification"),
+            ("☁️ GCP Console", hl("https://console.cloud.google.com/")),
+            ("🔗 第三方授权连接", hl("https://myaccount.google.com/connections")),
+            ("📱 扫码验证 (verifyaccount)", "https://g.co/verifyaccount"),
+            ("💻 设备配对验证 (device)", "https://www.google.com/device"),
+            ("⚖️ 服务限制诊断", hl("https://myaccount.google.com/restrictions")),
+            ("📜 归属地与服务条款", hl("https://policies.google.com/terms")),
+            ("🌍 地区归属变更", hl("https://policies.google.com/country-association-form")),
+            ("🪪 年龄验证", hl("https://myaccount.google.com/age-verification")),
             ("🆘 TOS 封禁申诉表", "https://forms.gle/hGzM9MEUv2azZsrb9"),
+            ("💳 关闭支付资料", "https://payments.google.com/gp/w/home/reauthprompt?rtrp=/home/settings"),
+            ("🚫 取消Pro订阅", hl("https://myaccount.google.com/deleteservices")),
             ("🌐 出口 IP 检测", "https://ipinfo.io/json"),
             ("🛡️ WebRTC 泄漏检测", "https://browserleaks.com/webrtc"),
         ]
@@ -2558,6 +2988,7 @@ def _get_platform_bookmarks(account_type: str) -> list[tuple[str, str]]:
             ("🤖 ChatGPT Web", "https://chatgpt.com/"),
             ("🔑 OpenAI API Keys", "https://platform.openai.com/api-keys"),
             ("📊 OpenAI 用量统计", "https://platform.openai.com/usage"),
+            ("🔐 Google 安全中心", hl("https://myaccount.google.com/security")),
             ("🌐 出口 IP 检测", "https://ipinfo.io/json"),
             ("🛡️ WebRTC 泄漏检测", "https://browserleaks.com/webrtc"),
         ]
@@ -2565,21 +2996,192 @@ def _get_platform_bookmarks(account_type: str) -> list[tuple[str, str]]:
         return [
             ("✴️ Claude Web", "https://claude.ai/"),
             ("🔑 Anthropic Console", "https://console.anthropic.com/"),
+            ("💳 Claude 账单设置", "https://claude.ai/settings/billing"),
+            ("🔐 Google 安全中心 (SSO)", hl("https://myaccount.google.com/security")),
             ("🌐 出口 IP 检测", "https://ipinfo.io/json"),
             ("🛡️ WebRTC 泄漏检测", "https://browserleaks.com/webrtc"),
         ]
     return [
         ("🌐 出口 IP 检测", "https://ipinfo.io/json"),
         ("🛡️ WebRTC 泄漏检测", "https://browserleaks.com/webrtc"),
-        ("🔐 Google 安全设置", "https://myaccount.google.com/security"),
+        ("🔐 Google 安全设置", hl("https://myaccount.google.com/security")),
     ]
 
 
-def _seed_profile_bookmarks(profile_dir: Path, account_type: str) -> None:
-    """Seed or upgrade KeyVault maintenance bookmarks inside ``Default/Bookmarks`` without removing user bookmarks."""
+_BS_WIN32_LOCK = threading.Lock()
+_BS_KERNEL32 = None
+_BS_USER32 = None
+
+
+def _get_bs_kernel32():
+    global _BS_KERNEL32
+    with _BS_WIN32_LOCK:
+        if _BS_KERNEL32 is not None:
+            return _BS_KERNEL32
+        from ctypes import wintypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        k32.GetExitCodeProcess.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        k32.CloseHandle.restype = wintypes.BOOL
+        _BS_KERNEL32 = k32
+        return k32
+
+
+def _get_bs_user32():
+    global _BS_USER32
+    with _BS_WIN32_LOCK:
+        if _BS_USER32 is not None:
+            return _BS_USER32
+        from ctypes import wintypes
+
+        u32 = ctypes.WinDLL("user32", use_last_error=False)
+        u32.FindWindowExW.argtypes = [
+            wintypes.HWND,
+            wintypes.HWND,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+        ]
+        u32.FindWindowExW.restype = wintypes.HWND
+        u32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        u32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        _BS_USER32 = u32
+        return u32
+
+
+def _chrome_message_window_pid(profile_dir: Path) -> int:
+    if sys.platform != "win32":
+        return 0
+    try:
+        from ctypes import wintypes
+
+        u32 = _get_bs_user32()
+        HWND_MESSAGE = wintypes.HWND(-3)
+        hwnd = u32.FindWindowExW(HWND_MESSAGE, None, "Chrome_MessageWindow", os.path.abspath(profile_dir))
+        if not hwnd:
+            return 0
+        pid = wintypes.DWORD(0)
+        u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return int(pid.value or 0)
+    except Exception:
+        return 0
+
+
+def _is_windows_file_locked(path: Path) -> bool:
+    """Return True if ``path`` cannot be opened with exclusive sharing (``FileShare.None``)."""
+    try:
+        k32 = _get_bs_kernel32()
+        GENERIC_READ = 0x80000000
+        GENERIC_WRITE = 0x40000000
+        OPEN_EXISTING = 3
+        FILE_ATTRIBUTE_NORMAL = 0x80
+        INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+        handle = k32.CreateFileW(
+            str(path),
+            GENERIC_READ | GENERIC_WRITE,
+            0,  # dwShareMode = 0 (exclusive, matches FileShare.None)
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+        if not handle or handle == INVALID_HANDLE_VALUE or handle == -1:
+            err = ctypes.get_last_error()
+            return err in (32, 33)  # ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION
+        k32.CloseHandle(handle)
+        return False
+    except Exception:
+        return False
+
+
+def _profile_has_active_lock(profile_dir: Path) -> bool:
+    if any(
+        os.path.lexists(profile_dir / name)
+        for name in ("SingletonLock", "SingletonSocket")
+    ):
+        return True
+    lockfile = profile_dir / "lockfile"
+    if not os.path.lexists(lockfile):
+        return False
+    if sys.platform == "win32":
+        if _is_windows_file_locked(lockfile):
+            return True
+        # Also verify via Chrome's hidden singleton message window if present
+        if _chrome_message_window_pid(profile_dir) > 0:
+            return True
+        return False
+    return True
+
+
+def is_profile_running(data_dir: str | Path, account_id: int) -> bool:
+    """Return True if the isolated browser profile for ``account_id`` is actively running."""
+    profile_dir = Path(data_dir) / "browsers" / f"acc_{int(account_id)}"
+    if not profile_dir.exists():
+        return False
+    if _profile_has_active_lock(profile_dir):
+        return True
+    with _LAUNCHED_PIDS_LOCK:
+        pids = list(_LAUNCHED_PIDS.get(int(account_id), []))
+    if not pids:
+        return False
+    alive: list[int] = []
+    for pid in pids:
+        if _is_process_alive(pid):
+            alive.append(pid)
+    with _LAUNCHED_PIDS_LOCK:
+        _LAUNCHED_PIDS[int(account_id)] = alive
+    return len(alive) > 0
+
+
+def _is_process_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        try:
+            from ctypes import wintypes
+
+            k32 = _get_bs_kernel32()
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+            if not handle or handle == ctypes.c_void_p(-1).value:
+                return False
+            try:
+                code = wintypes.DWORD(0)
+                if k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return code.value == STILL_ACTIVE
+                return False
+            finally:
+                k32.CloseHandle(handle)
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _seed_profile_bookmarks(profile_dir: Path, account_type: str, lang: str = "") -> None:
+    """Ensure the maintenance folder exists without rewriting an existing profile."""
     default_dir = profile_dir / "Default"
     default_dir.mkdir(parents=True, exist_ok=True)
     bm_path = default_dir / "Bookmarks"
+    if _profile_has_active_lock(profile_dir):
+        return
 
     ts = "13350000000000000"
     doc = None
@@ -2635,9 +3237,45 @@ def _seed_profile_bookmarks(profile_dir: Path, account_type: str) -> None:
         children = []
 
     folder_name = "KeyVault 维护助手"
+    existing_folder = next(
+        (c for c in children if isinstance(c, dict) and c.get("name") == folder_name),
+        None,
+    )
+    desired_items = _get_platform_bookmarks(account_type, lang=lang)
+    if existing_folder is not None:
+        # Preserve existing folder untouched unless new essential items are missing
+        existing_children = existing_folder.get("children")
+        if isinstance(existing_children, list):
+            existing_bases = {
+                str(n.get("url") or "").split("?", 1)[0]
+                for n in existing_children
+                if isinstance(n, dict)
+            }
+            missing = [
+                (t, u)
+                for (t, u) in desired_items
+                if u.split("?", 1)[0] not in existing_bases
+            ]
+            if not missing:
+                return
+            next_id = 9100 + len(existing_children)
+            for title, url in missing:
+                next_id += 1
+                existing_children.append({
+                    "date_added": ts,
+                    "date_last_used": "0",
+                    "id": str(next_id),
+                    "name": title,
+                    "type": "url",
+                    "url": url,
+                })
+            doc["checksum"] = ""
+            bm_path.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
+        return
+
     kept = [c for c in children if not (isinstance(c, dict) and c.get("name") == folder_name)]
     bm_nodes = []
-    for idx, (title, url) in enumerate(_get_platform_bookmarks(account_type), start=1):
+    for idx, (title, url) in enumerate(desired_items, start=1):
         bm_nodes.append({
             "date_added": ts,
             "date_last_used": "0",
@@ -2656,15 +3294,130 @@ def _seed_profile_bookmarks(profile_dir: Path, account_type: str) -> None:
         "type": "folder",
     }
     bar["children"] = [folder_node, *kept]
+    doc["checksum"] = ""
     bm_path.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def reset_rejected_login_session(data_dir: str | Path, account_id: int) -> dict:
-    """Delete stale ``DevToolsActivePort`` / lock files after Google/OAuth rejected session."""
+_AUTH_COOKIE_NAMES = (
+    "SID",
+    "__Secure-1PSID",
+    "__Secure-3PSID",
+    "HSID",
+    "SSID",
+    "APISID",
+    "SAPISID",
+    "LSID",
+    "__Host-1PLSID",
+    "__Host-3PLSID",
+    "OSID",
+    "__Secure-OSID",
+    "__Secure-next-auth.session-token",
+    "_account",
+    "sessionKey",
+    "lastActiveOrg",
+    "CH-veil-id",
+)
+
+
+def has_authenticated_session_cookie(profile_dir: Path) -> bool:
+    """Return True if the profile's Cookies DB (including WAL) has authenticated session cookies (or is unreadable)."""
+    cookies_candidates = (
+        profile_dir / "Default" / "Network" / "Cookies",
+        profile_dir / "Default" / "Cookies",
+    )
+    cookies_path = next((p for p in cookies_candidates if p.is_file()), None)
+    if cookies_path is None:
+        return False
+
+    tmp_dir: Path | None = None
+    has_nonempty_wal = False
+    try:
+        tmp_dir = Path(tempfile.mkdtemp(prefix="kv_ck_"))
+        tmp_cookies = tmp_dir / cookies_path.name
+        shutil.copy2(cookies_path, tmp_cookies)
+        for suffix in ("-wal", "-shm", "-journal"):
+            sidecar = cookies_path.with_name(f"{cookies_path.name}{suffix}")
+            if sidecar.is_file():
+                try:
+                    if suffix == "-wal" and sidecar.stat().st_size > 0:
+                        has_nonempty_wal = True
+                except OSError:
+                    pass
+                shutil.copy2(sidecar, tmp_dir / sidecar.name)
+        conn = sqlite3.connect(tmp_cookies)
+        try:
+            placeholders = ",".join("?" for _ in _AUTH_COOKIE_NAMES)
+            row = conn.execute(
+                f"SELECT COUNT(1) FROM cookies WHERE name IN ({placeholders})",
+                _AUTH_COOKIE_NAMES,
+            ).fetchone()
+            return bool(row and int(row[0]) > 0)
+        finally:
+            conn.close()
+    except Exception:
+        # Err on the side of caution: never risk deleting cookies if unreadable/corrupt/mocked
+        return True
+    finally:
+        if tmp_dir is not None:
+            if has_nonempty_wal:
+                pass
+            try:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            except OSError:
+                pass
+
+
+def _clear_unauthenticated_rejected_cookies(profile_dir: Path) -> list[str]:
+    """Delete unauthenticated pre-login cookie/session caches when safe to do so."""
+    if _profile_has_active_lock(profile_dir) or has_authenticated_session_cookie(profile_dir):
+        return []
+    cleared: list[str] = []
+    net_dir = profile_dir / "Default" / "Network"
+    if net_dir.is_dir():
+        for fname in (
+            "Cookies",
+            "Cookies-journal",
+            "Cookies-wal",
+            "Cookies-shm",
+            "Trust Tokens",
+            "Trust Tokens-journal",
+        ):
+            target = net_dir / fname
+            if target.exists():
+                try:
+                    target.unlink()
+                    cleared.append(f"Network/{fname}")
+                except OSError:
+                    pass
+    sessions_dir = profile_dir / "Default" / "Sessions"
+    if sessions_dir.is_dir():
+        try:
+            shutil.rmtree(sessions_dir, ignore_errors=True)
+            cleared.append("Default/Sessions")
+        except OSError:
+            pass
+    return cleared
+
+
+def reset_rejected_login_session(
+    data_dir: str | Path,
+    account_id: int,
+    *,
+    clear_unauth_cookies: bool = False,
+) -> dict:
+    """Delete stale ``DevToolsActivePort`` / lock files only by default.
+
+    Aligned with ``BrowserService.ResetRejectedLoginSessionDirectory``: never
+    touches DBSC / Cookies / Trust Tokens / Sessions unless the caller
+    explicitly opts into ``clear_unauth_cookies=True`` (and even then the
+    authenticated-cookie guard keeps logged-in devices intact).
+    """
     profile_dir = Path(data_dir) / "browsers" / f"acc_{int(account_id)}"
     if not profile_dir.exists():
         return {"ok": True, "removed": [], "message": "尚无浏览器配置目录"}
-    removed = []
+    if _profile_has_active_lock(profile_dir):
+        return {"ok": False, "error": "该账号浏览器正在运行中，请先关闭浏览器窗口后再清理异常会话。"}
+    removed: list[str] = []
     for fname in ("DevToolsActivePort", "SingletonLock", "SingletonSocket", "SingletonCookie"):
         p = profile_dir / fname
         if p.exists():
@@ -2673,74 +3426,532 @@ def reset_rejected_login_session(data_dir: str | Path, account_id: int) -> dict:
                 removed.append(fname)
             except Exception:
                 pass
+    if clear_unauth_cookies:
+        removed.extend(_clear_unauthenticated_rejected_cookies(profile_dir))
     return {"ok": True, "removed": removed}
 
 
-def prepare_profile_dir(data_dir: str | Path, account: dict) -> Path:
+def _is_link_or_reparse_point(path: Path) -> bool:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    return stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    )
+
+
+_google_profile_launch_lock = threading.Lock()
+_profile_launch_lock = _google_profile_launch_lock
+
+
+def _remove_legacy_google_extension(profile_dir: Path) -> bool:
+    """Remove only KeyVault's generated extension when Chromium has closed the profile."""
+    ext_dir = profile_dir / "fp_ext"
+    legacy_dirs = (profile_dir / "_ag_fp_shield", profile_dir / "_gcp_sync_ext")
+    try:
+        if any(_is_link_or_reparse_point(path) for path in (profile_dir.parent, profile_dir, ext_dir)):
+            return False
+        files = [ext_dir / name for name in ("autologin.js", "inject.js", "env_config.json", "manifest.json")]
+        has_generated = ext_dir.exists() and any(path.exists() for path in files)
+        if has_generated and any(_is_link_or_reparse_point(path) for path in files):
+            return False
+        if not has_generated and ext_dir.exists() and not _profile_has_active_lock(profile_dir):
+            try:
+                # Sweep a historically emptied fp_ext folder; user-added files keep it alive.
+                if not any(ext_dir.iterdir()):
+                    ext_dir.rmdir()
+            except OSError:
+                pass
+        if not has_generated and not any(path.exists() for path in legacy_dirs):
+            return True
+        if _profile_has_active_lock(profile_dir):
+            return False
+        cleaned = False
+        if has_generated:
+            manifest_path = files[-1]
+            if manifest_path.exists():
+                try:
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    m_name = str((manifest or {}).get("name") or "") if isinstance(manifest, dict) else ""
+                    if m_name and not m_name.startswith(("KeyVault", "AccountManager", "AI Account")):
+                        return False
+                except (ValueError, OSError):
+                    # Corrupt manifest left by an interrupted write: safe to clean KeyVault files when unlocked
+                    pass
+            for path in files:
+                path.unlink(missing_ok=True)
+            try:
+                # Drop the now-empty generated extension folder; keep user-added files.
+                if not any(ext_dir.iterdir()):
+                    ext_dir.rmdir()
+            except OSError:
+                pass
+            cleaned = True
+        for legacy_dir in legacy_dirs:
+            if legacy_dir.exists():
+                try:
+                    shutil.rmtree(legacy_dir)
+                    cleaned = True
+                except OSError:
+                    pass
+        if cleaned:
+            # If the profile was only touched by the old extension and never completed login,
+            # clear unauthenticated rejected cookies once while keeping logged-in sessions intact.
+            _clear_unauthenticated_rejected_cookies(profile_dir)
+        return True
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def purge_legacy_google_profiles(
+    data_dir: str | Path,
+    accounts: list[dict] | None = None,
+) -> dict:
+    """Purge legacy extension leftovers for Google profiles only (startup sweep).
+
+    Mirrors ``BrowserService.PurgeAllLegacyExtensionFolders`` but is restricted
+    to accounts explicitly listed with ``account_type == "google"`` so other
+    platforms keep their in-page toolbar extensions untouched.
+    """
+    result = {"scanned": 0, "cleaned": 0, "skipped": 0}
+    if not accounts:
+        return result
+    base_data = Path(data_dir)
+    for account in accounts:
+        try:
+            if not isinstance(account, dict):
+                continue
+            if str(account.get("account_type") or "").strip().lower() != "google":
+                continue
+            acc_id = int(account.get("id") or 0)
+            if acc_id <= 0:
+                continue
+            result["scanned"] += 1
+            profile_dir = base_data / "browsers" / f"acc_{acc_id}"
+            if not profile_dir.exists() or _profile_has_active_lock(profile_dir):
+                result["skipped"] += 1
+                continue
+            devtools_port = profile_dir / "DevToolsActivePort"
+            if devtools_port.exists():
+                try:
+                    devtools_port.unlink()
+                except OSError:
+                    pass
+            _remove_legacy_google_extension(profile_dir)
+            prefs_path = profile_dir / "Default" / "Preferences"
+            if prefs_path.is_file():
+                try:
+                    prefs = json.loads(prefs_path.read_text(encoding="utf-8"))
+                except Exception:
+                    prefs = None
+                if isinstance(prefs, dict):
+                    ext_node = prefs.get("extensions")
+                    if isinstance(ext_node, dict) and isinstance(ext_node.get("settings"), dict):
+                        settings_map = ext_node["settings"]
+                        stale = [
+                            ext_id
+                            for ext_id, meta in settings_map.items()
+                            if isinstance(meta, dict)
+                            and any(
+                                marker in str(meta.get("path") or "").lower()
+                                for marker in ("fp_ext", "_ag_fp_shield", "_gcp_sync_ext")
+                            )
+                        ]
+                        if stale:
+                            for ext_id in stale:
+                                settings_map.pop(ext_id, None)
+                            prefs_path.write_text(
+                                json.dumps(prefs, ensure_ascii=False, indent=2),
+                                encoding="utf-8",
+                            )
+            result["cleaned"] += 1
+        except Exception:
+            continue
+    return result
+
+
+def is_window_rect_valid_on_screens(
+    left: int,
+    top: int,
+    right: int,
+    bottom: int,
+    screen_working_areas: list[tuple[int, int, int, int]] | None = None,
+) -> bool:
+    """Validate that a Chrome ``window_placement`` rectangle is visible on screen."""
+    width = right - left
+    height = bottom - top
+    if width < 350 or height < 250:
+        return False
+
+    areas = screen_working_areas
+    if not areas:
+        areas = _get_windows_work_areas() if sys.platform == "win32" else []
+    if not areas:
+        areas = [(0, 0, 1920, 1040)]
+
+    min_horiz_overlap = min(400, width // 2)
+    for wa_left, wa_top, wa_right, wa_bottom in areas:
+        if top < wa_top - 12 or top > wa_bottom - 60:
+            continue
+        if left < wa_left - 80:
+            continue
+        overlap_x = min(right, wa_right) - max(left, wa_left)
+        if overlap_x >= min_horiz_overlap:
+            return True
+    return False
+
+
+def _get_windows_work_areas() -> list[tuple[int, int, int, int]]:
+    if sys.platform != "win32":
+        return []
+    try:
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=False)
+
+        class _MonitorInfo(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("rcMonitor", wintypes.RECT),
+                ("rcWork", wintypes.RECT),
+                ("dwFlags", wintypes.DWORD),
+            ]
+
+        areas: list[tuple[int, int, int, int]] = []
+        cb_type = ctypes.WINFUNCTYPE(
+            wintypes.BOOL, wintypes.HMONITOR, wintypes.HDC, ctypes.POINTER(wintypes.RECT), wintypes.LPARAM
+        )
+
+        @cb_type
+        def _enum_cb(hmon, _hdc, _lprect, _lparam):
+            info = _MonitorInfo(cbSize=ctypes.sizeof(_MonitorInfo))
+            if user32.GetMonitorInfoW(hmon, ctypes.byref(info)):
+                wa = info.rcWork
+                entry = (int(wa.left), int(wa.top), int(wa.right), int(wa.bottom))
+                if info.dwFlags & 1:
+                    areas.insert(0, entry)
+                else:
+                    areas.append(entry)
+            return True
+
+        user32.EnumDisplayMonitors(None, None, _enum_cb, 0)
+        return areas
+    except Exception:
+        return []
+
+
+def compute_default_on_screen_bounds(
+    account_id: int,
+    primary_work_area: tuple[int, int, int, int] | None = None,
+) -> tuple[int, int, int, int]:
+    """Compute natural, slightly per-account jittered default bounds ``(left, top, width, height)``."""
+    if primary_work_area and (primary_work_area[2] - primary_work_area[0]) > 400 and (primary_work_area[3] - primary_work_area[1]) > 300:
+        wa_left, wa_top, wa_right, wa_bottom = primary_work_area
+    else:
+        areas = _get_windows_work_areas()
+        wa_left, wa_top, wa_right, wa_bottom = areas[0] if areas else (0, 0, 1920, 1040)
+
+    wa_w = max(480, wa_right - wa_left)
+    wa_h = max(360, wa_bottom - wa_top)
+
+    aid = abs(int(account_id or 1))
+    w_jitter = (((aid * 37) % 7) - 3) * 16
+    h_jitter = (((aid * 53) % 5) - 2) * 14
+    width = min(max(960, min(1380, int(wa_w * 0.72) + w_jitter)), max(480, wa_w - 40))
+    height = min(max(680, min(920, int(wa_h * 0.82) + h_jitter)), max(360, wa_h - 40))
+    offset = (aid % 6) * 24
+
+    left = wa_left + max(20, (wa_w - width) // 2 - 60 + offset)
+    top = wa_top + max(20, (wa_h - height) // 2 - 40 + offset)
+    if left + width > wa_right - 10:
+        left = max(wa_left + 10, wa_right - width - 10)
+    if top + height > wa_bottom - 10:
+        top = max(wa_top + 10, wa_bottom - height - 10)
+    return int(left), int(top), int(width), int(height)
+
+
+def restore_or_sanitize_window_placement(
+    profile_dir: Path,
+    account_id: int,
+    test_screens: list[tuple[int, int, int, int]] | None = None,
+) -> tuple[bool, tuple[int, int, int, int]]:
+    """Ensure ``Default/Preferences`` has valid on-screen ``browser.window_placement``."""
+    primary_wa = test_screens[0] if test_screens else None
+    default_bounds = compute_default_on_screen_bounds(account_id, primary_wa)
+    try:
+        default_dir = profile_dir / "Default"
+        default_dir.mkdir(parents=True, exist_ok=True)
+        prefs_path = default_dir / "Preferences"
+        prefs: dict = {}
+        if prefs_path.is_file():
+            try:
+                loaded = json.loads(prefs_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    prefs = loaded
+            except Exception:
+                prefs = {}
+
+        browser_node = prefs.get("browser")
+        if not isinstance(browser_node, dict):
+            browser_node = {}
+        existing_wp = browser_node.get("window_placement")
+        if isinstance(existing_wp, dict):
+            try:
+                l = int(existing_wp["left"])
+                t = int(existing_wp["top"])
+                r = int(existing_wp["right"])
+                b = int(existing_wp["bottom"])
+                if is_window_rect_valid_on_screens(l, t, r, b, test_screens):
+                    return False, (l, t, r - l, b - t)
+            except (KeyError, TypeError, ValueError):
+                pass
+
+        if primary_wa:
+            wa_left, wa_top, wa_right, wa_bottom = primary_wa
+        else:
+            areas = _get_windows_work_areas()
+            wa_left, wa_top, wa_right, wa_bottom = areas[0] if areas else (0, 0, 1920, 1040)
+
+        bl, bt, bw, bh = default_bounds
+        browser_node["window_placement"] = {
+            "bottom": bt + bh,
+            "left": bl,
+            "maximized": False,
+            "right": bl + bw,
+            "top": bt,
+            "work_area_bottom": wa_bottom,
+            "work_area_left": wa_left,
+            "work_area_right": wa_right,
+            "work_area_top": wa_top,
+        }
+        browser_node.pop("app_window_placement", None)
+        prefs["browser"] = browser_node
+        prefs_path.write_text(json.dumps(prefs, ensure_ascii=False, indent=2), encoding="utf-8")
+        return True, default_bounds
+    except Exception:
+        return True, default_bounds
+
+
+_LAUNCHED_PIDS_LOCK = threading.Lock()
+_LAUNCHED_PIDS: dict[int, list[int]] = {}
+
+
+def _record_launched_pid(account_id: int, pid: int) -> None:
+    if pid <= 0:
+        return
+    with _LAUNCHED_PIDS_LOCK:
+        lst = _LAUNCHED_PIDS.setdefault(int(account_id), [])
+        if pid not in lst:
+            lst.append(pid)
+
+
+def rescue_offscreen_browser_windows(account_id: int, profile_dir: Path | None = None) -> None:
+    """Rescue visible Chrome/Edge windows for ``account_id`` that landed off-screen or minimized."""
+    if sys.platform != "win32":
+        return
+    try:
+        from ctypes import wintypes
+
+        with _LAUNCHED_PIDS_LOCK:
+            pid_set = set(_LAUNCHED_PIDS.get(int(account_id), []))
+        if profile_dir is not None:
+            msg_pid = _chrome_message_window_pid(Path(profile_dir))
+            if msg_pid > 0:
+                pid_set.add(msg_pid)
+        if not pid_set:
+            return
+
+        user32 = ctypes.WinDLL("user32", use_last_error=False)
+        tl, tt, tw, th = compute_default_on_screen_bounds(account_id)
+
+        class _WINDOWPLACEMENT(ctypes.Structure):
+            _fields_ = [
+                ("length", wintypes.UINT),
+                ("flags", wintypes.UINT),
+                ("showCmd", wintypes.UINT),
+                ("ptMinPosition", wintypes.POINT),
+                ("ptMaxPosition", wintypes.POINT),
+                ("rcNormalPosition", wintypes.RECT),
+            ]
+
+        cb_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        cls_buf = ctypes.create_unicode_buffer(64)
+
+        @cb_type
+        def _enum_cb(hwnd, _lp):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            if user32.GetClassNameW(hwnd, cls_buf, len(cls_buf)) <= 0:
+                return True
+            if cls_buf.value != "Chrome_WidgetWin_1":
+                return True
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value not in pid_set:
+                return True
+            wp = _WINDOWPLACEMENT(length=ctypes.sizeof(_WINDOWPLACEMENT))
+            if not user32.GetWindowPlacement(hwnd, ctypes.byref(wp)):
+                return True
+            rc = wp.rcNormalPosition
+            if wp.showCmd == 3:
+                rect = wintypes.RECT()
+                if user32.GetWindowRect(hwnd, ctypes.byref(rect)) and is_window_rect_valid_on_screens(
+                    rect.left, rect.top, rect.right, rect.bottom
+                ):
+                    return True
+            if not is_window_rect_valid_on_screens(rc.left, rc.top, rc.right, rc.bottom):
+                user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+                user32.SetWindowPos(hwnd, None, tl, tt, tw, th, 0x0044)  # SWP_SHOWWINDOW | SWP_NOZORDER
+                user32.SetForegroundWindow(hwnd)
+            elif wp.showCmd == 2:  # SW_SHOWMINIMIZED
+                user32.ShowWindow(hwnd, 9)
+                user32.SetForegroundWindow(hwnd)
+            return True
+
+        user32.EnumWindows(_enum_cb, 0)
+    except Exception:
+        pass
+
+
+def prepare_profile_dir(
+    data_dir: str | Path,
+    account: dict,
+    *,
+    pure_native: bool = True,
+    settings: dict | None = None,
+) -> Path:
+    """Prepare the isolated Chromium profile directory for ``account``.
+
+    In Pure-Native mode (default), never writes ``fp_ext``, removes legacy
+    KeyVault extensions if present, persists matching ``intl.accept_languages``
+    and ``webrtc.ip_handling_policy`` in ``Default/Preferences``, ensures
+    valid window placement, and seeds platform maintenance bookmarks.
+    """
     base_data = Path(data_dir)
     acc_id = int(account["id"])
     profile_dir = base_data / "browsers" / f"acc_{acc_id}"
     ext_dir = profile_dir / "fp_ext"
     profile_dir.mkdir(parents=True, exist_ok=True)
 
+    # Google accounts always follow the PurpleShield pure-native path, even when
+    # a caller explicitly asks for the in-page toolbar engine.
+    is_google = (account.get("account_type") or "").strip().lower() == "google"
+    manual = bool(pure_native) or is_google
     fp = account.get("fp_config") or generate_fingerprint_config(acc_id, account.get("account", ""))
-    _build_extension_files(ext_dir, fp, account)
-    # Every account type (域名邮箱 included) gets the matched locale persisted
-    # into ``Default/Preferences`` so Chrome's first paint is not zh-CN.
-    env_cfg = resolve_browser_env_config(fp, account)
-    if env_cfg.get("enabled"):
-        _write_chromium_preferences(profile_dir, env_cfg)
-    _seed_profile_bookmarks(profile_dir, str(account.get("account_type") or ""))
+    env_cfg = resolve_browser_env_config(fp, account, settings=settings)
+
+    if not manual:
+        _build_extension_files(ext_dir, fp, account)
+    else:
+        _remove_legacy_google_extension(profile_dir)
+
+    if not _profile_has_active_lock(profile_dir):
+        _write_chromium_preferences(
+            profile_dir,
+            env_cfg,
+            account=account,
+            fp=fp,
+            clean_legacy_ext=manual,
+        )
+        restore_or_sanitize_window_placement(profile_dir, acc_id)
+
+    _seed_profile_bookmarks(
+        profile_dir,
+        str(account.get("account_type") or ""),
+        lang=env_cfg.get("locale", ""),
+    )
     return profile_dir
 
 
-def find_chromium_executable() -> str | None:
-    import shutil
-    import sys
+def _get_windows_app_path(exe_name: str) -> str:
+    if sys.platform != "win32":
+        return ""
+    try:
+        import winreg
 
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe_name}",
+        ) as key:
+            val, _ = winreg.QueryValueEx(key, None)
+            return str(val or "").strip()
+    except Exception:
+        return ""
+
+
+def detect_chrome_path() -> str:
+    candidates: list[str] = []
+    if sys.platform == "win32":
+        candidates.extend([
+            os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+            _get_windows_app_path("chrome.exe"),
+        ])
+    elif sys.platform == "darwin":
+        candidates.append("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+    for p in candidates:
+        if p and os.path.exists(p):
+            return p
+    for name in ("google-chrome", "google-chrome-stable", "chrome"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return ""
+
+
+def detect_edge_path() -> str:
+    candidates: list[str] = []
+    if sys.platform == "win32":
+        candidates.extend([
+            os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
+            os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
+            os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Edge\Application\msedge.exe"),
+            _get_windows_app_path("msedge.exe"),
+        ])
+    elif sys.platform == "darwin":
+        candidates.append("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge")
+    for p in candidates:
+        if p and os.path.exists(p):
+            return p
+    for name in ("msedge", "microsoft-edge"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return ""
+
+
+def find_chromium_executable() -> str | None:
     env_override = os.environ.get("KEYVAULT_BROWSER_PATH", "").strip()
     if env_override and os.path.exists(env_override):
         return env_override
 
+    chrome = detect_chrome_path()
+    if chrome:
+        return chrome
+    edge = detect_edge_path()
+    if edge:
+        return edge
+
     candidates: list[str] = []
     if sys.platform == "win32":
-        candidates.extend(
-            [
-                os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
-                os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
-                os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
-                os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
-                os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
-                os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Edge\Application\msedge.exe"),
-                os.path.expandvars(r"%ProgramFiles%\BraveSoftware\Brave-Browser\Application\brave.exe"),
-                os.path.expandvars(r"%LOCALAPPDATA%\BraveSoftware\Brave-Browser\Application\brave.exe"),
-                os.path.expandvars(r"%LOCALAPPDATA%\Chromium\Application\chrome.exe"),
-            ]
-        )
+        candidates.extend([
+            os.path.expandvars(r"%ProgramFiles%\BraveSoftware\Brave-Browser\Application\brave.exe"),
+            os.path.expandvars(r"%LOCALAPPDATA%\BraveSoftware\Brave-Browser\Application\brave.exe"),
+            os.path.expandvars(r"%LOCALAPPDATA%\Chromium\Application\chrome.exe"),
+        ])
     elif sys.platform == "darwin":
-        candidates.extend(
-            [
-                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-                "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-                "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
-                "/Applications/Chromium.app/Contents/MacOS/Chromium",
-            ]
-        )
+        candidates.extend([
+            "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ])
 
     for path in candidates:
         if path and os.path.exists(path):
             return path
 
-    for bin_name in (
-        "google-chrome",
-        "google-chrome-stable",
-        "chrome",
-        "msedge",
-        "microsoft-edge",
-        "brave-browser",
-        "chromium",
-        "chromium-browser",
-    ):
+    for bin_name in ("brave-browser", "chromium", "chromium-browser"):
         found = shutil.which(bin_name)
         if found:
             return found
@@ -2748,10 +3959,65 @@ def find_chromium_executable() -> str | None:
     return None
 
 
-def get_target_url(account_type: str) -> str:
+def resolve_browser_executable(
+    settings: dict | None = None,
+    *,
+    account_type: str = "",
+) -> tuple[str | None, str]:
+    """Resolve the browser binary honoring ``preferred_browser`` / ``custom_browser_path``."""
+    cfg = settings if isinstance(settings, dict) else {}
+    pref = str(cfg.get("preferred_browser") or "auto").strip().lower()
+    custom_path = str(cfg.get("custom_browser_path") or "").strip()
+    is_google = (account_type or "").strip().lower() == "google"
+
+    if pref == "custom":
+        if custom_path and os.path.exists(custom_path):
+            return custom_path, ""
+        return None, "未找到指定的自定义浏览器可执行文件，请在「系统设置」中检查路径。"
+    if pref == "chrome":
+        chrome = detect_chrome_path()
+        if chrome:
+            return chrome, ""
+        return None, "未在本机检测到 Google Chrome，请安装 Chrome 或切换回自动选择。"
+    if pref == "edge":
+        edge = detect_edge_path()
+        if edge:
+            return edge, ""
+        return None, "未在本机检测到 Microsoft Edge。"
+
+    # Default "auto": prefer official Chrome (via find_chromium_executable so monkeypatches apply).
+    # ``inpage_edge`` instead prefers Edge first so the in-page docked toolbar can run
+    # as a native ``--load-extension`` with zero CDP (no ``--remote-debugging-port``).
+    # Google accounts always keep the PurpleShield native order (Chrome first), matching
+    # ``BrowserService.ResolveBrowserExecutable`` auto mode.
+    engine_mode = str(cfg.get("browser_engine_mode") or "").strip().lower()
+    if engine_mode == "inpage_edge" and not is_google:
+        env_override = os.environ.get("KEYVAULT_BROWSER_PATH", "").strip()
+        if env_override and os.path.exists(env_override):
+            return env_override, ""
+        edge = detect_edge_path()
+        if edge:
+            return edge, ""
+        exe = find_chromium_executable()
+        if exe:
+            return exe, ""
+        if custom_path and os.path.exists(custom_path):
+            return custom_path, ""
+        return None, "未检测到 Chrome 或 Edge 浏览器"
+
+    exe = find_chromium_executable()
+    if exe:
+        return exe, ""
+    if custom_path and os.path.exists(custom_path):
+        return custom_path, ""
+    return None, "未检测到 Chrome 或 Edge 浏览器"
+
+
+def get_target_url(account_type: str, settings: dict | None = None) -> str:
     normalized = (account_type or "").strip().lower()
     if normalized == "google":
-        return "https://accounts.google.com/"
+        cfg_url = str((settings or {}).get("default_start_url") or "").strip()
+        return cfg_url or "https://myaccount.google.com/"
     if normalized == "域名邮箱":
         return "https://mail.ggb6.com/"
     if normalized in ("claude", "anthropic"):
@@ -2781,15 +4047,33 @@ def get_debug_port(account_id: int) -> int:
         return base_port
 
 
-def _append_proxy_isolation_args(args: list[str], proxy: str) -> None:
-    """Append the network-isolation flags shared by every proxied launch mode.
+def _call_supported(fn, *args, **kwargs):
+    """Call ``fn`` passing only keyword arguments its signature accepts (test-mock friendly)."""
+    try:
+        sig = inspect.signature(fn)
+        has_varkw = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        )
+        if has_varkw:
+            return fn(*args, **kwargs)
+        accepted = {k: v for k, v in kwargs.items() if k in sig.parameters}
+        return fn(*args, **accepted)
+    except (TypeError, ValueError):
+        return fn(*args)
 
-    ``--proxy-server`` binds the whole browser to the sidecar endpoint (or a local
-    auth relay when upstream credentials are present), ``--proxy-bypass-list`` keeps
-    OAuth loopbacks local, ``disable_non_proxied_udp`` stops WebRTC from opening
-    direct UDP sockets toward the local ISP, ``--disable-quic`` prevents HTTP/3
-    (UDP 443) from bypassing the HTTP proxy, and ``--host-resolver-rules`` forces
-    remote DNS inside the tunnel while keeping loopback hostnames local.
+
+def _append_proxy_isolation_args(
+    args: list[str],
+    proxy: str,
+    *,
+    pure_native: bool = True,
+) -> None:
+    """Append proxy routing flags.
+
+    In Pure-Native mode (default), only ``--proxy-server`` and
+    ``--proxy-bypass-list`` are passed (WebRTC IP handling is written cleanly to
+    ``Default/Preferences``). Legacy extension mode also appends CLI hardening
+    flags for backwards compatibility.
     """
     if not proxy:
         return
@@ -2803,13 +4087,14 @@ def _append_proxy_isolation_args(args: list[str], proxy: str) -> None:
 
     args.append(f"--proxy-server={eff_proxy}")
     args.append("--proxy-bypass-list=<-loopback>;localhost;127.0.0.1;[::1]")
-    webrtc_flag = "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"
-    if webrtc_flag not in args:
-        args.append(webrtc_flag)
-    args.append("--disable-quic")
-    args.append(
-        "--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1 , EXCLUDE localhost"
-    )
+    if not pure_native:
+        webrtc_flag = "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"
+        if webrtc_flag not in args:
+            args.append(webrtc_flag)
+        args.append("--disable-quic")
+        args.append(
+            "--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1 , EXCLUDE localhost"
+        )
 
 
 def build_browser_launch_args(
@@ -2817,44 +4102,56 @@ def build_browser_launch_args(
     profile_dir: str | Path,
     exe_path: str | None = None,
     target_url: str = "",
-    pure_native: bool = False,
+    pure_native: bool = True,
     enable_cdp: bool = False,
+    settings: dict | None = None,
+    launch_bounds: tuple[int, int, int, int] | None = None,
+    force_bounds: bool = False,
+    debug_port: int | None = None,
 ) -> list[str]:
     exe = exe_path or find_chromium_executable() or "chrome.exe"
     p_dir = Path(profile_dir).resolve()
     ext_dir = (p_dir / "fp_ext").resolve()
     acc_id = int(account.get("id") or 1)
-    debug_port = get_debug_port(acc_id)
+    if debug_port is None:
+        debug_port = get_debug_port(acc_id)
 
     fp = account.get("fp_config") or generate_fingerprint_config(acc_id, account.get("account", ""))
     proxy = (fp.get("proxy") or "").strip()
-    eff_target_url = (target_url or "").strip() or get_target_url(account.get("account_type", "ChatGPT"))
+    raw_target = (target_url or "").strip() or get_target_url(
+        account.get("account_type", "ChatGPT"), settings=settings
+    )
+    # Google accounts must never receive the legacy extension / CDP / hardening
+    # flags, even if a caller explicitly asks for the non-native engine.
+    is_google = (account.get("account_type") or "").strip().lower() == "google"
+    pure_native = bool(pure_native) or is_google
 
     is_domain_email = (account.get("account_type") or "").strip() == "域名邮箱"
-    env_cfg = resolve_browser_env_config(fp, account)
+    env_cfg = resolve_browser_env_config(fp, account, settings=settings)
+    eff_target_url = apply_url_language_hint(raw_target, env_cfg.get("locale"))
 
     if pure_native:
+        # Pure C++ Native Launch Arguments (matches AccountManager PurpleShield):
+        # - Zero --load-extension / Zero --disable-extensions / Zero --disable-sync
+        # - Zero --remote-debugging-port / Zero --force-webrtc-ip-handling-policy CLI flag
+        # - Isolation & WebRTC & Accept-Language live natively in --user-data-dir Preferences.
         args = [
             exe,
             f"--user-data-dir={p_dir}",
             "--no-first-run",
             "--no-default-browser-check",
-            "--disable-sync",
-            "--disable-save-password-bubble",
-            "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
         ]
-        _append_proxy_isolation_args(args, proxy)
-        if env_cfg and env_cfg.get("enabled"):
+        if force_bounds and launch_bounds and launch_bounds[2] > 0 and launch_bounds[3] > 0:
+            args.append(f"--window-position={launch_bounds[0]},{launch_bounds[1]}")
+            args.append(f"--window-size={launch_bounds[2]},{launch_bounds[3]}")
+        if env_cfg and env_cfg.get("enabled") and env_cfg.get("locale"):
             args.append(f"--lang={env_cfg['locale']}")
-            args.append(f"--accept-lang={','.join(env_cfg['languages'])}")
-        args.append(eff_target_url)
+        _append_proxy_isolation_args(args, proxy, pure_native=True)
+        if eff_target_url and eff_target_url.lower() != "about:blank":
+            args.append(eff_target_url)
         return args
 
-    # Unified Zero-CDP Fingerprint Engine:
-    # All platforms launch without --remote-debugging-port or --remote-allow-origins
-    # by default so Google BotGuard / Cloudflare / DataDome / Arkose never detect an
-    # attached V8 inspector, while fp_ext keeps hardware/timezone spoofing and manual
-    # capsule assistance active.
+    # Explicit Legacy Extension Mode (kept only for backward compatibility when requested):
     args = [
         exe,
         f"--user-data-dir={p_dir}",
@@ -2863,6 +4160,9 @@ def build_browser_launch_args(
     if enable_cdp and not is_domain_email:
         args.append(f"--remote-debugging-port={debug_port}")
         args.append("--remote-allow-origins=*")
+    if force_bounds and launch_bounds and launch_bounds[2] > 0 and launch_bounds[3] > 0:
+        args.append(f"--window-position={launch_bounds[0]},{launch_bounds[1]}")
+        args.append(f"--window-size={launch_bounds[2]},{launch_bounds[3]}")
     args.extend([
         "--no-first-run",
         "--no-default-browser-check",
@@ -2876,7 +4176,7 @@ def build_browser_launch_args(
         "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
         "--disable-features=WebRtcHideLocalIpsWithMdns,OptimizationHints,Translate,DisableLoadExtensionCommandLineSwitch",
     ])
-    _append_proxy_isolation_args(args, proxy)
+    _append_proxy_isolation_args(args, proxy, pure_native=False)
     if env_cfg and env_cfg.get("enabled"):
         # Chromium only reads these on first launch; keep them before the URL
         # so ``args[-1] == target_url`` stays true for callers and tests.
@@ -2932,7 +4232,7 @@ async def _attach_cdp_page_target(
 
             while True:
                 try:
-                    raw = await asyncio.wait_for(ws.recv(), timeout=1.2)
+                    raw = await asyncio.wait_for(ws.recv(), timeout=15.0)
                     evt = json.loads(raw)
                     method = evt.get("method", "")
                     if method in (
@@ -2943,10 +4243,22 @@ async def _attach_cdp_page_target(
                         msg_id += 1
                         await ws.send(json.dumps({"id": msg_id, "method": "Runtime.evaluate", "params": {"expression": inject_js}}))
                         msg_id += 1
-                        await ws.send(json.dumps({"id": msg_id, "method": "Runtime.evaluate", "params": {"expression": autologin_js}}))
+                        await ws.send(
+                            json.dumps(
+                                {
+                                    "id": msg_id,
+                                    "method": "Runtime.evaluate",
+                                    "params": {
+                                        "expression": (
+                                            "(window.__kv_ensure_mounted ? window.__kv_ensure_mounted() : "
+                                            "(function(){" + autologin_js + "})())"
+                                        )
+                                    },
+                                }
+                            )
+                        )
                 except asyncio.TimeoutError:
-                    msg_id += 1
-                    await ws.send(json.dumps({"id": msg_id, "method": "Runtime.evaluate", "params": {"expression": autologin_js}}))
+                    continue
     except Exception:
         pass
 
@@ -2964,13 +4276,20 @@ async def _cdp_port_monitor(
     connected_once = False
     consecutive_failures = 0
 
+    def _fetch_targets():
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=1.5) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="ignore"))
+
     while True:
         try:
-            req = urllib.request.Request(url, headers={"Accept": "application/json"})
-            with urllib.request.urlopen(req, timeout=1.5) as resp:
-                targets = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            targets = await asyncio.to_thread(_fetch_targets)
             connected_once = True
             consecutive_failures = 0
+
+            for k, existing in list(attached_tasks.items()):
+                if existing.done():
+                    attached_tasks.pop(k, None)
 
             for t in targets:
                 if t.get("type") != "page":
@@ -3037,28 +4356,78 @@ def _start_cdp_injector(debug_port: int, profile_dir: Path) -> None:
     t.start()
 
 
+def _is_sidecar_port_url(proxy_url: str) -> bool:
+    port = _proxy_port_of(proxy_url)
+    return bool(proxy_url) and (port == DEFAULT_SIDECAR_PROXY_PORT or 17900 <= port <= 17949)
+
+
 def launch_isolated_browser(
     data_dir: str | Path,
     account: dict,
     target_url: str = "",
-    pure_native: bool = False,
+    pure_native: bool | None = None,
     enable_cdp: bool = False,
+    settings: dict | None = None,
 ) -> dict:
-    exe = find_chromium_executable()
-    if not exe:
-        return {"ok": False, "error": "未检测到 Chrome 或 Edge 浏览器"}
+    account_type = (account.get("account_type") or "ChatGPT").strip()
+    is_google = account_type.lower() == "google"
+    is_domain_email = account_type == "域名邮箱"
+    is_claude = account_type == "Claude"
 
+    exe, exe_err = _call_supported(
+        resolve_browser_executable, settings, account_type=account_type
+    )
+    if not exe:
+        return {"ok": False, "error": exe_err or "未检测到 Chrome 或 Edge 浏览器"}
+
+    acc_id = int(account.get("id") or 1)
     fp = dict(account.get("fp_config") or {})
     proxy_url = (fp.get("proxy") or "").strip()
     proxy_node = (fp.get("proxy_node") or "").strip()
     if not fp:
-        fp = generate_fingerprint_config(int(account.get("id") or 1), account.get("account", ""))
+        fp = generate_fingerprint_config(acc_id, account.get("account", ""))
         proxy_url = (fp.get("proxy") or "").strip()
         proxy_node = (fp.get("proxy_node") or "").strip()
     account = {**account, "fp_config": fp}
-    account_type = (account.get("account_type") or "ChatGPT").strip()
-    is_domain_email = account_type == "域名邮箱"
-    is_claude = account_type == "Claude"
+
+    if pure_native is not None:
+        use_pure_native = bool(pure_native)
+        engine_mode = (
+            "pure_native"
+            if use_pure_native
+            else str((settings or {}).get("browser_engine_mode") or "legacy_ext").strip().lower()
+        )
+    else:
+        # Direct unit-test calls without settings must keep the historical
+        # pure-native behavior; only an explicit ``browser_engine_mode`` in a
+        # settings dict opts into the in-page toolbar engines.
+        if isinstance(settings, dict) and settings.get("browser_engine_mode"):
+            engine_mode = str(settings.get("browser_engine_mode")).strip().lower()
+        else:
+            engine_mode = "pure_native"
+        use_pure_native = engine_mode not in ("inpage_edge", "inpage_chrome_cdp", "legacy_ext")
+
+    # Google accounts always run the PurpleShield pure C++ native flow, no matter
+    # which in-page engine the global settings select (matches
+    # ``BrowserService.LaunchAccountBrowser`` which has no extension/CDP path).
+    if is_google:
+        use_pure_native = True
+        engine_mode = "pure_native"
+
+    # ``inpage_edge`` runs the toolbar as a native Edge extension with zero CDP;
+    # when the resolved binary is actually Chrome (fallback or forced), it
+    # degrades to the silent CDP injector (never calls ``Runtime.enable``).
+    exe_lower = (exe or "").lower()
+    is_edge_exe = ("msedge" in exe_lower) or ("microsoft edge" in exe_lower)
+    if use_pure_native or is_domain_email:
+        effective_cdp = False
+    elif engine_mode == "inpage_chrome_cdp":
+        effective_cdp = True
+    elif engine_mode == "inpage_edge":
+        effective_cdp = not is_edge_exe
+    else:
+        effective_cdp = bool(enable_cdp)
+    resolved_debug_port = get_debug_port(acc_id) if effective_cdp else None
 
     node_switch_res = {"ok": True, "switched": False}
     if is_claude:
@@ -3078,16 +4447,25 @@ def launch_isolated_browser(
             fp = {**fp, "proxy": proxy_url, "proxy_node": proxy_node}
             account = {**account, "fp_config": fp}
     elif proxy_node:
-        node_switch_res = activate_proxy_node(
+        node_switch_res = _call_supported(
+            activate_proxy_node,
             account.get("account_type", "ChatGPT"),
             proxy_url,
             proxy_node,
+            isolate_slot=True,
+            account_id=acc_id,
         )
+        if not node_switch_res.get("ok") and not proxy_url:
+            return {
+                "ok": False,
+                "error": node_switch_res.get("error")
+                or f"代理节点 [{proxy_node}] 切换失败且未配置备用代理，已阻止直连启动浏览器！",
+            }
         if node_switch_res.get("ok") and str(node_switch_res.get("proxy_url") or "").strip():
             proxy_url = str(node_switch_res["proxy_url"]).strip()
             fp = {**fp, "proxy": proxy_url}
             account = {**account, "fp_config": fp}
-    elif ":17899" in proxy_url:
+    elif _is_sidecar_port_url(proxy_url):
         # The sidecar port may have moved to a fallback port (or the kernel may
         # not be running yet); always launch against the live sidecar URL.
         from src.sidecar_proxy import get_sidecar_proxy_manager
@@ -3098,46 +4476,123 @@ def launch_isolated_browser(
             fp = {**fp, "proxy": proxy_url}
             account = {**account, "fp_config": fp}
 
-    profile_dir = prepare_profile_dir(data_dir, account)
-    if target_url or pure_native or enable_cdp:
-        args = build_browser_launch_args(
+    launch_env = os.environ.copy()
+    env_cfg = resolve_browser_env_config(fp, account, settings=settings)
+    if env_cfg.get("enabled"):
+        launch_env["TZ"] = env_cfg["timezone"]
+        # Google runs stock Windows Chrome: the native C# flow only sets ``TZ``
+        # and never injects extra ``LANG`` / ``LC_ALL`` process variables.
+        if not is_google:
+            launch_env["LANG"] = f"{env_cfg['locale'].replace('-', '_')}.UTF-8"
+            launch_env["LC_ALL"] = launch_env["LANG"]
+
+    profile_root = Path(data_dir) / "browsers" / f"acc_{acc_id}"
+    force_bounds = False
+    launch_bounds: tuple[int, int, int, int] | None = None
+    launch_target = target_url
+
+    def open_profile(profile_dir: Path) -> subprocess.Popen:
+        args = _call_supported(
+            build_browser_launch_args,
             account,
             profile_dir,
             exe_path=exe,
-            target_url=target_url,
-            pure_native=bool(pure_native),
-            enable_cdp=bool(enable_cdp),
+            target_url=launch_target,
+            pure_native=use_pure_native,
+            enable_cdp=effective_cdp,
+            settings=settings,
+            launch_bounds=launch_bounds,
+            force_bounds=force_bounds,
+            debug_port=resolved_debug_port,
         )
-    else:
-        args = build_browser_launch_args(account, profile_dir, exe_path=exe)
-    debug_port = get_debug_port(int(account.get("id") or 1))
-
-    launch_env = os.environ.copy()
-    env_cfg = resolve_browser_env_config(fp, account)
-    if env_cfg.get("enabled"):
-        launch_env["TZ"] = env_cfg["timezone"]
-        launch_env["LANG"] = f"{env_cfg['locale'].replace('-', '_')}.UTF-8"
-        launch_env["LC_ALL"] = launch_env["LANG"]
-
-    try:
-        subprocess.Popen(
+        return subprocess.Popen(
             args,
             cwd=str(profile_dir),
             close_fds=True,
             env=launch_env,
         )
-        # Unified Zero-CDP mode: skip WebSocket CDP injector unless enable_cdp=True
-        # is explicitly requested, eliminating anti-bot V8 inspector detection.
-        if enable_cdp and not is_domain_email and not pure_native:
-            _start_cdp_injector(debug_port, profile_dir)
+
+    try:
+        if use_pure_native:
+            with _profile_launch_lock:
+                if not _remove_legacy_google_extension(profile_root):
+                    return {
+                        "ok": False,
+                        "manual_login": True,
+                        "profile_cleanup_pending": True,
+                        "error": "旧登录助手待清理。请关闭该账号的浏览器窗口后重试。",
+                    }
+                already_running = _profile_has_active_lock(profile_root)
+                if not already_running:
+                    force_bounds, launch_bounds = restore_or_sanitize_window_placement(profile_root, acc_id)
+                    profile_dir = _call_supported(
+                        prepare_profile_dir,
+                        data_dir,
+                        account,
+                        pure_native=True,
+                        settings=settings,
+                    )
+                else:
+                    # An already-open profile keeps its Preferences/Bookmarks/window
+                    # placement untouched; Google also skips re-appending the start URL
+                    # unless the caller explicitly requested one (BrowserService.cs:516).
+                    profile_dir = profile_root
+                    if is_google and not (target_url or "").strip():
+                        launch_target = "about:blank"
+                browser_process = open_profile(profile_dir)
+        else:
+            if not _profile_has_active_lock(profile_root):
+                force_bounds, launch_bounds = restore_or_sanitize_window_placement(profile_root, acc_id)
+            profile_dir = _call_supported(
+                prepare_profile_dir,
+                data_dir,
+                account,
+                pure_native=False,
+                settings=settings,
+            )
+            browser_process = open_profile(profile_dir)
+
+        try:
+            exit_code = browser_process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            exit_code = None
+        # Chromium can exit successfully after handing the URL to an existing window.
+        if exit_code:
+            return {"ok": False, "error": f"浏览器启动后立即退出（退出码 {exit_code}）。"}
+
+        proc_pid = getattr(browser_process, "pid", None)
+        if isinstance(proc_pid, int) and proc_pid > 0:
+            _record_launched_pid(acc_id, proc_pid)
+            if sys.platform == "win32":
+                def _rescue_later():
+                    for delay in (0.0, 0.45, 0.85):
+                        if delay:
+                            time.sleep(delay)
+                        rescue_offscreen_browser_windows(acc_id, profile_dir=profile_dir)
+
+                threading.Thread(target=_rescue_later, daemon=True).start()
+
+        # Unified Zero-CDP mode: the silent CDP injector (never calls
+        # ``Runtime.enable``) only starts when the resolved engine actually
+        # needs it; ``域名邮箱`` always stays Zero-CDP.
+        if effective_cdp and not is_domain_email and resolved_debug_port is not None:
+            _start_cdp_injector(resolved_debug_port, profile_dir)
+
+        engine_name = "Chrome" if "chrome" in exe_lower else ("Edge" if "msedge" in exe_lower else Path(exe).stem)
         return {
             "ok": True,
             "profile_dir": str(profile_dir),
             "fp_config": fp,
+            "runtime_proxy": proxy_url,
+            "env_cfg": env_cfg,
             "node_switched": node_switch_res.get("switched", False),
-            "engine": "Chrome" if "chrome" in exe.lower() else "Edge",
-            "pure_native": bool(pure_native),
-            "zero_cdp": not bool(enable_cdp),
+            "engine": engine_name,
+            "pure_native": use_pure_native,
+            "inpage_toolbar": not use_pure_native,
+            "browser_engine_mode": engine_mode,
+            "zero_cdp": bool(use_pure_native or not effective_cdp or is_domain_email),
+            "manual_login": use_pure_native,
+            "pid": proc_pid if isinstance(proc_pid, int) else 0,
         }
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -3163,6 +4618,7 @@ def _ensure_claude_proxy(account: dict, *, proxy_url: str, proxy_node: str) -> d
     """
     from src.sidecar_proxy import SIDECAR_GROUP_NAME, get_sidecar_proxy_manager
 
+    acc_id = int(account.get("id") or 1)
     result: dict = {
         "ok": True,
         "proxy_url": proxy_url,
@@ -3172,7 +4628,7 @@ def _ensure_claude_proxy(account: dict, *, proxy_url: str, proxy_node: str) -> d
     sidecar_port = _proxy_port_of(proxy_url) if proxy_url else 0
     is_sidecar = bool(proxy_url) and (
         sidecar_port == DEFAULT_SIDECAR_PROXY_PORT
-        or 17900 <= sidecar_port <= 17931
+        or 17900 <= sidecar_port <= 17949
         or ":17899" in proxy_url
     )
     needs_sidecar = not proxy_url or is_sidecar
@@ -3201,10 +4657,13 @@ def _ensure_claude_proxy(account: dict, *, proxy_url: str, proxy_node: str) -> d
 
         target_node = proxy_node or best_node
         if target_node:
-            switch = activate_proxy_node(
+            switch = _call_supported(
+                activate_proxy_node,
                 "Claude",
                 proxy_url or sidecar_url,
                 target_node,
+                isolate_slot=True,
+                account_id=acc_id,
             )
             if switch.get("ok") and str(switch.get("proxy_url") or "").strip():
                 result["proxy_url"] = str(switch["proxy_url"]).strip()
@@ -3249,7 +4708,14 @@ def _ensure_claude_proxy(account: dict, *, proxy_url: str, proxy_node: str) -> d
 
     # A user-specified node on a live sidecar must be activated as well.
     if proxy_node:
-        switch = activate_proxy_node("Claude", proxy_url, proxy_node)
+        switch = _call_supported(
+            activate_proxy_node,
+            "Claude",
+            proxy_url,
+            proxy_node,
+            isolate_slot=True,
+            account_id=acc_id,
+        )
         if switch.get("ok") and str(switch.get("proxy_url") or "").strip():
             result["proxy_url"] = str(switch["proxy_url"]).strip()
             result["node_switch_res"] = switch

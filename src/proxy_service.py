@@ -1,3 +1,4 @@
+import inspect
 import json
 import os
 import re
@@ -249,6 +250,14 @@ def find_clash_verge_yaml() -> Path | None:
     return found[0][1] if found else None
 
 
+def _safe_int_port(raw_port) -> int:
+    try:
+        val = int(raw_port or 0)
+        return val if 0 < val <= 65535 else 0
+    except (TypeError, ValueError):
+        return 0
+
+
 def parse_clash_yaml_summary(yaml_path: str | Path) -> dict:
     p = Path(yaml_path)
     if not p.exists():
@@ -261,8 +270,8 @@ def parse_clash_yaml_summary(yaml_path: str | Path) -> dict:
     if not isinstance(data, dict):
         data = {}
 
-    mixed_port = int(data.get("mixed-port") or data.get("port") or 0)
-    socks_port = int(data.get("socks-port") or 0)
+    mixed_port = _safe_int_port(data.get("mixed-port") or data.get("port"))
+    socks_port = _safe_int_port(data.get("socks-port"))
     secret = str(data.get("secret") or "")
     ext_ctrl = str(data.get("external-controller") or "").strip()
 
@@ -289,7 +298,7 @@ def parse_clash_yaml_summary(yaml_path: str | Path) -> dict:
     for lst in data.get("listeners") or []:
         if not isinstance(lst, dict):
             continue
-        lport = lst.get("port")
+        lport = _safe_int_port(lst.get("port"))
         lname = lst.get("name") or "listener"
         lproxy = lst.get("proxy") or ""
         ltype = str(lst.get("type") or "mixed").lower()
@@ -297,9 +306,9 @@ def parse_clash_yaml_summary(yaml_path: str | Path) -> dict:
             scheme = "socks5" if "socks" in ltype else "http"
             ports.append(
                 {
-                    "port": int(lport),
-                    "url": f"{scheme}://127.0.0.1:{int(lport)}",
-                    "label": f"127.0.0.1:{int(lport)} ({lname} · 绑定 {lproxy or '默认'} 组)",
+                    "port": lport,
+                    "url": f"{scheme}://127.0.0.1:{lport}",
+                    "label": f"127.0.0.1:{lport} ({lname} · 绑定 {lproxy or '默认'} 组)",
                     "bound_group": lproxy,
                 }
             )
@@ -527,11 +536,23 @@ def activate_proxy_node(
     node_name: str,
     *,
     preflight: bool = False,
+    isolate_slot: bool = False,
+    account_id: int | None = None,
 ) -> dict:
-    """Switch KeyVault's dedicated sidecar selector group to ``node_name``."""
+    """Switch KeyVault's dedicated sidecar selector (or isolated per-account slot) to ``node_name``."""
     if not node_name or not node_name.strip():
         return {"ok": True, "switched": False, "proxy_url": proxy_url}
 
     from src.sidecar_proxy import get_sidecar_proxy_manager
 
-    return get_sidecar_proxy_manager().switch_node(node_name.strip(), preflight=preflight)
+    manager = get_sidecar_proxy_manager()
+    kwargs: dict = {"preflight": preflight}
+    try:
+        params = inspect.signature(manager.switch_node).parameters
+        if isolate_slot and "isolate_slot" in params:
+            kwargs["isolate_slot"] = True
+        if account_id is not None and "account_id" in params:
+            kwargs["account_id"] = int(account_id)
+    except (TypeError, ValueError):
+        pass
+    return manager.switch_node(node_name.strip(), **kwargs)

@@ -449,7 +449,8 @@ class _CdpClient:
     """Minimal synchronous CDP client that can never enable the V8 Runtime domain."""
 
     def __init__(self, ws_url: str):
-        self._ws = _ws_connect(ws_url, max_size=None, open_timeout=5)
+        self._ws_ctx = _ws_connect(ws_url, max_size=None, open_timeout=5)
+        self._ws = self._ws_ctx.__enter__() if hasattr(self._ws_ctx, "__enter__") else self._ws_ctx
         self._lock = threading.RLock()
         self._next_id = 0
         self.sent_methods: list[str] = []
@@ -508,8 +509,12 @@ class _CdpClient:
             if self._closed:
                 return
             self._closed = True
+            ws_ctx = getattr(self, "_ws_ctx", None)
             try:
-                self._ws.close()
+                if ws_ctx is not None and hasattr(ws_ctx, "__exit__"):
+                    ws_ctx.__exit__(None, None, None)
+                else:
+                    self._ws.close()
             except Exception:
                 pass
 

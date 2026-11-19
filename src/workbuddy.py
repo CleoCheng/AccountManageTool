@@ -124,8 +124,9 @@ class WorkBuddyQueue:
             )""")
 
     def _connect(self):
-        conn = sqlite3.connect(self.path, timeout=3)
+        conn = sqlite3.connect(self.path, timeout=15.0)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=15000;")
         return conn
 
     @staticmethod
@@ -635,7 +636,8 @@ class WorkBuddyQueue:
             synthetic_node = f"代理端口({explicit_proxy_url})"
             pair = [first, second] if second else [first]
             for ent in pair:
-                same = (_prev_node(ent["email"]) == synthetic_node)
+                ent_prev = prev1 if ent is first else prev2
+                same = _has_nr(ent["email"], synthetic_node) or (ent_prev == synthetic_node)
                 if not same and _free_slots(synthetic_node) < 1:
                     info = usage_map[synthetic_node]
                     raise ValueError(
@@ -966,19 +968,24 @@ class WorkBuddyQueue:
     def action(self, task_id, revision, action, value=""):
         return self._run(self._action, task_id, revision, action, value)
 
-    def _send_greeting(self, conn, task):
-        if task["greeting_attempted"]:
+    def _send_greeting(self, task_id: int, revision: int):
+        with closing(self._connect()) as conn:
+            row = conn.execute(f"SELECT * FROM tasks WHERE id=? AND {_ACTIVE}", (task_id,)).fetchone()
+        if not row or row["revision"] != revision:
+            raise ValueError("任务进度已更新，请核对当前邮箱和步骤。")
+        if row["greeting_attempted"]:
             raise ValueError("已请求发送过招呼，请在对话中核对发送结果并等待回复。")
-        button = self.browser.prepare_greeting(dict(task))
+        button = self.browser.prepare_greeting(dict(row))
         # Persist the attempt before the external click. A timeout or crash
         # after dispatch is ambiguous and must not send a second greeting.
-        conn.execute("UPDATE tasks SET greeting_attempted=1, revision=revision+1, updated_at=? WHERE id=?",
-                     (int(time.time()), task["id"]))
-        conn.commit()
-        conn.execute("BEGIN IMMEDIATE")
-        refreshed = conn.execute(f"SELECT * FROM tasks WHERE id=? AND {_ACTIVE}", (task["id"],)).fetchone()
-        if not refreshed or refreshed["revision"] != task["revision"] + 1:
-            raise ValueError("任务进度已更新，请在工作窗口核对招呼。")
+        now = int(time.time())
+        with closing(self._connect()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(f"SELECT * FROM tasks WHERE id=? AND {_ACTIVE}", (task_id,)).fetchone()
+            if not cur or cur["revision"] != revision:
+                raise ValueError("任务进度已更新，请在工作窗口核对招呼。")
+            conn.execute("UPDATE tasks SET greeting_attempted=1, revision=revision+1, updated_at=? WHERE id=?",
+                         (now, task_id))
         try:
             button.click(timeout=4000)
         except Exception as exc:
@@ -1205,423 +1212,530 @@ class WorkBuddyQueue:
 
         return saved_cred
 
-    def _action(self, task_id, revision, action, value):
-        with closing(self._connect()) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
-            round_active = self._current_round_tasks(conn)
-            task = next((t for t in round_active if t["id"] == task_id), None)
-            if not task or task["revision"] != revision:
-                raise ValueError("任务进度已更新，请核对当前邮箱和步骤。")
+    def _load_active_task_snapshot(self, task_id: int, revision: int) -> tuple[list[dict], dict]:
+        with closing(self._connect()) as conn:
+            round_rows = self._current_round_tasks(conn)
+            round_active = [dict(r) for r in round_rows]
+        task = next((t for t in round_active if t["id"] == task_id), None)
+        if not task or task["revision"] != revision:
+            raise ValueError("任务进度已更新，请核对当前邮箱和步骤。")
+        return round_active, task
+
+    @staticmethod
+    def _assert_fresh_revision(conn, task_id: int, expected_revision: int) -> sqlite3.Row:
+        row = conn.execute(f"SELECT * FROM tasks WHERE id=? AND {_ACTIVE}", (task_id,)).fetchone()
+        if not row or row["revision"] != expected_revision:
+            raise ValueError("任务进度已更新，请核对当前邮箱和步骤。")
+        return row
+
+    def _commit_challenge_pause_if_needed(self, task_id: int, expected_revision: int, task_dict: dict) -> dict | None:
+        if task_dict["status"] != "verified" and self.browser.challenge_page(task_dict):
             now = int(time.time())
-            if action == "cancel":
-                if hasattr(self.browser, "is_ip_restricted_page"):
-                    for rt in round_active:
-                        bad_nd = str(rt["proxy_node"] or "").strip()
-                        if bad_nd and self.browser.is_ip_restricted_page(dict(rt)) is True:
-                            conn.execute(
-                                "INSERT INTO node_quotas (node_name, proxy_url, quota_limit, unlocked, blocked, updated_at) "
-                                "VALUES (?, ?, ?, 0, 1, ?) "
-                                "ON CONFLICT(node_name) DO UPDATE SET unlocked = 0, blocked = 1, updated_at = excluded.updated_at",
-                                (bad_nd, str(rt["proxy_url"] or ""), DEFAULT_NODE_QUOTA, now),
-                            )
-                all_round_rows = conn.execute(
-                    "SELECT id FROM tasks WHERE batch = ? AND round_no = ? ORDER BY id",
-                    (task["batch"], task["round_no"]),
-                ).fetchall()
-                for r in all_round_rows:
-                    self.browser.close(discard_id=r["id"])
-                if hasattr(self.browser, "purge_cache_and_switch_node"):
-                    self.browser.purge_cache_and_switch_node("", "")
-                active_rows = conn.execute(
-                    f"SELECT * FROM tasks WHERE batch=? AND {_ACTIVE}",
-                    (task["batch"],),
-                ).fetchall()
-                conn.execute(f"""UPDATE tasks SET status='cancelled', revision=revision+1, updated_at=?
-                    WHERE batch=? AND {_ACTIVE}""", (now, task["batch"]))
-                for r in active_rows:
-                    self._release_unused_node_slot_if_untouched(conn, r)
-                return
-
-            if action == "skip":
-                if hasattr(self.browser, "is_ip_restricted_page"):
-                    for rt in round_active:
-                        bad_nd = str(rt["proxy_node"] or "").strip()
-                        if bad_nd and self.browser.is_ip_restricted_page(dict(rt)) is True:
-                            conn.execute(
-                                "INSERT INTO node_quotas (node_name, proxy_url, quota_limit, unlocked, blocked, updated_at) "
-                                "VALUES (?, ?, ?, 0, 1, ?) "
-                                "ON CONFLICT(node_name) DO UPDATE SET unlocked = 0, blocked = 1, updated_at = excluded.updated_at",
-                                (bad_nd, str(rt["proxy_url"] or ""), DEFAULT_NODE_QUOTA, now),
-                            )
-                other_active = [t for t in round_active if t["id"] != task_id]
-                round_transitioned = False
-                if other_active:
-                    self.browser.close(discard_id=task_id)
-                else:
-                    round_transitioned, _ = self._finish_round_browsers(conn, task["batch"], task["round_no"])
-                conn.execute("UPDATE tasks SET status='skipped', revision=revision+1, updated_at=? WHERE id=?",
-                             (now, task_id))
-                self._release_unused_node_slot_if_untouched(conn, task)
-                return {"round_transitioned": round_transitioned}
-
-            if action == "open_round":
-                sessions = getattr(self.browser, "sessions", None)
-                any_session_open = (
-                    isinstance(sessions, dict)
-                    and any(rt["id"] in sessions for rt in round_active)
-                )
-                if not any_session_open:
-                    round_active = self._preflight_and_prepare_round_node(conn, round_active)
-                ready_list = [t for t in round_active if t["status"] == "ready"]
-                if not ready_list:
-                    if any(t["status"] == "verified" for t in round_active):
-                        return {"opened_count": 0, "message": "人工验证已确认，正在继续全自动注册…"}
-                    return {"message": "本轮窗口正在等待人工验证，请先完成验证。"}
-                pairs_to_open = []
-                for rt in ready_list:
-                    acc = self.accounts.get_account(rt["account_id"])
-                    if not acc or acc["account_type"] != "域名邮箱" or acc["account"].casefold() != rt["email"].casefold():
-                        raise ValueError("所选邮箱资料已变动，请检查或跳过对应任务。")
-                    pairs_to_open.append((rt, acc))
-                opened_cnt = 0
-                paused_cnt = 0
-                for idx_rt, (rt, acc) in enumerate(pairs_to_open):
-                    if (
-                        rt["step"] == "github"
-                        and hasattr(self.browser, "is_ip_restricted_page")
-                        and self.browser.is_ip_restricted_page(dict(rt)) is True
-                    ):
-                        rotated = self._rotate_round_to_clean_node(conn, round_active, rt)
-                        if rotated is not None:
-                            return rotated
-                    if self._pause_for_challenge(conn, rt):
-                        paused_cnt += 1
-                        continue
-                    if idx_rt > 0:
-                        _sleep_step_delay()
-                    if rt["step"] == "email":
-                        try:
-                            code = read_github_code(rt["email"], acc["password"], rt["started_at"])
-                            self.browser.fill_github_code(dict(rt), code)
-                        except Exception:
-                            self.browser.open(dict(rt), acc["password"])
-                    else:
-                        self.browser.open(dict(rt), acc["password"])
-                    opened_cnt += 1
-                    if (
-                        rt["step"] == "github"
-                        and hasattr(self.browser, "is_ip_restricted_page")
-                        and self.browser.is_ip_restricted_page(dict(rt)) is True
-                    ):
-                        rotated = self._rotate_round_to_clean_node(conn, round_active, rt)
-                        if rotated is not None:
-                            return rotated
-                    if self._pause_for_challenge(conn, rt):
-                        paused_cnt += 1
-                msg = f"已同时开启本轮 {opened_cnt} 个独立指纹浏览器，并按真人点击+粘贴节奏完成准备。"
-                if paused_cnt:
-                    msg += f"（其中 {paused_cnt} 个窗口出现人机验证已自动暂停等待人工点击）"
-                return {"opened_count": opened_cnt, "message": msg}
-
-            if action == "switch_node":
-                bad_node = str(task["proxy_node"] or "").strip()
-                rotated = self._rotate_round_to_clean_node(
-                    conn,
-                    round_active,
-                    task,
-                    explicit_target=value.strip() if isinstance(value, str) else "",
-                )
-                if rotated is None:
-                    raise ValueError(
-                        "未找到其他有足够配额的干净订阅节点！请在代理客户端中刷新订阅，或在「节点配额与解限」中解限其他可用节点后重试。"
-                    )
-                rotated["message"] = f"已拉黑受限节点「{bad_node or '旧节点'}」，清理缓存并切换至新节点「{rotated['switched_node']}」，正在重开本轮窗口…"
-                return rotated
-
-            paused = task["status"] == "paused"
-            if action == "resume" and paused:
-                # Resume probes the OOPIF DOM (``allow_active_fe_skip=False``):
-                # the challenge frame may have transitioned to "访问暂时受限"
-                # while paused, which must auto-rotate to a clean node.
-                if (
-                    hasattr(self.browser, "is_ip_restricted_page")
-                    and self.browser.is_ip_restricted_page({**dict(task), "status": "verified"}) is True
-                ):
-                    rotated = self._rotate_round_to_clean_node(conn, round_active, task)
-                    if rotated is not None:
-                        return rotated
-                conn.execute(
-                    "UPDATE tasks SET status='verified', revision=revision+1, updated_at=? WHERE id=?",
-                    (now, task_id),
-                )
-                return
-
-            if action == "pause" and not paused:
+            with closing(self._connect()) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                self._assert_fresh_revision(conn, task_id, expected_revision)
                 conn.execute(
                     "UPDATE tasks SET status='paused', revision=revision+1, updated_at=? WHERE id=?",
                     (now, task_id),
                 )
-                return
+            return {
+                "message": "工作窗口出现人机验证或「访问暂时受限」，已自动暂停。您可在窗口完成验证后点击「恢复此步」，或点击「换新节点重开本轮」切换干净 IP。"
+            }
+        return None
 
-            if action == "check_paused":
-                if not paused:
-                    return {"still_paused": False}
-                state = ""
-                if hasattr(self.browser, "check_paused_challenge_state"):
+    def _action(self, task_id, revision, action, value):
+        round_active, task = self._load_active_task_snapshot(task_id, revision)
+        now = int(time.time())
+
+        if action == "cancel":
+            blocked_nodes: list[tuple[str, str]] = []
+            if hasattr(self.browser, "is_ip_restricted_page"):
+                for rt in round_active:
+                    bad_nd = str(rt["proxy_node"] or "").strip()
+                    if bad_nd and self.browser.is_ip_restricted_page(dict(rt)) is True:
+                        blocked_nodes.append((bad_nd, str(rt["proxy_url"] or "")))
+            with closing(self._connect()) as conn:
+                all_round_rows = conn.execute(
+                    "SELECT id FROM tasks WHERE batch = ? AND round_no = ? ORDER BY id",
+                    (task["batch"], task["round_no"]),
+                ).fetchall()
+            for r in all_round_rows:
+                self.browser.close(discard_id=r["id"])
+            if hasattr(self.browser, "purge_cache_and_switch_node"):
+                self.browser.purge_cache_and_switch_node("", "")
+            with closing(self._connect()) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                self._assert_fresh_revision(conn, task_id, revision)
+                for bad_nd, bad_px in blocked_nodes:
+                    conn.execute(
+                        "INSERT INTO node_quotas (node_name, proxy_url, quota_limit, unlocked, blocked, updated_at) "
+                        "VALUES (?, ?, ?, 0, 1, ?) "
+                        "ON CONFLICT(node_name) DO UPDATE SET unlocked = 0, blocked = 1, updated_at = excluded.updated_at",
+                        (bad_nd, bad_px, DEFAULT_NODE_QUOTA, now),
+                    )
+                active_rows = conn.execute(
+                    f"SELECT * FROM tasks WHERE batch=? AND {_ACTIVE}",
+                    (task["batch"],),
+                ).fetchall()
+                conn.execute(
+                    f"UPDATE tasks SET status='cancelled', revision=revision+1, updated_at=? WHERE batch=? AND {_ACTIVE}",
+                    (now, task["batch"]),
+                )
+                for r in active_rows:
+                    self._release_unused_node_slot_if_untouched(conn, r)
+            return
+
+        if action == "skip":
+            blocked_nodes = []
+            if hasattr(self.browser, "is_ip_restricted_page"):
+                for rt in round_active:
+                    bad_nd = str(rt["proxy_node"] or "").strip()
+                    if bad_nd and self.browser.is_ip_restricted_page(dict(rt)) is True:
+                        blocked_nodes.append((bad_nd, str(rt["proxy_url"] or "")))
+            other_active = [t for t in round_active if t["id"] != task_id]
+            if other_active:
+                self.browser.close(discard_id=task_id)
+            with closing(self._connect()) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                cur_task = self._assert_fresh_revision(conn, task_id, revision)
+                for bad_nd, bad_px in blocked_nodes:
+                    conn.execute(
+                        "INSERT INTO node_quotas (node_name, proxy_url, quota_limit, unlocked, blocked, updated_at) "
+                        "VALUES (?, ?, ?, 0, 1, ?) "
+                        "ON CONFLICT(node_name) DO UPDATE SET unlocked = 0, blocked = 1, updated_at = excluded.updated_at",
+                        (bad_nd, bad_px, DEFAULT_NODE_QUOTA, now),
+                    )
+                round_transitioned = False
+                if not other_active:
+                    round_transitioned, _ = self._finish_round_browsers(conn, cur_task["batch"], cur_task["round_no"])
+                conn.execute(
+                    "UPDATE tasks SET status='skipped', revision=revision+1, updated_at=? WHERE id=?",
+                    (now, task_id),
+                )
+                self._release_unused_node_slot_if_untouched(conn, cur_task)
+            return {"round_transitioned": round_transitioned}
+
+        if action == "open_round":
+            sessions = getattr(self.browser, "sessions", None)
+            any_session_open = (
+                isinstance(sessions, dict)
+                and any(rt["id"] in sessions for rt in round_active)
+            )
+            if not any_session_open:
+                with closing(self._connect()) as conn, conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    cur_round = self._current_round_tasks(conn)
+                    round_active = [dict(r) for r in self._preflight_and_prepare_round_node(conn, cur_round)]
+            ready_list = [t for t in round_active if t["status"] == "ready"]
+            if not ready_list:
+                if any(t["status"] == "verified" for t in round_active):
+                    return {"opened_count": 0, "message": "人工验证已确认，正在继续全自动注册…"}
+                return {"message": "本轮窗口正在等待人工验证，请先完成验证。"}
+            pairs_to_open = []
+            for rt in ready_list:
+                acc = self.accounts.get_account(rt["account_id"])
+                if not acc or acc["account_type"] != "域名邮箱" or acc["account"].casefold() != rt["email"].casefold():
+                    raise ValueError("所选邮箱资料已变动，请检查或跳过对应任务。")
+                pairs_to_open.append((rt, acc))
+            opened_cnt = 0
+            paused_cnt = 0
+            for idx_rt, (rt, acc) in enumerate(pairs_to_open):
+                if (
+                    rt["step"] == "github"
+                    and hasattr(self.browser, "is_ip_restricted_page")
+                    and self.browser.is_ip_restricted_page(dict(rt)) is True
+                ):
+                    with closing(self._connect()) as conn, conn:
+                        conn.execute("BEGIN IMMEDIATE")
+                        cur_round = self._current_round_tasks(conn)
+                        rotated = self._rotate_round_to_clean_node(conn, cur_round, rt)
+                        if rotated is not None:
+                            return rotated
+                if self._commit_challenge_pause_if_needed(rt["id"], rt["revision"], dict(rt)):
+                    paused_cnt += 1
+                    continue
+                if idx_rt > 0:
+                    _sleep_step_delay()
+                if rt["step"] == "email":
                     try:
-                        raw_state = self.browser.check_paused_challenge_state(dict(task))
-                        if isinstance(raw_state, str):
-                            state = raw_state.strip()
-                        elif raw_state and not hasattr(raw_state, "_mock_return_value"):
-                            state = str(raw_state).strip()
+                        code = read_github_code(rt["email"], acc["password"], rt["started_at"])
+                        self.browser.fill_github_code(dict(rt), code)
                     except Exception:
-                        state = ""
-                if not state and hasattr(self.browser, "is_ip_restricted_page") and self.browser.is_ip_restricted_page(dict(task)) is True:
-                    state = "ip_restricted"
-                if state == "ip_restricted":
-                    rotated = self._rotate_round_to_clean_node(conn, round_active, task)
+                        self.browser.open(dict(rt), acc["password"])
+                else:
+                    self.browser.open(dict(rt), acc["password"])
+                opened_cnt += 1
+                if (
+                    rt["step"] == "github"
+                    and hasattr(self.browser, "is_ip_restricted_page")
+                    and self.browser.is_ip_restricted_page(dict(rt)) is True
+                ):
+                    with closing(self._connect()) as conn, conn:
+                        conn.execute("BEGIN IMMEDIATE")
+                        cur_round = self._current_round_tasks(conn)
+                        rotated = self._rotate_round_to_clean_node(conn, cur_round, rt)
+                        if rotated is not None:
+                            return rotated
+                if self._commit_challenge_pause_if_needed(rt["id"], rt["revision"], dict(rt)):
+                    paused_cnt += 1
+            msg = f"已同时开启本轮 {opened_cnt} 个独立指纹浏览器，并按真人点击+粘贴节奏完成准备。"
+            if paused_cnt:
+                msg += f"（其中 {paused_cnt} 个窗口出现人机验证已自动暂停等待人工点击）"
+            return {"opened_count": opened_cnt, "message": msg}
+
+        if action == "switch_node":
+            bad_node = str(task["proxy_node"] or "").strip()
+            with closing(self._connect()) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                cur_round = self._current_round_tasks(conn)
+                cur_task = self._assert_fresh_revision(conn, task_id, revision)
+                rotated = self._rotate_round_to_clean_node(
+                    conn,
+                    cur_round,
+                    cur_task,
+                    explicit_target=value.strip() if isinstance(value, str) else "",
+                )
+            if rotated is None:
+                raise ValueError(
+                    "未找到其他有足够配额的干净订阅节点！请在代理客户端中刷新订阅，或在「节点配额与解限」中解限其他可用节点后重试。"
+                )
+            rotated["message"] = f"已拉黑受限节点「{bad_node or '旧节点'}」，清理缓存并切换至新节点「{rotated['switched_node']}」，正在重开本轮窗口…"
+            return rotated
+
+        paused = task["status"] == "paused"
+        if action == "resume" and paused:
+            if (
+                hasattr(self.browser, "is_ip_restricted_page")
+                and self.browser.is_ip_restricted_page({**dict(task), "status": "verified"}) is True
+            ):
+                with closing(self._connect()) as conn, conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    cur_round = self._current_round_tasks(conn)
+                    cur_task = self._assert_fresh_revision(conn, task_id, revision)
+                    rotated = self._rotate_round_to_clean_node(conn, cur_round, cur_task)
                     if rotated is not None:
                         return rotated
-                    return {"still_paused": True, "ip_restricted": True}
-                if state == "solved":
+            with closing(self._connect()) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                self._assert_fresh_revision(conn, task_id, revision)
+                conn.execute(
+                    "UPDATE tasks SET status='verified', revision=revision+1, updated_at=? WHERE id=?",
+                    (now, task_id),
+                )
+            return
+
+        if action == "pause" and not paused:
+            with closing(self._connect()) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                self._assert_fresh_revision(conn, task_id, revision)
+                conn.execute(
+                    "UPDATE tasks SET status='paused', revision=revision+1, updated_at=? WHERE id=?",
+                    (now, task_id),
+                )
+            return
+
+        if action == "check_paused":
+            if not paused:
+                return {"still_paused": False}
+            state = ""
+            if hasattr(self.browser, "check_paused_challenge_state"):
+                try:
+                    raw_state = self.browser.check_paused_challenge_state(dict(task))
+                    if isinstance(raw_state, str):
+                        state = raw_state.strip()
+                    elif raw_state and not hasattr(raw_state, "_mock_return_value"):
+                        state = str(raw_state).strip()
+                except Exception:
+                    state = ""
+            if not state and hasattr(self.browser, "is_ip_restricted_page") and self.browser.is_ip_restricted_page(dict(task)) is True:
+                state = "ip_restricted"
+            if state == "ip_restricted":
+                with closing(self._connect()) as conn, conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    cur_round = self._current_round_tasks(conn)
+                    cur_task = self._assert_fresh_revision(conn, task_id, revision)
+                    rotated = self._rotate_round_to_clean_node(conn, cur_round, cur_task)
+                    if rotated is not None:
+                        return rotated
+                return {"still_paused": True, "ip_restricted": True}
+            if state == "solved":
+                with closing(self._connect()) as conn, conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    self._assert_fresh_revision(conn, task_id, revision)
                     conn.execute(
                         "UPDATE tasks SET status='verified', revision=revision+1, updated_at=? WHERE id=?",
                         (now, task_id),
                     )
-                    return {
-                        "still_paused": False,
-                        "paused_resolved": True,
-                        "message": "检测到浏览器人机验证已通过，正在自动继续注册…",
-                    }
-                return {"still_paused": True}
+                return {
+                    "still_paused": False,
+                    "paused_resolved": True,
+                    "message": "检测到浏览器人机验证已通过，正在自动继续注册…",
+                }
+            return {"still_paused": True}
 
-            if action == "skip_to_workbuddy":
-                if task["step"] not in ("github", "email"):
-                    return {"step": task["step"], "message": "当前已在 WorkBuddy 授权或后续阶段。"}
-                raw_user = value.strip() if isinstance(value, str) and value.strip() else str(task["username"] or "").strip()
-                if len(raw_user) <= 39 and re.fullmatch(r"[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)*", raw_user):
-                    username = raw_user
-                else:
-                    username = task["username"]
+        if action == "skip_to_workbuddy":
+            if task["step"] not in ("github", "email"):
+                return {"step": task["step"], "message": "当前已在 WorkBuddy 授权或后续阶段。"}
+            raw_user = value.strip() if isinstance(value, str) and value.strip() else str(task["username"] or "").strip()
+            if len(raw_user) <= 39 and re.fullmatch(r"[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)*", raw_user):
+                username = raw_user
+            else:
+                username = task["username"]
+            with closing(self._connect()) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                self._assert_fresh_revision(conn, task_id, revision)
                 conn.execute(
                     "UPDATE tasks SET step='workbuddy', status='ready', username=?, revision=revision+1, updated_at=? WHERE id=?",
                     (username, now, task_id),
                 )
-                self._sync_account_step(
-                    task["account_id"],
-                    "workbuddy",
-                    username=username,
-                    proxy_url=task["proxy_url"],
-                    proxy_node=task["proxy_node"],
-                )
-                return {
-                    "step": "workbuddy",
-                    "auto_advanced": True,
-                    "message": "已跳过 GitHub 注册，直接进入 WorkBuddy 登录授权（将使用该邮箱已注册的 GitHub 账号自动登录）…",
-                }
+            self._sync_account_step(
+                task["account_id"],
+                "workbuddy",
+                username=username,
+                proxy_url=task["proxy_url"],
+                proxy_node=task["proxy_node"],
+            )
+            return {
+                "step": "workbuddy",
+                "auto_advanced": True,
+                "message": "已跳过 GitHub 注册，直接进入 WorkBuddy 登录授权（将使用该邮箱已注册的 GitHub 账号自动登录）…",
+            }
 
-            if paused:
-                if action == "show":
-                    self.browser.show_paused_window(dict(task))
-                    return {"message": "已打开工作窗口，队列仍在等待人工验证。"}
-                raise ValueError("任务正在等待人工验证。请先完成验证，再点击恢复此步。")
-            account = self.accounts.get_account(task["account_id"])
-            if not account or account["account_type"] != "域名邮箱" or account["account"].casefold() != task["email"].casefold():
-                raise ValueError("当前邮箱已被删除或改动，请恢复原资料，或跳过这条任务。")
-            if action in ("open", "mailbox", "code", "confirm", "send", "oauth", "auto_step"):
-                if (
-                    action == "auto_step"
-                    and task["step"] == "github"
-                    and hasattr(self.browser, "is_ip_restricted_page")
-                    and self.browser.is_ip_restricted_page(dict(task)) is True
-                ):
-                    rotated = self._rotate_round_to_clean_node(conn, round_active, task)
+        if paused:
+            if action == "show":
+                self.browser.show_paused_window(dict(task))
+                return {"message": "已打开工作窗口，队列仍在等待人工验证。"}
+            raise ValueError("任务正在等待人工验证。请先完成验证，再点击恢复此步。")
+
+        account = self.accounts.get_account(task["account_id"])
+        if not account or account["account_type"] != "域名邮箱" or account["account"].casefold() != task["email"].casefold():
+            raise ValueError("当前邮箱已被删除或改动，请恢复原资料，或跳过这条任务。")
+
+        if action in ("open", "mailbox", "code", "confirm", "send", "oauth", "auto_step"):
+            if (
+                action == "auto_step"
+                and task["step"] == "github"
+                and hasattr(self.browser, "is_ip_restricted_page")
+                and self.browser.is_ip_restricted_page(dict(task)) is True
+            ):
+                with closing(self._connect()) as conn, conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    cur_round = self._current_round_tasks(conn)
+                    cur_task = self._assert_fresh_revision(conn, task_id, revision)
+                    rotated = self._rotate_round_to_clean_node(conn, cur_round, cur_task)
                     if rotated is not None:
                         return rotated
-                blocked = self._pause_for_challenge(conn, task)
-                if blocked:
-                    return blocked
-                _sleep_step_delay()
-            if action == "open" or (action == "mailbox" and task["step"] == "email"):
-                if action == "open" and (
-                    isinstance(getattr(self.browser, "sessions", None), dict)
-                    and task["id"] not in self.browser.sessions
-                ):
-                    refreshed_round = self._preflight_and_prepare_round_node(conn, [task])
+            blocked = self._commit_challenge_pause_if_needed(task_id, revision, dict(task))
+            if blocked:
+                return blocked
+            _sleep_step_delay()
+
+        if action == "open" or (action == "mailbox" and task["step"] == "email"):
+            if action == "open" and (
+                isinstance(getattr(self.browser, "sessions", None), dict)
+                and task["id"] not in self.browser.sessions
+            ):
+                with closing(self._connect()) as conn, conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    cur_task = self._assert_fresh_revision(conn, task_id, revision)
+                    refreshed_round = self._preflight_and_prepare_round_node(conn, [cur_task])
                     if refreshed_round:
-                        task = refreshed_round[0]
-                message = self.browser.open(dict(task), account["password"], mailbox=action == "mailbox")
-                return self._pause_for_challenge(conn, task) or {"message": message}
-            if action == "password" and task["step"] in ("github", "email", "workbuddy"):
-                return {"password": account["password"]}
-            if action == "code" and task["step"] == "email":
-                code = read_github_code(task["email"], account["password"], task["started_at"])
+                        task = dict(refreshed_round[0])
+            message = self.browser.open(dict(task), account["password"], mailbox=action == "mailbox")
+            return self._commit_challenge_pause_if_needed(task_id, revision, dict(task)) or {"message": message}
+
+        if action == "password" and task["step"] in ("github", "email", "workbuddy"):
+            return {"password": account["password"]}
+
+        if action == "code" and task["step"] == "email":
+            code = read_github_code(task["email"], account["password"], task["started_at"])
+            filled = False
+            try:
+                filled = bool(self.browser.fill_github_code(dict(task), code) is True)
+            except Exception:
                 filled = False
+            return {"code": code, "filled": filled}
+
+        if action == "oauth" and task["step"] in ("workbuddy", "region", "greeting"):
+            task_dict = dict(task)
+            pwd = ""
+            if account:
                 try:
-                    filled = bool(self.browser.fill_github_code(dict(task), code) is True)
+                    pwd = account["password"]
                 except Exception:
-                    filled = False
-                return {"code": code, "filled": filled}
-            if action == "oauth" and task["step"] in ("workbuddy", "region", "greeting"):
-                task_dict = dict(task)
-                pwd = ""
-                if account:
+                    pwd = ""
+            if task["oauth_state"]:
+                try:
                     try:
-                        pwd = account["password"]
-                    except Exception:
-                        pwd = ""
-                if task["oauth_state"]:
-                    try:
-                        try:
-                            polled_cred = self.browser.capture_credential(
-                                task_dict, oauth_state=task["oauth_state"], password=pwd
-                            )
-                        except TypeError:
-                            polled_cred = self.browser.capture_credential(
-                                task_dict, oauth_state=task["oauth_state"]
-                            )
-                    except Exception:
-                        polled_cred = None
-                    if isinstance(polled_cred, dict) and polled_cred.get("accessToken"):
-                        cred_json = json.dumps(polled_cred, ensure_ascii=False)
+                        polled_cred = self.browser.capture_credential(
+                            task_dict, oauth_state=task["oauth_state"], password=pwd
+                        )
+                    except TypeError:
+                        polled_cred = self.browser.capture_credential(
+                            task_dict, oauth_state=task["oauth_state"]
+                        )
+                except Exception:
+                    polled_cred = None
+                if isinstance(polled_cred, dict) and polled_cred.get("accessToken"):
+                    cred_json = json.dumps(polled_cred, ensure_ascii=False)
+                    with closing(self._connect()) as conn, conn:
+                        conn.execute("BEGIN IMMEDIATE")
+                        self._assert_fresh_revision(conn, task_id, revision)
                         conn.execute(
                             "UPDATE tasks SET credential_json=?, revision=revision+1, updated_at=? WHERE id=?",
                             (cred_json, now, task_id),
                         )
-                        if hasattr(self.accounts, "save_workbuddy_credential"):
-                            self.accounts.save_workbuddy_credential(task["account_id"], polled_cred)
-                        return {"credential_saved": True, "message": "已成功捕获并保存 WorkBuddy2API 登录凭据！"}
+                    if hasattr(self.accounts, "save_workbuddy_credential"):
+                        self.accounts.save_workbuddy_credential(task["account_id"], polled_cred)
+                    return {"credential_saved": True, "message": "已成功捕获并保存 WorkBuddy2API 登录凭据！"}
 
-                try:
-                    oauth_res = self.browser.start_cli_oauth(task_dict, password=pwd)
-                except TypeError:
-                    oauth_res = self.browser.start_cli_oauth(task_dict)
-                if not isinstance(oauth_res, dict):
-                    raise ValueError("无法启动 WorkBuddy CLI 凭据授权，请检查窗口状态。")
-                new_state = str(oauth_res.get("state") or "")
-                cred_obj = oauth_res.get("credential") if isinstance(oauth_res.get("credential"), dict) else None
-                cred_json = json.dumps(cred_obj, ensure_ascii=False) if cred_obj else task["credential_json"]
+            try:
+                oauth_res = self.browser.start_cli_oauth(task_dict, password=pwd)
+            except TypeError:
+                oauth_res = self.browser.start_cli_oauth(task_dict)
+            if not isinstance(oauth_res, dict):
+                raise ValueError("无法启动 WorkBuddy CLI 凭据授权，请检查窗口状态。")
+            new_state = str(oauth_res.get("state") or "")
+            cred_obj = oauth_res.get("credential") if isinstance(oauth_res.get("credential"), dict) else None
+            cred_json = json.dumps(cred_obj, ensure_ascii=False) if cred_obj else task["credential_json"]
+            with closing(self._connect()) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                self._assert_fresh_revision(conn, task_id, revision)
                 conn.execute(
                     "UPDATE tasks SET oauth_state=?, credential_json=?, revision=revision+1, updated_at=? WHERE id=?",
                     (new_state or task["oauth_state"], cred_json, now, task_id),
                 )
-                if cred_obj and hasattr(self.accounts, "save_workbuddy_credential"):
-                    self.accounts.save_workbuddy_credential(task["account_id"], cred_obj)
-                return {
-                    "credential_saved": bool(cred_obj),
-                    "message": str(oauth_res.get("message") or "已触发凭据捕获"),
-                }
-            if action == "send" and task["step"] == "greeting":
-                return self._send_greeting(conn, task)
-            if action == "auto_step":
-                sessions = getattr(self.browser, "sessions", None)
-                if isinstance(sessions, dict) and task["id"] not in sessions:
-                    refreshed_round = self._preflight_and_prepare_round_node(conn, [task])
-                    if refreshed_round:
-                        task = refreshed_round[0]
+            if cred_obj and hasattr(self.accounts, "save_workbuddy_credential"):
+                self.accounts.save_workbuddy_credential(task["account_id"], cred_obj)
+            return {
+                "credential_saved": bool(cred_obj),
+                "message": str(oauth_res.get("message") or "已触发凭据捕获"),
+            }
 
-                step = task["step"]
-                if step == "github":
-                    if hasattr(self.browser, "submit_github_signup"):
-                        res = self.browser.submit_github_signup(dict(task), account["password"])
-                        if not isinstance(res, dict):
-                            msg = self.browser.open(dict(task), account["password"])
-                            res = {"status": "next_step", "next": "email", "username": task["username"], "message": msg}
-                    else:
+        if action == "send" and task["step"] == "greeting":
+            return self._send_greeting(task_id, revision)
+
+        if action == "auto_step":
+            sessions = getattr(self.browser, "sessions", None)
+            if isinstance(sessions, dict) and task["id"] not in sessions:
+                with closing(self._connect()) as conn, conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    cur_task = self._assert_fresh_revision(conn, task_id, revision)
+                    refreshed_round = self._preflight_and_prepare_round_node(conn, [cur_task])
+                    if refreshed_round:
+                        task = dict(refreshed_round[0])
+
+            step = task["step"]
+            if step == "github":
+                if hasattr(self.browser, "submit_github_signup"):
+                    res = self.browser.submit_github_signup(dict(task), account["password"])
+                    if not isinstance(res, dict):
                         msg = self.browser.open(dict(task), account["password"])
                         res = {"status": "next_step", "next": "email", "username": task["username"], "message": msg}
+                else:
+                    msg = self.browser.open(dict(task), account["password"])
+                    res = {"status": "next_step", "next": "email", "username": task["username"], "message": msg}
 
-                    if res.get("status") == "ip_restricted" or (
-                        res.get("status") not in ("challenged", "next_step")
-                        and hasattr(self.browser, "is_ip_restricted_page")
-                        and self.browser.is_ip_restricted_page(dict(task)) is True
-                    ):
-                        rotated = self._rotate_round_to_clean_node(conn, round_active, task)
+                if res.get("status") == "ip_restricted" or (
+                    res.get("status") not in ("challenged", "next_step")
+                    and hasattr(self.browser, "is_ip_restricted_page")
+                    and self.browser.is_ip_restricted_page(dict(task)) is True
+                ):
+                    with closing(self._connect()) as conn, conn:
+                        conn.execute("BEGIN IMMEDIATE")
+                        cur_round = self._current_round_tasks(conn)
+                        cur_task = self._assert_fresh_revision(conn, task_id, revision)
+                        rotated = self._rotate_round_to_clean_node(conn, cur_round, cur_task)
                         if rotated is not None:
                             return rotated
 
-                    raw_user = str(res.get("username") or task["username"]).strip()
-                    if len(raw_user) <= 39 and re.fullmatch(r"[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)*", raw_user):
-                        username = raw_user
-                    else:
-                        username = task["username"]
+                raw_user = str(res.get("username") or task["username"]).strip()
+                if len(raw_user) <= 39 and re.fullmatch(r"[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)*", raw_user):
+                    username = raw_user
+                else:
+                    username = task["username"]
 
-                    if res.get("status") == "account_suspended":
+                if res.get("status") == "account_suspended":
+                    with closing(self._connect()) as conn, conn:
+                        conn.execute("BEGIN IMMEDIATE")
+                        self._assert_fresh_revision(conn, task_id, revision)
                         conn.execute(
                             "UPDATE tasks SET status='paused', username=?, revision=revision+1, updated_at=? WHERE id=?",
                             (username, now, task_id),
                         )
-                        self._sync_account_step(task["account_id"], step, username=username, proxy_url=task["proxy_url"], proxy_node=task["proxy_node"])
-                        return {
-                            "auto_advanced": False,
-                            "paused_for_human": True,
-                            "account_suspended": True,
-                            "message": str(res.get("message") or "检测到该 GitHub 账号已被官方封禁 (Account suspended)，请点击「跳过此人」改用下一个邮箱。"),
-                        }
+                    self._sync_account_step(task["account_id"], step, username=username, proxy_url=task["proxy_url"], proxy_node=task["proxy_node"])
+                    return {
+                        "auto_advanced": False,
+                        "paused_for_human": True,
+                        "account_suspended": True,
+                        "message": str(res.get("message") or "检测到该 GitHub 账号已被官方封禁 (Account suspended)，请点击「跳过此人」改用下一个邮箱。"),
+                    }
 
-                    if res.get("status") in ("challenged", "ip_restricted") or self._pause_for_challenge(conn, task):
+                is_chal = res.get("status") in ("challenged", "ip_restricted") or (
+                    task["status"] != "verified" and self.browser.challenge_page(dict(task))
+                )
+                if is_chal:
+                    with closing(self._connect()) as conn, conn:
+                        conn.execute("BEGIN IMMEDIATE")
+                        self._assert_fresh_revision(conn, task_id, revision)
                         conn.execute(
                             "UPDATE tasks SET status='paused', username=?, revision=revision+1, updated_at=? WHERE id=?",
                             (username, now, task_id),
                         )
-                        self._sync_account_step(task["account_id"], step, username=username, proxy_url=task["proxy_url"], proxy_node=task["proxy_node"])
-                        return {
-                            "auto_advanced": False,
-                            "paused_for_human": True,
-                            "message": str(res.get("message") or "出现人机验证，已自动暂停等待人工点击验证。"),
-                        }
+                    self._sync_account_step(task["account_id"], step, username=username, proxy_url=task["proxy_url"], proxy_node=task["proxy_node"])
+                    return {
+                        "auto_advanced": False,
+                        "paused_for_human": True,
+                        "message": str(res.get("message") or "出现人机验证，已自动暂停等待人工点击验证。"),
+                    }
 
-                    if res.get("status") == "next_step":
-                        next_step = str(res.get("next") or "email")
-                        if next_step not in STEPS:
-                            next_step = "email"
+                if res.get("status") == "next_step":
+                    next_step = str(res.get("next") or "email")
+                    if next_step not in STEPS:
+                        next_step = "email"
+                    with closing(self._connect()) as conn, conn:
+                        conn.execute("BEGIN IMMEDIATE")
+                        self._assert_fresh_revision(conn, task_id, revision)
                         conn.execute(
                             "UPDATE tasks SET step=?, status='ready', username=?, revision=revision+1, updated_at=? WHERE id=?",
                             (next_step, username, now, task_id),
                         )
-                        self._sync_account_step(task["account_id"], next_step, username=username, proxy_url=task["proxy_url"], proxy_node=task["proxy_node"])
-                        return {
-                            "auto_advanced": True,
-                            "step": next_step,
-                            "message": str(res.get("message") or "已自动提交 GitHub 注册，进入邮箱验证。"),
-                        }
+                    self._sync_account_step(task["account_id"], next_step, username=username, proxy_url=task["proxy_url"], proxy_node=task["proxy_node"])
+                    return {
+                        "auto_advanced": True,
+                        "step": next_step,
+                        "message": str(res.get("message") or "已自动提交 GitHub 注册，进入邮箱验证。"),
+                    }
 
-                    # Else (waiting_human)
+                with closing(self._connect()) as conn, conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    self._assert_fresh_revision(conn, task_id, revision)
                     conn.execute(
                         "UPDATE tasks SET username=?, revision=revision+1, updated_at=? WHERE id=?",
                         (username, now, task_id),
                     )
+                return {
+                    "auto_advanced": False,
+                    "paused_for_human": True,
+                    "message": str(res.get("message") or "请在工作窗口核对并提交 GitHub 注册。"),
+                }
+
+            if step == "email":
+                try:
+                    code = self._read_github_code_with_retry(task["email"], account["password"], task["started_at"])
+                except ValueError as exc:
                     return {
                         "auto_advanced": False,
                         "paused_for_human": True,
-                        "message": str(res.get("message") or "请在工作窗口核对并提交 GitHub 注册。"),
+                        "message": f"{exc}（可稍候点击「继续全自动注册」重试读取，或手动填入验证码）",
                     }
 
-                if step == "email":
+                if hasattr(self.browser, "submit_github_otp"):
                     try:
-                        code = self._read_github_code_with_retry(task["email"], account["password"], task["started_at"])
-                    except ValueError as exc:
-                        return {
-                            "auto_advanced": False,
-                            "paused_for_human": True,
-                            "message": f"{exc}（可稍候点击「继续全自动注册」重试读取，或手动填入验证码）",
-                        }
-
-                    if hasattr(self.browser, "submit_github_otp"):
-                        try:
-                            res = self.browser.submit_github_otp(dict(task), code, account["password"])
-                        except TypeError:
-                            res = self.browser.submit_github_otp(dict(task), code)
-                        if not isinstance(res, dict):
-                            fill_res = self.browser.fill_github_code(dict(task), code)
-                            filled = bool(fill_res is not False and fill_res is not None and fill_res != "")
-                            res = {
-                                "status": "next_step" if filled else "waiting_human",
-                                "next": "workbuddy",
-                                "filled": filled,
-                                "message": "已自动读取并填入 GitHub 验证码。",
-                            }
-                    else:
+                        res = self.browser.submit_github_otp(dict(task), code, account["password"])
+                    except TypeError:
+                        res = self.browser.submit_github_otp(dict(task), code)
+                    if not isinstance(res, dict):
                         fill_res = self.browser.fill_github_code(dict(task), code)
                         filled = bool(fill_res is not False and fill_res is not None and fill_res != "")
                         res = {
@@ -1630,173 +1744,219 @@ class WorkBuddyQueue:
                             "filled": filled,
                             "message": "已自动读取并填入 GitHub 验证码。",
                         }
+                else:
+                    fill_res = self.browser.fill_github_code(dict(task), code)
+                    filled = bool(fill_res is not False and fill_res is not None and fill_res != "")
+                    res = {
+                        "status": "next_step" if filled else "waiting_human",
+                        "next": "workbuddy",
+                        "filled": filled,
+                        "message": "已自动读取并填入 GitHub 验证码。",
+                    }
 
-                    if res.get("status") == "account_suspended":
+                if res.get("status") == "account_suspended":
+                    with closing(self._connect()) as conn, conn:
+                        conn.execute("BEGIN IMMEDIATE")
+                        self._assert_fresh_revision(conn, task_id, revision)
                         conn.execute(
                             "UPDATE tasks SET status='paused', revision=revision+1, updated_at=? WHERE id=?",
                             (now, task_id),
                         )
-                        return {
-                            "auto_advanced": False,
-                            "paused_for_human": True,
-                            "account_suspended": True,
-                            "code": code,
-                            "filled": bool(res.get("filled")),
-                            "message": str(res.get("message") or "检测到该 GitHub 账号已被官方封禁 (Account suspended)，请点击「跳过此人」改用下一个邮箱。"),
-                        }
+                    return {
+                        "auto_advanced": False,
+                        "paused_for_human": True,
+                        "account_suspended": True,
+                        "code": code,
+                        "filled": bool(res.get("filled")),
+                        "message": str(res.get("message") or "检测到该 GitHub 账号已被官方封禁 (Account suspended)，请点击「跳过此人」改用下一个邮箱。"),
+                    }
 
-                    if res.get("status") == "challenged" or self._pause_for_challenge(conn, task):
+                is_chal = res.get("status") == "challenged" or (
+                    task["status"] != "verified" and self.browser.challenge_page(dict(task))
+                )
+                if is_chal:
+                    with closing(self._connect()) as conn, conn:
+                        conn.execute("BEGIN IMMEDIATE")
+                        self._assert_fresh_revision(conn, task_id, revision)
                         conn.execute(
                             "UPDATE tasks SET status='paused', revision=revision+1, updated_at=? WHERE id=?",
                             (now, task_id),
                         )
-                        return {
-                            "auto_advanced": False,
-                            "paused_for_human": True,
-                            "code": code,
-                            "filled": bool(res.get("filled")),
-                            "message": str(res.get("message") or "提交验证码后出现人机验证，已暂停。"),
-                        }
-
-                    if res.get("status") == "next_step":
-                        conn.execute(
-                            "UPDATE tasks SET step='workbuddy', status='ready', revision=revision+1, updated_at=? WHERE id=?",
-                            (now, task_id),
-                        )
-                        self._sync_account_step(task["account_id"], "workbuddy", username=task["username"], proxy_url=task["proxy_url"], proxy_node=task["proxy_node"])
-                        return {
-                            "auto_advanced": True,
-                            "step": "workbuddy",
-                            "code": code,
-                            "filled": True,
-                            "message": str(res.get("message") or "GitHub 邮箱验证已自动通过，进入 WorkBuddy 授权！"),
-                        }
-
                     return {
                         "auto_advanced": False,
                         "paused_for_human": True,
                         "code": code,
                         "filled": bool(res.get("filled")),
-                        "message": str(res.get("message") or "已读取验证码，请在窗口确认验证结果。"),
+                        "message": str(res.get("message") or "提交验证码后出现人机验证，已暂停。"),
                     }
 
-                if step == "workbuddy":
-                    if hasattr(self.browser, "complete_workbuddy_github_login"):
-                        try:
-                            res = self.browser.complete_workbuddy_github_login(dict(task), account["password"])
-                        except TypeError:
-                            res = self.browser.complete_workbuddy_github_login(dict(task))
-                        if not isinstance(res, dict):
-                            msg = self.browser.open(dict(task), account["password"])
-                            res = {"status": "next_step", "next": "region", "message": msg}
-                    else:
+                if res.get("status") == "next_step":
+                    with closing(self._connect()) as conn, conn:
+                        conn.execute("BEGIN IMMEDIATE")
+                        self._assert_fresh_revision(conn, task_id, revision)
+                        conn.execute(
+                            "UPDATE tasks SET step='workbuddy', status='ready', revision=revision+1, updated_at=? WHERE id=?",
+                            (now, task_id),
+                        )
+                    self._sync_account_step(task["account_id"], "workbuddy", username=task["username"], proxy_url=task["proxy_url"], proxy_node=task["proxy_node"])
+                    return {
+                        "auto_advanced": True,
+                        "step": "workbuddy",
+                        "code": code,
+                        "filled": True,
+                        "message": str(res.get("message") or "GitHub 邮箱验证已自动通过，进入 WorkBuddy 授权！"),
+                    }
+
+                return {
+                    "auto_advanced": False,
+                    "paused_for_human": True,
+                    "code": code,
+                    "filled": bool(res.get("filled")),
+                    "message": str(res.get("message") or "已读取验证码，请在窗口确认验证结果。"),
+                }
+
+            if step == "workbuddy":
+                if hasattr(self.browser, "complete_workbuddy_github_login"):
+                    try:
+                        res = self.browser.complete_workbuddy_github_login(dict(task), account["password"])
+                    except TypeError:
+                        res = self.browser.complete_workbuddy_github_login(dict(task))
+                    if not isinstance(res, dict):
                         msg = self.browser.open(dict(task), account["password"])
                         res = {"status": "next_step", "next": "region", "message": msg}
+                else:
+                    msg = self.browser.open(dict(task), account["password"])
+                    res = {"status": "next_step", "next": "region", "message": msg}
 
-                    if res.get("status") == "account_suspended":
+                if res.get("status") == "account_suspended":
+                    with closing(self._connect()) as conn, conn:
+                        conn.execute("BEGIN IMMEDIATE")
+                        self._assert_fresh_revision(conn, task_id, revision)
                         conn.execute(
                             "UPDATE tasks SET status='paused', revision=revision+1, updated_at=? WHERE id=?",
                             (now, task_id),
                         )
-                        return {
-                            "auto_advanced": False,
-                            "paused_for_human": True,
-                            "account_suspended": True,
-                            "message": str(res.get("message") or "检测到该 GitHub 账号已被官方封禁 (Account suspended)，无法用于授权 WorkBuddy。请点击「跳过此人」改用下一个邮箱。"),
-                        }
+                    return {
+                        "auto_advanced": False,
+                        "paused_for_human": True,
+                        "account_suspended": True,
+                        "message": str(res.get("message") or "检测到该 GitHub 账号已被官方封禁 (Account suspended)，无法用于授权 WorkBuddy。请点击「跳过此人」改用下一个邮箱。"),
+                    }
 
-                    if res.get("status") == "challenged" or self._pause_for_challenge(conn, task):
+                is_chal = res.get("status") == "challenged" or (
+                    task["status"] != "verified" and self.browser.challenge_page(dict(task))
+                )
+                if is_chal:
+                    with closing(self._connect()) as conn, conn:
+                        conn.execute("BEGIN IMMEDIATE")
+                        self._assert_fresh_revision(conn, task_id, revision)
                         conn.execute(
                             "UPDATE tasks SET status='paused', revision=revision+1, updated_at=? WHERE id=?",
                             (now, task_id),
                         )
-                        return {
-                            "auto_advanced": False,
-                            "paused_for_human": True,
-                            "message": str(res.get("message") or "WorkBuddy 登录出现人机验证，已暂停。"),
-                        }
+                    return {
+                        "auto_advanced": False,
+                        "paused_for_human": True,
+                        "message": str(res.get("message") or "WorkBuddy 登录出现人机验证，已暂停。"),
+                    }
 
-                    if res.get("status") == "next_step":
+                if res.get("status") == "next_step":
+                    with closing(self._connect()) as conn, conn:
+                        conn.execute("BEGIN IMMEDIATE")
+                        self._assert_fresh_revision(conn, task_id, revision)
                         conn.execute(
                             "UPDATE tasks SET step='region', status='ready', revision=revision+1, updated_at=? WHERE id=?",
                             (now, task_id),
                         )
-                        self._sync_account_step(task["account_id"], "region", username=task["username"], proxy_url=task["proxy_url"], proxy_node=task["proxy_node"])
-                        return {
-                            "auto_advanced": True,
-                            "step": "region",
-                            "message": str(res.get("message") or "已完成 WorkBuddy GitHub 登录授权，正在检查右上角完善信息按钮…"),
-                        }
-
+                    self._sync_account_step(task["account_id"], "region", username=task["username"], proxy_url=task["proxy_url"], proxy_node=task["proxy_node"])
                     return {
-                        "auto_advanced": False,
-                        "paused_for_human": True,
-                        "message": str(res.get("message") or "请在工作窗口完成 GitHub 授权登录。"),
+                        "auto_advanced": True,
+                        "step": "region",
+                        "message": str(res.get("message") or "已完成 WorkBuddy GitHub 登录授权，正在检查右上角完善信息按钮…"),
                     }
 
-                if step == "region":
-                    if hasattr(self.browser, "complete_workbuddy_region"):
-                        res = self.browser.complete_workbuddy_region(dict(task))
-                        if not isinstance(res, dict):
-                            msg = self.browser.open(dict(task), account["password"])
-                            res = {"status": "next_step", "next": "greeting", "region": "not_required", "message": msg}
-                    else:
+                return {
+                    "auto_advanced": False,
+                    "paused_for_human": True,
+                    "message": str(res.get("message") or "请在工作窗口完成 GitHub 授权登录。"),
+                }
+
+            if step == "region":
+                if hasattr(self.browser, "complete_workbuddy_region"):
+                    res = self.browser.complete_workbuddy_region(dict(task))
+                    if not isinstance(res, dict):
                         msg = self.browser.open(dict(task), account["password"])
                         res = {"status": "next_step", "next": "greeting", "region": "not_required", "message": msg}
+                else:
+                    msg = self.browser.open(dict(task), account["password"])
+                    res = {"status": "next_step", "next": "greeting", "region": "not_required", "message": msg}
 
-                    if res.get("status") == "challenged" or self._pause_for_challenge(conn, task):
+                is_chal = res.get("status") == "challenged" or (
+                    task["status"] != "verified" and self.browser.challenge_page(dict(task))
+                )
+                if is_chal:
+                    with closing(self._connect()) as conn, conn:
+                        conn.execute("BEGIN IMMEDIATE")
+                        self._assert_fresh_revision(conn, task_id, revision)
                         conn.execute(
                             "UPDATE tasks SET status='paused', revision=revision+1, updated_at=? WHERE id=?",
                             (now, task_id),
                         )
-                        return {
-                            "auto_advanced": False,
-                            "paused_for_human": True,
-                            "message": str(res.get("message") or "出现人机验证，已暂停。"),
-                        }
+                    return {
+                        "auto_advanced": False,
+                        "paused_for_human": True,
+                        "message": str(res.get("message") or "出现人机验证，已暂停。"),
+                    }
 
-                    if res.get("status") == "next_step":
-                        region_val = res.get("region") if res.get("region") in ("confirmed", "not_required") else "not_required"
+                if res.get("status") == "next_step":
+                    region_val = res.get("region") if res.get("region") in ("confirmed", "not_required") else "not_required"
+                    with closing(self._connect()) as conn, conn:
+                        conn.execute("BEGIN IMMEDIATE")
+                        cur_task = self._assert_fresh_revision(conn, task_id, revision)
                         if getattr(self.browser, "_is_real_browser", False) is True:
-                            self._capture_and_persist_credential(conn, task, account, now)
+                            self._capture_and_persist_credential(conn, cur_task, account, now)
                         conn.execute(
                             "UPDATE tasks SET step='greeting', region=?, status='ready', revision=revision+1, updated_at=? WHERE id=?",
                             (region_val, now, task_id),
                         )
-                        self._sync_account_step(task["account_id"], "greeting", username=task["username"], proxy_url=task["proxy_url"], proxy_node=task["proxy_node"])
-                        return {
-                            "auto_advanced": True,
-                            "step": "greeting",
-                            "region": region_val,
-                            "message": str(res.get("message") or "地区检查已完成，正在进入在线 WorkBuddy 发送招呼…"),
-                        }
-
+                    self._sync_account_step(task["account_id"], "greeting", username=task["username"], proxy_url=task["proxy_url"], proxy_node=task["proxy_node"])
                     return {
-                        "auto_advanced": False,
-                        "paused_for_human": True,
-                        "message": str(res.get("message") or "请在窗口确认非国区地区后继续。"),
+                        "auto_advanced": True,
+                        "step": "greeting",
+                        "region": region_val,
+                        "message": str(res.get("message") or "地区检查已完成，正在进入在线 WorkBuddy 发送招呼…"),
                     }
 
-                if step == "greeting":
-                    if hasattr(self.browser, "send_greeting_and_wait_reply"):
-                        res = self.browser.send_greeting_and_wait_reply(dict(task), already_sent=bool(task["greeting_attempted"]))
-                        if not isinstance(res, dict):
-                            if not task["greeting_attempted"]:
-                                btn = self.browser.prepare_greeting(dict(task))
-                                if hasattr(btn, "click"):
-                                    btn.click(timeout=4000)
-                            res = {"status": "replied", "sent": True, "message": "已发送招呼并收到回复！"}
-                    else:
+                return {
+                    "auto_advanced": False,
+                    "paused_for_human": True,
+                    "message": str(res.get("message") or "请在窗口确认非国区地区后继续。"),
+                }
+
+            if step == "greeting":
+                if hasattr(self.browser, "send_greeting_and_wait_reply"):
+                    res = self.browser.send_greeting_and_wait_reply(dict(task), already_sent=bool(task["greeting_attempted"]))
+                    if not isinstance(res, dict):
                         if not task["greeting_attempted"]:
                             btn = self.browser.prepare_greeting(dict(task))
                             if hasattr(btn, "click"):
                                 btn.click(timeout=4000)
                         res = {"status": "replied", "sent": True, "message": "已发送招呼并收到回复！"}
+                else:
+                    if not task["greeting_attempted"]:
+                        btn = self.browser.prepare_greeting(dict(task))
+                        if hasattr(btn, "click"):
+                            btn.click(timeout=4000)
+                    res = {"status": "replied", "sent": True, "message": "已发送招呼并收到回复！"}
 
-                    if res.get("sent") and not task["greeting_attempted"]:
+                with closing(self._connect()) as conn, conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    cur_task = self._assert_fresh_revision(conn, task_id, revision)
+                    if res.get("sent") and not cur_task["greeting_attempted"]:
                         conn.execute("UPDATE tasks SET greeting_attempted=1, updated_at=? WHERE id=?", (now, task_id))
 
-                    if res.get("status") == "challenged" or self._pause_for_challenge(conn, task):
+                    is_chal = res.get("status") == "challenged" or self._pause_for_challenge(conn, cur_task)
+                    if is_chal:
                         conn.execute(
                             "UPDATE tasks SET status='paused', revision=revision+1, updated_at=? WHERE id=?",
                             (now, task_id),
@@ -1818,145 +1978,173 @@ class WorkBuddyQueue:
                             "message": str(res.get("message") or "请在在线 WorkBuddy 窗口核对招呼回复后点击完成。"),
                         }
 
-                    saved_cred = self._capture_and_persist_credential(conn, task, account, now)
-
-                    other_active = [t for t in round_active if t["id"] != task_id]
+                    saved_cred = self._capture_and_persist_credential(conn, cur_task, account, now)
+                    cur_round = self._current_round_tasks(conn)
+                    other_active = [t for t in cur_round if t["id"] != task_id]
                     round_completed = False
                     round_transitioned = False
                     next_node_label = ""
                     if not other_active:
                         round_completed = True
                         round_transitioned, next_node_label = self._finish_round_browsers(
-                            conn, task["batch"], task["round_no"]
+                            conn, cur_task["batch"], cur_task["round_no"]
                         )
 
-                    final_cred_json = json.dumps(saved_cred, ensure_ascii=False) if saved_cred else task["credential_json"]
-                    conn.execute("""UPDATE tasks SET step=?, status=?, revision=revision+1,
-                        username=?, region=?, credential_json=?, updated_at=? WHERE id=?""", (
-                        "greeting", "done",
-                        task["username"], task["region"], final_cred_json, now, task_id,
-                    ))
-
-                    if task["proxy_node"]:
+                    final_cred_json = json.dumps(saved_cred, ensure_ascii=False) if saved_cred else cur_task["credential_json"]
+                    conn.execute(
+                        "UPDATE tasks SET step=?, status=?, revision=revision+1, username=?, region=?, credential_json=?, updated_at=? WHERE id=?",
+                        (
+                            "greeting",
+                            "done",
+                            cur_task["username"],
+                            cur_task["region"],
+                            final_cred_json,
+                            now,
+                            task_id,
+                        ),
+                    )
+                    if cur_task["proxy_node"]:
                         conn.execute(
                             "UPDATE node_registrations SET status='done' WHERE node_name=? AND email=?",
-                            (task["proxy_node"], task["email"]),
-                        )
-                    if hasattr(self.accounts, "mark_workbuddy_registered"):
-                        self.accounts.mark_workbuddy_registered(
-                            task["account_id"],
-                            username=task["username"],
-                            region=task["region"],
-                            credential=saved_cred,
-                            proxy_url=task["proxy_url"],
-                            proxy_node=task["proxy_node"],
+                            (cur_task["proxy_node"], cur_task["email"]),
                         )
 
-                    if not round_completed:
-                        msg = "当前账号已完成并保存凭据！请继续完成本轮第 2 个指纹浏览器注册，全部完成后将统一关闭双浏览器、清理缓存并切换下一节点。"
-                    elif round_transitioned:
-                        msg = f"本轮已全部完成！已关闭两个指纹浏览器、清理缓存并切换节点{('至 ' + next_node_label) if next_node_label else ''}，正在开启新一轮两个账号注册…"
-                    else:
-                        msg = "本轮及全部批次账号已注册完成！已关闭全部指纹浏览器并清理缓存。"
+                if hasattr(self.accounts, "mark_workbuddy_registered"):
+                    self.accounts.mark_workbuddy_registered(
+                        task["account_id"],
+                        username=task["username"],
+                        region=task["region"],
+                        credential=saved_cred,
+                        proxy_url=task["proxy_url"],
+                        proxy_node=task["proxy_node"],
+                    )
 
-                    return {
-                        "auto_advanced": True,
-                        "task_done": True,
-                        "round_completed": round_completed,
-                        "round_transitioned": round_transitioned,
-                        "credential_saved": bool(saved_cred),
-                        "message": msg,
-                    }
+                if not round_completed:
+                    msg = "当前账号已完成并保存凭据！请继续完成本轮第 2 个指纹浏览器注册，全部完成后将统一关闭双浏览器、清理缓存并切换下一节点。"
+                elif round_transitioned:
+                    msg = f"本轮已全部完成！已关闭两个指纹浏览器、清理缓存并切换节点{('至 ' + next_node_label) if next_node_label else ''}，正在开启新一轮两个账号注册…"
+                else:
+                    msg = "本轮及全部批次账号已注册完成！已关闭全部指纹浏览器并清理缓存。"
 
-            if action != "confirm":
-                raise ValueError("当前步骤不支持此操作。")
+                return {
+                    "auto_advanced": True,
+                    "task_done": True,
+                    "round_completed": round_completed,
+                    "round_transitioned": round_transitioned,
+                    "credential_saved": bool(saved_cred),
+                    "message": msg,
+                }
 
-            step = task["step"]
-            username, region = task["username"], task["region"]
-            if step == "github":
-                username = value.strip() if isinstance(value, str) else ""
-                if len(username) > 39 or not re.fullmatch(r"[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)*", username):
-                    raise ValueError("请填写实际提交的 GitHub 用户名，最多 39 位，可使用英文字母、数字和单个连字符。")
-            if step == "region":
-                if value not in ("confirmed", "not_required"):
-                    raise ValueError("请选择已确认实际地区，或页面无需确认。")
-                region = value
-            following = STEPS.index(step) + 1
-            finished = following == len(STEPS)
+        if action != "confirm":
+            raise ValueError("当前步骤不支持此操作。")
 
+        step = task["step"]
+        username, region = task["username"], task["region"]
+        if step == "github":
+            username = value.strip() if isinstance(value, str) else ""
+            if len(username) > 39 or not re.fullmatch(r"[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)*", username):
+                raise ValueError("请填写实际提交的 GitHub 用户名，最多 39 位，可使用英文字母、数字和单个连字符。")
+        if step == "region":
+            if value not in ("confirmed", "not_required"):
+                raise ValueError("请选择已确认实际地区，或页面无需确认。")
+            region = value
+        following = STEPS.index(step) + 1
+        finished = following == len(STEPS)
+
+        with closing(self._connect()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cur_task = self._assert_fresh_revision(conn, task_id, revision)
             saved_cred = None
-            if task["credential_json"]:
+            if cur_task["credential_json"]:
                 try:
-                    parsed = json.loads(task["credential_json"])
+                    parsed = json.loads(cur_task["credential_json"])
                     if isinstance(parsed, dict) and parsed.get("accessToken"):
                         saved_cred = parsed
                 except Exception:
                     saved_cred = None
 
-            other_active = [t for t in round_active if t["id"] != task_id]
+            cur_round = self._current_round_tasks(conn)
+            other_active = [t for t in cur_round if t["id"] != task_id]
             round_completed = False
             round_transitioned = False
             next_node_label = ""
             if finished:
-                saved_cred = self._capture_and_persist_credential(conn, task, account, now)
+                saved_cred = self._capture_and_persist_credential(conn, cur_task, account, now)
                 if not other_active:
                     round_completed = True
                     round_transitioned, next_node_label = self._finish_round_browsers(
-                        conn, task["batch"], task["round_no"]
+                        conn, cur_task["batch"], cur_task["round_no"]
                     )
 
-            final_cred_json = json.dumps(saved_cred, ensure_ascii=False) if saved_cred else task["credential_json"]
-            conn.execute("""UPDATE tasks SET step=?, status=?, revision=revision+1,
-                username=?, region=?, credential_json=?, updated_at=? WHERE id=?""", (
-                step if finished else STEPS[following], "done" if finished else "ready",
-                username, region, final_cred_json, now, task_id,
-            ))
-            if not finished:
-                self._sync_account_step(
-                    task["account_id"],
-                    STEPS[following],
-                    username=username,
-                    proxy_url=task["proxy_url"],
-                    proxy_node=task["proxy_node"],
+            final_cred_json = json.dumps(saved_cred, ensure_ascii=False) if saved_cred else cur_task["credential_json"]
+            conn.execute(
+                "UPDATE tasks SET step=?, status=?, revision=revision+1, username=?, region=?, credential_json=?, updated_at=? WHERE id=?",
+                (
+                    step if finished else STEPS[following],
+                    "done" if finished else "ready",
+                    username,
+                    region,
+                    final_cred_json,
+                    now,
+                    task_id,
+                ),
+            )
+            if finished and cur_task["proxy_node"]:
+                conn.execute(
+                    "UPDATE node_registrations SET status='done' WHERE node_name=? AND email=?",
+                    (cur_task["proxy_node"], cur_task["email"]),
                 )
-            if finished:
-                if task["proxy_node"]:
-                    conn.execute(
-                        "UPDATE node_registrations SET status='done' WHERE node_name=? AND email=?",
-                        (task["proxy_node"], task["email"]),
-                    )
-                if hasattr(self.accounts, "mark_workbuddy_registered"):
-                    self.accounts.mark_workbuddy_registered(
-                        task["account_id"],
-                        username=username,
-                        region=region,
-                        credential=saved_cred,
-                        proxy_url=task["proxy_url"],
-                        proxy_node=task["proxy_node"],
-                    )
-                if not round_completed:
-                    return {
-                        "round_completed": False,
-                        "round_transitioned": False,
-                        "message": "当前账号已完成并保存凭据！请继续完成本轮第 2 个指纹浏览器注册，全部完成后将统一关闭双浏览器、清理缓存并切换下一节点。",
-                    }
-                if round_transitioned:
-                    return {
-                        "round_completed": True,
-                        "round_transitioned": True,
-                        "message": f"本轮已全部完成！已关闭两个指纹浏览器、清理缓存并切换节点{('至 ' + next_node_label) if next_node_label else ''}，正在开启新一轮两个账号注册…",
-                    }
-                return {
-                    "round_completed": True,
-                    "round_transitioned": False,
-                    "message": "本轮及全部批次账号已注册完成！已关闭全部指纹浏览器并清理缓存。",
-                }
 
-    def close(self):
+        if not finished:
+            self._sync_account_step(
+                task["account_id"],
+                STEPS[following],
+                username=username,
+                proxy_url=task["proxy_url"],
+                proxy_node=task["proxy_node"],
+            )
+            return
+
+        if hasattr(self.accounts, "mark_workbuddy_registered"):
+            self.accounts.mark_workbuddy_registered(
+                task["account_id"],
+                username=username,
+                region=region,
+                credential=saved_cred,
+                proxy_url=task["proxy_url"],
+                proxy_node=task["proxy_node"],
+            )
+        if not round_completed:
+            return {
+                "round_completed": False,
+                "round_transitioned": False,
+                "message": "当前账号已完成并保存凭据！请继续完成本轮第 2 个指纹浏览器注册，全部完成后将统一关闭双浏览器、清理缓存并切换下一节点。",
+            }
+        if round_transitioned:
+            return {
+                "round_completed": True,
+                "round_transitioned": True,
+                "message": f"本轮已全部完成！已关闭两个指纹浏览器、清理缓存并切换节点{('至 ' + next_node_label) if next_node_label else ''}，正在开启新一轮两个账号注册…",
+            }
+        return {
+            "round_completed": True,
+            "round_transitioned": False,
+            "message": "本轮及全部批次账号已注册完成！已关闭全部指纹浏览器并清理缓存。",
+        }
+
+    def close(self, timeout: float = 5.0):
         try:
-            self.worker.submit(self.browser.close).result()
+            self.worker.submit(self.browser.close).result(timeout=max(0.5, float(timeout)))
+        except Exception:
+            try:
+                self.browser.close()
+            except Exception:
+                pass
         finally:
-            self.worker.shutdown()
+            try:
+                self.worker.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                self.worker.shutdown(wait=False)
 
 
 WorkBuddyService = WorkBuddyQueue

@@ -1450,5 +1450,40 @@ def test_auto_step_region_proactively_captures_credential_on_real_browser(api):
     assert dom_final["custom_fields"]["wb_credential"] == captured_cred
 
 
+def test_explicit_proxy_url_without_nodes_and_concurrent_unlock_during_action(api):
+    import concurrent.futures
+    import threading
+    import time
+
+    dom_acc = api.db.add_account({"account_type": "域名邮箱", "account": "px_only@ggb6.com", "password": "pw"})
+    # Ensure no subscription nodes exist so _allocate_round enters explicit_proxy_url branch
+    api._workbuddy.discover_nodes_fn = lambda account_type="": {"nodes": [], "ports": []}
+    started = api.start_workbuddy_queue([dom_acc["id"]], proxy_url="http://127.0.0.1:7897", proxy_node="")
+    assert started["ok"] is True
+    cur = started["queue"]["current"]
+    assert cur["proxy_url"] == "http://127.0.0.1:7897"
+    assert cur["proxy_node"] == "代理端口(http://127.0.0.1:7897)"
+
+    # While _action check_paused runs slow browser check, set_node_unlock must succeed immediately
+    api.workbuddy_action(cur["id"], cur["revision"], "pause")
+    cur = api.get_workbuddy_queue()["current"]
+    gate = threading.Event()
+    entered = threading.Event()
+
+    def slow_check(_t):
+        entered.set()
+        gate.wait(timeout=3.0)
+        return "pending"
+
+    api._workbuddy.browser.check_paused_challenge_state = slow_check
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        act_fut = pool.submit(api.workbuddy_action, cur["id"], cur["revision"], "check_paused")
+        assert entered.wait(timeout=2.0) is True
+        unlock_res = api._workbuddy.set_node_unlock("Node-X", True, "http://127.0.0.1:7897")
+        assert unlock_res["ok"] is True
+        gate.set()
+        assert act_fut.result(timeout=3.0)["still_paused"] is True
+
+
 
 

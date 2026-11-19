@@ -13,6 +13,15 @@ $csc = @(
 ) | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $csc) { throw "csc.exe (.NET Framework 4.x) not found." }
 
-& $csc /nologo /utf8output /codepage:65001 /target:winexe /out:"$out" /win32icon:"$icon" /r:System.Windows.Forms.dll "$src"
+if (-not (Test-Path $src)) { throw "Source file not found: $src" }
+
+$iconArgs = @()
+if (Test-Path $icon) {
+    $iconArgs = @("/win32icon:`"$icon`"")
+} else {
+    Write-Warning "Icon not found at $icon, building without custom Win32 icon."
+}
+
+& $csc /nologo /utf8output /codepage:65001 /target:winexe /out:"$out" @iconArgs /r:System.Windows.Forms.dll "$src"
 if ($LASTEXITCODE -ne 0) { throw "Build failed." }
 Write-Host "Built $out"

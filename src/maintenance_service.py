@@ -1,6 +1,7 @@
 import base64
 from datetime import datetime, timezone
 import hashlib
+import html
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import os
@@ -137,24 +138,28 @@ def parse_proxy_spec(raw_proxy: str) -> dict:
 
     if "://" in raw:
         parsed = urllib.parse.urlparse(raw)
+        try:
+            parsed_port = parsed.port
+        except ValueError:
+            parsed_port = None
         return {
             "raw": raw,
             "scheme": (parsed.scheme or "http").lower(),
             "host": parsed.hostname or "",
-            "port": int(parsed.port or (1080 if "socks" in (parsed.scheme or "").lower() else 8080)),
+            "port": int(parsed_port or (1080 if "socks" in (parsed.scheme or "").lower() else 8080)),
             "user": urllib.parse.unquote(parsed.username or ""),
             "password": urllib.parse.unquote(parsed.password or ""),
         }
 
     parts = raw.split(":")
-    if len(parts) == 4 and parts[1].isdigit():
+    if len(parts) >= 4 and parts[1].isdigit():
         return {
             "raw": raw,
             "scheme": "http",
             "host": parts[0].strip(),
             "port": int(parts[1]),
             "user": parts[2].strip(),
-            "password": parts[3].strip(),
+            "password": ":".join(parts[3:]).strip(),
         }
     if len(parts) == 2 and parts[1].isdigit():
         return {
@@ -192,6 +197,17 @@ class LocalAuthHttpProxyRelay:
     def local_url(self) -> str:
         return f"http://127.0.0.1:{self.local_port}"
 
+    @property
+    def is_alive(self) -> bool:
+        try:
+            return (
+                not self._stop_event.is_set()
+                and self._thread.is_alive()
+                and self._sock.fileno() != -1
+            )
+        except Exception:
+            return False
+
     def _serve_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
@@ -224,13 +240,16 @@ class LocalAuthHttpProxyRelay:
                 return
 
             req_line = lines[0].decode("latin-1", errors="replace")
+            is_connect = req_line.upper().startswith("CONNECT ")
             has_proxy_auth = any(ln.lower().startswith(b"proxy-authorization:") for ln in lines[1:])
             filtered_lines = [lines[0]]
             for ln in lines[1:]:
-                if ln.lower().startswith(b"proxy-connection:"):
-                    filtered_lines.append(b"Connection: keep-alive")
-                else:
-                    filtered_lines.append(ln)
+                low_ln = ln.lower()
+                if low_ln.startswith(b"proxy-connection:") or (not is_connect and low_ln.startswith(b"connection:")):
+                    continue
+                filtered_lines.append(ln)
+            if not is_connect:
+                filtered_lines.append(b"Connection: close")
             if not has_proxy_auth:
                 filtered_lines.append(f"Proxy-Authorization: {self.auth_header}".encode("latin-1"))
 
@@ -317,7 +336,12 @@ def resolve_proxy_for_chromium_and_urllib(raw_proxy: str) -> dict:
             key = (host, port, user, password)
             with _RELAY_LOCK:
                 relay = _ACTIVE_RELAYS.get(key)
-                if relay is None:
+                if relay is None or not relay.is_alive:
+                    if relay is not None:
+                        try:
+                            relay.close()
+                        except Exception:
+                            pass
                     relay = LocalAuthHttpProxyRelay(host, port, user, password)
                     _ACTIVE_RELAYS[key] = relay
             return {
@@ -351,6 +375,8 @@ def _build_urllib_opener(raw_proxy: str = "") -> urllib.request.OpenerDirector:
     resolved = resolve_proxy_for_chromium_and_urllib(raw_proxy)
     up = resolved["urllib_proxy"]
     if up:
+        if up.lower().startswith("socks"):
+            raise ValueError("urllib 暂不支持直连 SOCKS 代理，请配置 HTTP 代理端口或 Clash 混合端口。")
         return urllib.request.build_opener(urllib.request.ProxyHandler({"http": up, "https": up}))
     return urllib.request.build_opener()
 
@@ -363,7 +389,10 @@ def _http_json_request(
     proxy_url: str = "",
     timeout: float = 15.0,
 ) -> tuple[int, dict | str]:
-    opener = _build_urllib_opener(proxy_url)
+    try:
+        opener = _build_urllib_opener(proxy_url)
+    except ValueError as exc:
+        return 0, {"error": "unsupported_proxy_scheme", "error_description": str(exc)}
     req_headers = dict(headers or {})
     data_bytes = None
     if isinstance(payload, dict):
@@ -387,6 +416,93 @@ def _http_json_request(
             return exc.code, json.loads(raw_err)
         except Exception:
             return exc.code, raw_err
+    except (urllib.error.URLError, TimeoutError, socket.timeout, OSError, ValueError) as exc:
+        reason = getattr(exc, "reason", None)
+        msg = str(reason if reason is not None else exc)
+        return 0, {"error": "network_error", "error_description": msg}
+
+
+_IANA_STANDARD_OFFSET_HOURS: dict[str, float] = {
+    "America/Los_Angeles": -8.0,
+    "America/Vancouver": -8.0,
+    "America/Denver": -7.0,
+    "America/Chicago": -6.0,
+    "America/New_York": -5.0,
+    "America/Toronto": -5.0,
+    "America/Sao_Paulo": -3.0,
+    "Europe/London": 0.0,
+    "Europe/Berlin": 1.0,
+    "Europe/Paris": 1.0,
+    "Europe/Amsterdam": 1.0,
+    "Europe/Istanbul": 3.0,
+    "Europe/Moscow": 3.0,
+    "Asia/Kolkata": 5.5,
+    "Asia/Bangkok": 7.0,
+    "Asia/Ho_Chi_Minh": 7.0,
+    "Asia/Jakarta": 7.0,
+    "Asia/Singapore": 8.0,
+    "Asia/Kuala_Lumpur": 8.0,
+    "Asia/Manila": 8.0,
+    "Asia/Hong_Kong": 8.0,
+    "Asia/Taipei": 8.0,
+    "Asia/Shanghai": 8.0,
+    "Asia/Seoul": 9.0,
+    "Asia/Tokyo": 9.0,
+    "Australia/Sydney": 10.0,
+}
+
+
+def resolve_iana_utc_offset_hours(iana_tz: str, fallback_seconds: int | None = None) -> float | None:
+    """Resolve current UTC offset in hours for an IANA timezone without requiring ``tzdata``."""
+    if fallback_seconds is not None:
+        try:
+            return round(float(fallback_seconds) / 3600.0, 2)
+        except (TypeError, ValueError):
+            pass
+    tz_name = (iana_tz or "").strip()
+    if not tz_name:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+
+        offset = datetime.now(ZoneInfo(tz_name)).utcoffset()
+        if offset is not None:
+            return round(offset.total_seconds() / 3600.0, 2)
+    except Exception:
+        pass
+    try:
+        import clr  # type: ignore
+
+        from System import DateTime, TimeZoneInfo  # type: ignore
+
+        tzi = TimeZoneInfo.FindSystemTimeZoneById(tz_name)
+        return round(float(tzi.GetUtcOffset(DateTime.UtcNow).TotalHours), 2)
+    except Exception:
+        pass
+    if tz_name in _IANA_STANDARD_OFFSET_HOURS:
+        return _IANA_STANDARD_OFFSET_HOURS[tz_name]
+    return None
+
+
+def compare_host_timezone(iana_tz: str, exit_offset_seconds: int | None = None) -> dict:
+    """Compare proxy exit timezone against the local host Windows/OS timezone."""
+    local_offset = datetime.now().astimezone().utcoffset()
+    host_hours = round(local_offset.total_seconds() / 3600.0, 2) if local_offset else 0.0
+    proxy_hours = resolve_iana_utc_offset_hours(iana_tz, exit_offset_seconds)
+    if proxy_hours is None:
+        return {
+            "host_offset_hours": host_hours,
+            "proxy_offset_hours": None,
+            "diff_hours": 0.0,
+            "mismatch": False,
+        }
+    diff = abs(proxy_hours - host_hours)
+    return {
+        "host_offset_hours": host_hours,
+        "proxy_offset_hours": proxy_hours,
+        "diff_hours": round(diff, 2),
+        "mismatch": diff >= 1.0,
+    }
 
 
 def probe_proxy_geo(proxy_url: str = "", timeout: float = 8.0) -> dict:
@@ -407,14 +523,19 @@ def probe_proxy_geo(proxy_url: str = "", timeout: float = 8.0) -> dict:
                 continue
             cc = str(data.get("country_code") or data.get("country") or "").upper()
             tz = ""
+            tz_offset_secs = None
             if isinstance(data.get("timezone"), dict):
                 tz = str(data["timezone"].get("id") or "")
+                raw_off = data["timezone"].get("offset")
+                if isinstance(raw_off, (int, float)):
+                    tz_offset_secs = int(raw_off)
             else:
                 tz = str(data.get("timezone") or "")
             defaults = COUNTRY_TIMEZONE_DEFAULTS.get(cc, ("", "en-US", "en-US,en;q=0.9"))
             if not tz:
                 tz = defaults[0]
             supported = cc not in UNSUPPORTED_ANTIGRAVITY_REGIONS if cc else True
+            tz_cmp = compare_host_timezone(tz, tz_offset_secs)
             return {
                 "ok": True,
                 "ip": str(data.get("ip") or ""),
@@ -425,6 +546,9 @@ def probe_proxy_geo(proxy_url: str = "", timeout: float = 8.0) -> dict:
                 "locale": defaults[1],
                 "accept_languages": defaults[2],
                 "antigravity_supported": supported,
+                "host_offset_hours": tz_cmp["host_offset_hours"],
+                "proxy_offset_hours": tz_cmp["proxy_offset_hours"],
+                "tz_mismatch": tz_cmp["mismatch"],
                 "warning": (
                     f"出口区域 {cc} 不支持 Antigravity / 部分 Google AI 服务，请切换节点！"
                     if not supported
@@ -483,14 +607,33 @@ def inspect_rt_json(raw_text: str) -> dict:
     if not isinstance(parsed, dict):
         return {"ok": False, "error": "RT 凭据需为 JSON 对象、数组或 1// 开头的 Refresh Token"}
 
-    rt = str(parsed.get("refresh_token") or parsed.get("refreshToken") or "").strip()
+    rt = str(
+        parsed.get("refresh_token")
+        or parsed.get("refreshToken")
+        or parsed.get("rt")
+        or ""
+    ).strip()
     at = str(parsed.get("access_token") or parsed.get("accessToken") or "").strip()
     if not rt and not at:
         return {"ok": False, "error": "JSON 中缺少 refresh_token"}
 
+    raw_cid = str(parsed.get("client_id") or parsed.get("clientId") or "").strip()
+    has_explicit_cid = bool(raw_cid)
+    eff_cid = raw_cid if has_explicit_cid else ANTIGRAVITY_CLIENT_ID
+    raw_csec = str(parsed.get("client_secret") or parsed.get("clientSecret") or "").strip()
+    if raw_csec:
+        eff_csec = raw_csec
+    elif eff_cid.lower() == ANTIGRAVITY_CLIENT_ID.lower():
+        eff_csec = ANTIGRAVITY_CLIENT_SECRET
+    else:
+        eff_csec = ""
+
     normalized = dict(parsed)
-    normalized.setdefault("client_id", ANTIGRAVITY_CLIENT_ID)
-    normalized.setdefault("client_secret", ANTIGRAVITY_CLIENT_SECRET)
+    normalized["client_id"] = eff_cid
+    if eff_csec:
+        normalized["client_secret"] = eff_csec
+    elif "client_secret" not in normalized and "clientSecret" not in normalized and not has_explicit_cid:
+        normalized["client_secret"] = ANTIGRAVITY_CLIENT_SECRET
     normalized["refresh_token"] = rt
     if at:
         normalized["access_token"] = at
@@ -503,9 +646,14 @@ def inspect_rt_json(raw_text: str) -> dict:
         "access_token": at,
         "has_access_token": bool(at),
         "email": str(parsed.get("email") or ""),
-        "project_id": str(parsed.get("project_id") or parsed.get("cloudaicompanionProject") or ""),
-        "client_id": str(normalized.get("client_id") or ANTIGRAVITY_CLIENT_ID),
-        "client_secret": str(normalized.get("client_secret") or ANTIGRAVITY_CLIENT_SECRET),
+        "project_id": str(
+            parsed.get("project_id")
+            or parsed.get("projectId")
+            or parsed.get("cloudaicompanionProject")
+            or ""
+        ),
+        "client_id": eff_cid,
+        "client_secret": eff_csec,
         "normalized_json": json.dumps(normalized, ensure_ascii=False),
     }
 
@@ -539,15 +687,274 @@ def _map_tier_to_plan(tier_id: str) -> tuple[str, str]:
     return "Free", "无"
 
 
+def _extract_gcp_error_info(resp_obj) -> tuple[str, str, str]:
+    raw_dump = json.dumps(resp_obj, ensure_ascii=False) if isinstance(resp_obj, (dict, list)) else str(resp_obj or "")
+    reason_tag = ""
+    err_msg = ""
+    root = resp_obj[0] if isinstance(resp_obj, list) and resp_obj else resp_obj
+    if isinstance(root, dict):
+        err_obj = root.get("error") if isinstance(root.get("error"), dict) else root
+        if isinstance(err_obj, dict):
+            err_msg = str(err_obj.get("message") or err_obj.get("error_description") or "")
+            reason_tag = str(err_obj.get("status") or err_obj.get("error") or "")
+            details = err_obj.get("details")
+            if isinstance(details, list):
+                for d in details:
+                    if isinstance(d, dict) and d.get("reason"):
+                        reason_tag = str(d["reason"])
+                        break
+    return reason_tag, err_msg, raw_dump
+
+
+def _is_unsupported_location_text(text: str) -> bool:
+    low = (text or "").lower()
+    return (
+        "unsupported_location" in low
+        or "not available in your country" in low
+        or "restricted_region" in low
+    )
+
+
+def _classify_antigravity_response(
+    status_code: int,
+    resp_obj,
+    *,
+    checked_at: str,
+    access_token: str,
+    expiry_ts: int,
+    prev_rt_status: str = "active",
+    prev_gcp_status: str = "none",
+) -> dict:
+    reason_tag, err_msg, raw_dump = _extract_gcp_error_info(resp_obj)
+    val_url = _find_first_key_recursive(resp_obj, ("validationUrl", "validation_url", "appealUrl"))
+    combined = f"{reason_tag} {err_msg} {raw_dump}"
+
+    if status_code == 0:
+        return {
+            "done": True,
+            "ok": False,
+            "transient": True,
+            "rt_status": prev_rt_status if prev_rt_status not in ("", "none") else "active",
+            "gcp_status": prev_gcp_status or "none",
+            "error": f"网络或代理连接失败: {err_msg or raw_dump}".strip(),
+            "checked_at": checked_at,
+        }
+
+    if status_code == 429:
+        return {
+            "done": True,
+            "ok": True,
+            "rt_status": "active",
+            "gcp_status": "active",
+            "subscription_plan": "Free",
+            "antigravity_tier": "无",
+            "project_id": "",
+            "tier_id": "free-tier",
+            "models_count": 0,
+            "sample_models": [],
+            "validation_url": "",
+            "access_token": access_token,
+            "expiry_timestamp": expiry_ts,
+            "checked_at": checked_at,
+            "error": "反重力 RT 有效 (当前请求 429 额度冷却中)",
+        }
+
+    if status_code == 401:
+        return {
+            "done": True,
+            "ok": False,
+            "rt_status": "invalid_grant",
+            "gcp_status": "none",
+            "error": "Access Token 未授权或已失效 (401)",
+            "checked_at": checked_at,
+        }
+
+    if _is_unsupported_location_text(combined):
+        return {
+            "done": True,
+            "ok": False,
+            "rt_status": "unsupported",
+            "gcp_status": "unsupported",
+            "error": f"检测到 UNSUPPORTED_LOCATION（{reason_tag or '地区不受支持'}，请切换支持节点）",
+            "checked_at": checked_at,
+            "access_token": access_token,
+            "expiry_timestamp": expiry_ts,
+        }
+
+    if "VALIDATION_REQUIRED" in raw_dump or "verify your account" in combined.lower() or val_url:
+        return {
+            "done": True,
+            "ok": False,
+            "rt_status": "active",
+            "gcp_status": "validation",
+            "validation_url": val_url,
+            "error": "需要完成验证 (VALIDATION_REQUIRED)，请打开验证链接完成人机/账号验证",
+            "checked_at": checked_at,
+            "access_token": access_token,
+            "expiry_timestamp": expiry_ts,
+        }
+
+    if re.search(r"invalid_grant|token_has_been_expired|token\s+expired|access_token_expired|unauthenticated|reauth", combined, re.I):
+        return {
+            "done": True,
+            "ok": False,
+            "rt_status": "invalid_grant",
+            "gcp_status": "none",
+            "error": f"RT/Token 已失效 ({status_code})",
+            "checked_at": checked_at,
+        }
+
+    if "TOS_VIOLATION" in raw_dump or (status_code == 403 and re.search(r"violat|terms\s+of\s+service|tos", combined, re.I)):
+        return {
+            "done": True,
+            "ok": False,
+            "rt_status": "suspended",
+            "gcp_status": "suspended",
+            "validation_url": val_url,
+            "error": f"检测到 TOS_VIOLATION（账号或 GCP 服务已被风控封禁 · {reason_tag or 403}）",
+            "checked_at": checked_at,
+            "access_token": access_token,
+            "expiry_timestamp": expiry_ts,
+        }
+
+    if status_code == 403:
+        detail = f" · {reason_tag}" if reason_tag else ""
+        msg = f" ({err_msg})" if err_msg else ""
+        return {
+            "done": True,
+            "needs_validation_probe": not bool(val_url),
+            "ok": False,
+            "rt_status": "suspended",
+            "gcp_status": "suspended",
+            "validation_url": "",
+            "error": f"反重力返回 403 (GCP被封或服务受限{detail}){msg}",
+            "checked_at": checked_at,
+            "access_token": access_token,
+            "expiry_timestamp": expiry_ts,
+        }
+
+    if status_code == 400:
+        return {
+            "done": True,
+            "ok": False,
+            "transient": True,
+            "rt_status": prev_rt_status if prev_rt_status not in ("", "none") else "active",
+            "gcp_status": prev_gcp_status or "none",
+            "error": f"反重力接口返回 HTTP 400 ({err_msg or reason_tag or 'Bad Request'})",
+            "checked_at": checked_at,
+            "access_token": access_token,
+            "expiry_timestamp": expiry_ts,
+        }
+
+    if status_code >= 500:
+        return {
+            "done": True,
+            "ok": False,
+            "transient": True,
+            "rt_status": prev_rt_status if prev_rt_status not in ("", "none") else "active",
+            "gcp_status": prev_gcp_status or "none",
+            "error": f"Google Antigravity 服务端临时错误 ({status_code})",
+            "checked_at": checked_at,
+        }
+
+    # HTTP 200 inspection: guard against ineligible/suspended accounts returning 200 with empty tiers
+    project_id = ""
+    tier_id = ""
+    has_allowed_tiers = False
+    inelig_reasons: list[str] = []
+    if isinstance(resp_obj, dict):
+        proj_val = resp_obj.get("cloudaicompanionProject")
+        if isinstance(proj_val, dict):
+            project_id = str(proj_val.get("id") or "")
+        elif proj_val is not None:
+            project_id = str(proj_val or "")
+        paid = resp_obj.get("paidTier") or resp_obj.get("currentTier") or {}
+        if isinstance(paid, dict):
+            tier_id = str(paid.get("id") or paid.get("name") or "")
+        allowed = resp_obj.get("allowedTiers")
+        has_allowed_tiers = isinstance(allowed, list) and len(allowed) > 0
+        for inelig in (resp_obj.get("ineligibleTiers") or []):
+            if isinstance(inelig, dict):
+                rc = str(inelig.get("reasonCode") or inelig.get("reasonMessage") or "").strip()
+                if rc:
+                    inelig_reasons.append(rc)
+                    if _is_unsupported_location_text(rc):
+                        return {
+                            "done": True,
+                            "ok": False,
+                            "rt_status": "unsupported",
+                            "gcp_status": "unsupported",
+                            "error": f"反重力地区不支持 ({rc})",
+                            "checked_at": checked_at,
+                            "access_token": access_token,
+                            "expiry_timestamp": expiry_ts,
+                        }
+        if not project_id and not tier_id and not has_allowed_tiers and (inelig_reasons or "allowedTiers" in resp_obj or "ineligibleTiers" in resp_obj):
+            reason_note = inelig_reasons[0] if inelig_reasons else "无可用套餐/项目"
+            return {
+                "done": True,
+                "ok": False,
+                "rt_status": "suspended",
+                "gcp_status": "suspended",
+                "error": f"反重力/GCP 资格受限 ({reason_note})",
+                "checked_at": checked_at,
+                "access_token": access_token,
+                "expiry_timestamp": expiry_ts,
+            }
+
+    return {
+        "done": False,
+        "project_id": project_id,
+        "tier_id": tier_id,
+        "validation_url": val_url,
+    }
+
+
+def _probe_secondary_validation_url(
+    api_headers: dict,
+    meta_payload: dict,
+    project_id: str,
+    proxy_url: str,
+    timeout: float,
+) -> str:
+    stream_payload = {
+        "project": project_id or "aicode-consumers",
+        "model": "gemini-2.5-flash-lite",
+        "request": {"contents": [{"role": "user", "parts": [{"text": "1"}]}]},
+    }
+    _, s_resp = _http_json_request(
+        f"{ANTIGRAVITY_DAILY_BASE}:streamGenerateContent?alt=sse",
+        method="POST",
+        headers=api_headers,
+        payload=stream_payload,
+        proxy_url=proxy_url,
+        timeout=min(timeout, 10.0),
+    )
+    url = _find_first_key_recursive(s_resp, ("validationUrl", "validation_url", "appealUrl"))
+    if url:
+        return url
+    _, p_resp = _http_json_request(
+        f"{ANTIGRAVITY_FALLBACK_BASE}:loadCodeAssist",
+        method="POST",
+        headers=api_headers,
+        payload=meta_payload,
+        proxy_url=proxy_url,
+        timeout=min(timeout, 10.0),
+    )
+    return _find_first_key_recursive(p_resp, ("validationUrl", "validation_url", "appealUrl"))
+
+
 def probe_antigravity_rt(account: dict, proxy_url: str = "", timeout: float = 15.0) -> dict:
     """Run Antigravity 4-step RT diagnosis (token refresh -> loadCodeAssist -> onboardUser -> fetchAvailableModels)."""
     cf = account.get("custom_fields") or {}
+    prev_rt_status = str(cf.get("rt_status") or "none")
+    prev_gcp_status = str(cf.get("gcp_status") or "none")
     raw_rt = str(cf.get("rt_json") or cf.get("rt_refresh_token") or "").strip()
     if not raw_rt:
         return {
             "ok": False,
             "rt_status": "none",
-            "gcp_status": str(cf.get("gcp_status") or "none"),
+            "gcp_status": prev_gcp_status,
             "error": "账号尚未导入或授权 RT 凭据",
         }
 
@@ -556,23 +963,25 @@ def probe_antigravity_rt(account: dict, proxy_url: str = "", timeout: float = 15
         return {
             "ok": False,
             "rt_status": "invalid_grant",
-            "gcp_status": str(cf.get("gcp_status") or "none"),
+            "gcp_status": prev_gcp_status,
             "error": inspected.get("error") or "RT 凭据格式无效",
         }
 
     eff_proxy = proxy_url or str((account.get("fp_config") or {}).get("proxy") or "").strip()
     rt = inspected["refresh_token"]
     client_id = inspected["client_id"] or ANTIGRAVITY_CLIENT_ID
-    client_secret = inspected["client_secret"] or ANTIGRAVITY_CLIENT_SECRET
+    client_secret = inspected.get("client_secret") or ""
     checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # Step 0: Refresh access_token from Google OAuth2 token endpoint
-    form_body = urllib.parse.urlencode({
+    form_fields = {
         "client_id": client_id,
-        "client_secret": client_secret,
         "refresh_token": rt,
         "grant_type": "refresh_token",
-    }).encode("utf-8")
+    }
+    if client_secret:
+        form_fields["client_secret"] = client_secret
+    form_body = urllib.parse.urlencode(form_fields).encode("utf-8")
     tok_status, tok_resp = _http_json_request(
         "https://oauth2.googleapis.com/token",
         method="POST",
@@ -581,14 +990,24 @@ def probe_antigravity_rt(account: dict, proxy_url: str = "", timeout: float = 15
         proxy_url=eff_proxy,
         timeout=timeout,
     )
+    if tok_status == 0 or tok_status == 429 or tok_status >= 500:
+        err_desc = tok_resp.get("error_description") if isinstance(tok_resp, dict) else str(tok_resp)
+        return {
+            "ok": False,
+            "transient": True,
+            "rt_status": prev_rt_status if prev_rt_status not in ("", "none") else "active",
+            "gcp_status": prev_gcp_status,
+            "error": f"Token 刷新遇到临时网络/限流问题 ({tok_status}): {err_desc}".strip(),
+            "checked_at": checked_at,
+        }
     if tok_status >= 400 or not isinstance(tok_resp, dict) or not tok_resp.get("access_token"):
         err_code = tok_resp.get("error") if isinstance(tok_resp, dict) else ""
         err_desc = tok_resp.get("error_description") if isinstance(tok_resp, dict) else str(tok_resp)
-        rt_stat = "invalid_grant" if "invalid_grant" in str(err_code).lower() or tok_status in (400, 401) else "invalid_grant"
+        is_revoked = "invalid_grant" in f"{err_code} {err_desc}".lower() or tok_status in (400, 401)
         return {
             "ok": False,
-            "rt_status": rt_stat,
-            "gcp_status": str(cf.get("gcp_status") or "none"),
+            "rt_status": "invalid_grant" if is_revoked else prev_rt_status,
+            "gcp_status": prev_gcp_status,
             "error": f"Token 刷新失败 ({tok_status}): {err_code} {err_desc}".strip(),
             "checked_at": checked_at,
         }
@@ -629,51 +1048,28 @@ def probe_antigravity_rt(account: dict, proxy_url: str = "", timeout: float = 15
             timeout=timeout,
         )
 
-    raw_dump = json.dumps(load_resp, ensure_ascii=False) if isinstance(load_resp, dict) else str(load_resp)
-    val_url = _find_first_key_recursive(load_resp, ("validationUrl", "validation_url", "appealUrl"))
+    classified = _classify_antigravity_response(
+        load_status,
+        load_resp,
+        checked_at=checked_at,
+        access_token=access_token,
+        expiry_ts=expiry_ts,
+        prev_rt_status=prev_rt_status,
+        prev_gcp_status=prev_gcp_status,
+    )
+    if classified.get("done"):
+        if classified.pop("needs_validation_probe", False):
+            sec_url = _probe_secondary_validation_url(api_headers, meta_payload, "", eff_proxy, timeout)
+            if sec_url:
+                classified["rt_status"] = "active"
+                classified["gcp_status"] = "validation"
+                classified["validation_url"] = sec_url
+                classified["error"] = "需要完成验证 (VALIDATION_REQUIRED)，请打开验证链接完成人机/账号验证"
+        return classified
 
-    if "TOS_VIOLATION" in raw_dump or load_status == 403 and "violat" in raw_dump.lower():
-        return {
-            "ok": False,
-            "rt_status": "suspended",
-            "gcp_status": "suspended",
-            "validation_url": val_url,
-            "error": "检测到 TOS_VIOLATION（账号或 GCP 服务已被风控封禁，建议走申诉表单）",
-            "checked_at": checked_at,
-            "access_token": access_token,
-            "expiry_timestamp": expiry_ts,
-        }
-
-    if "UNSUPPORTED_LOCATION" in raw_dump or "not available in your country" in raw_dump.lower():
-        return {
-            "ok": False,
-            "rt_status": "unsupported",
-            "gcp_status": "unsupported",
-            "error": "检测到 UNSUPPORTED_LOCATION（代理地区或账号归属地不支持 Antigravity）",
-            "checked_at": checked_at,
-            "access_token": access_token,
-            "expiry_timestamp": expiry_ts,
-        }
-
-    if "VALIDATION_REQUIRED" in raw_dump or val_url:
-        return {
-            "ok": False,
-            "rt_status": "active",
-            "gcp_status": "validation",
-            "validation_url": val_url,
-            "error": "需要完成验证 (VALIDATION_REQUIRED)，请打开验证链接完成人机/账号验证",
-            "checked_at": checked_at,
-            "access_token": access_token,
-            "expiry_timestamp": expiry_ts,
-        }
-
-    project_id = ""
-    tier_id = ""
-    if isinstance(load_resp, dict):
-        project_id = str(load_resp.get("cloudaicompanionProject") or "")
-        paid = load_resp.get("paidTier") or load_resp.get("currentTier") or {}
-        if isinstance(paid, dict):
-            tier_id = str(paid.get("id") or paid.get("name") or "")
+    project_id = str(classified.get("project_id") or "")
+    tier_id = str(classified.get("tier_id") or "")
+    val_url = str(classified.get("validation_url") or "")
 
     # Step 2: onboardUser if needed
     if not project_id:
@@ -688,6 +1084,19 @@ def probe_antigravity_rt(account: dict, proxy_url: str = "", timeout: float = 15
             proxy_url=eff_proxy,
             timeout=timeout,
         )
+        if ob_status in (400, 401, 403):
+            ob_cls = _classify_antigravity_response(
+                ob_status,
+                ob_resp,
+                checked_at=checked_at,
+                access_token=access_token,
+                expiry_ts=expiry_ts,
+                prev_rt_status=prev_rt_status,
+                prev_gcp_status=prev_gcp_status,
+            )
+            if ob_cls.get("done"):
+                ob_cls.pop("needs_validation_probe", None)
+                return ob_cls
         if isinstance(ob_resp, dict):
             ob_dump = json.dumps(ob_resp, ensure_ascii=False)
             val_url = val_url or _find_first_key_recursive(ob_resp, ("validationUrl", "validation_url"))
@@ -709,6 +1118,18 @@ def probe_antigravity_rt(account: dict, proxy_url: str = "", timeout: float = 15
                     "gcp_status": "suspended",
                     "error": "onboardUser 返回 TOS_VIOLATION",
                     "checked_at": checked_at,
+                    "access_token": access_token,
+                    "expiry_timestamp": expiry_ts,
+                }
+            if _is_unsupported_location_text(ob_dump):
+                return {
+                    "ok": False,
+                    "rt_status": "unsupported",
+                    "gcp_status": "unsupported",
+                    "error": "onboardUser 返回 UNSUPPORTED_LOCATION",
+                    "checked_at": checked_at,
+                    "access_token": access_token,
+                    "expiry_timestamp": expiry_ts,
                 }
             resp_inner = ob_resp.get("response") if isinstance(ob_resp.get("response"), dict) else ob_resp
             proj_obj = resp_inner.get("cloudaicompanionProject")
@@ -728,12 +1149,52 @@ def probe_antigravity_rt(account: dict, proxy_url: str = "", timeout: float = 15
         proxy_url=eff_proxy,
         timeout=timeout,
     )
+    if m_status in (400, 401, 403):
+        m_cls = _classify_antigravity_response(
+            m_status,
+            m_resp,
+            checked_at=checked_at,
+            access_token=access_token,
+            expiry_ts=expiry_ts,
+            prev_rt_status=prev_rt_status,
+            prev_gcp_status=prev_gcp_status,
+        )
+        if m_cls.get("done"):
+            m_cls.pop("needs_validation_probe", None)
+            return m_cls
     if isinstance(m_resp, dict) and isinstance(m_resp.get("models"), dict):
         model_names = list(m_resp["models"].keys())
         models_count = len(model_names)
 
+    # Step 4 (best-effort): real inference check catches silent stream 403 TOS_VIOLATION / 400 region block
+    s_status, s_resp = _http_json_request(
+        f"{ANTIGRAVITY_DAILY_BASE}:streamGenerateContent?alt=sse",
+        method="POST",
+        headers=api_headers,
+        payload={
+            "project": project_id or "aicode-consumers",
+            "model": "gemini-2.5-flash-lite",
+            "request": {"contents": [{"role": "user", "parts": [{"text": "1"}]}]},
+        },
+        proxy_url=eff_proxy,
+        timeout=min(timeout, 10.0),
+    )
+    if s_status in (401, 403) or (s_status == 400 and _is_unsupported_location_text(str(s_resp))):
+        s_cls = _classify_antigravity_response(
+            s_status,
+            s_resp,
+            checked_at=checked_at,
+            access_token=access_token,
+            expiry_ts=expiry_ts,
+            prev_rt_status=prev_rt_status,
+            prev_gcp_status=prev_gcp_status,
+        )
+        if s_cls.get("done") and not s_cls.get("transient"):
+            s_cls.pop("needs_validation_probe", None)
+            return s_cls
+
     sub_plan, ag_tier = _map_tier_to_plan(tier_id)
-    gcp_stat = "active" if (project_id or models_count > 0) else ("no_billing" if load_status == 200 else "validation")
+    gcp_stat = "active" if (project_id or models_count > 0) else ("no_billing" if load_status == 200 else "suspended")
     return {
         "ok": load_status < 400 and (bool(project_id) or models_count > 0),
         "rt_status": "active",
@@ -759,8 +1220,13 @@ def _get_antigravity_app_dir() -> Path:
     return Path.home() / ".config" / "Antigravity"
 
 
-def inject_rt_to_antigravity_client(account: dict, clear_session_dirs: bool = True) -> dict:
-    """Inject the account's RT credential into local `%APPDATA%\\Antigravity\\oauth_credentials.json`."""
+def inject_rt_to_antigravity_client(
+    account: dict,
+    clear_session_dirs: bool = True,
+    proxy_url: str = "",
+    timeout: float = 20.0,
+) -> dict:
+    """Exchange RT for a fresh access_token and inject into `%APPDATA%\\Antigravity\\oauth_credentials.json`."""
     cf = account.get("custom_fields") or {}
     raw_rt = str(cf.get("rt_json") or cf.get("rt_refresh_token") or "").strip()
     if not raw_rt:
@@ -770,13 +1236,53 @@ def inject_rt_to_antigravity_client(account: dict, clear_session_dirs: bool = Tr
     if not inspected.get("ok") or inspected.get("is_array"):
         return {"ok": False, "error": inspected.get("error") or "RT 格式无效"}
 
-    rt = inspected["refresh_token"]
-    access_token = str(cf.get("rt_access_token") or inspected.get("access_token") or "").strip()
-    expiry_ts = int(cf.get("rt_expiry") or (int(time.time()) + 3500))
-    email = str(account.get("account") or cf.get("rt_email") or inspected.get("email") or "").strip()
-
     ag_dir = _get_antigravity_app_dir()
-    ag_dir.mkdir(parents=True, exist_ok=True)
+    if not ag_dir.is_dir():
+        return {
+            "ok": False,
+            "error": "未找到反重力数据目录 (%APPDATA%\\Antigravity)，请确认已安装并至少运行过一次。",
+        }
+
+    rt = inspected["refresh_token"]
+    client_id = inspected["client_id"] or ANTIGRAVITY_CLIENT_ID
+    client_secret = inspected.get("client_secret") or ""
+    eff_proxy = proxy_url or str((account.get("fp_config") or {}).get("proxy") or "").strip()
+
+    form_fields = {
+        "client_id": client_id,
+        "refresh_token": rt,
+        "grant_type": "refresh_token",
+    }
+    if client_secret:
+        form_fields["client_secret"] = client_secret
+    form_body = urllib.parse.urlencode(form_fields).encode("utf-8")
+
+    tok_status, tok_resp = _http_json_request(
+        "https://oauth2.googleapis.com/token",
+        method="POST",
+        headers={"User-Agent": ANTIGRAVITY_USER_AGENT, "Content-Type": "application/x-www-form-urlencoded"},
+        payload=form_body,
+        proxy_url=eff_proxy,
+        timeout=timeout,
+    )
+    if tok_status == 0:
+        err_desc = tok_resp.get("error_description") if isinstance(tok_resp, dict) else str(tok_resp)
+        return {"ok": False, "error": f"网络请求失败 (代理可能不通): {err_desc}".strip()}
+    if tok_status >= 400 or not isinstance(tok_resp, dict) or not tok_resp.get("access_token"):
+        err_code = tok_resp.get("error") if isinstance(tok_resp, dict) else ""
+        err_desc = tok_resp.get("error_description") if isinstance(tok_resp, dict) else str(tok_resp)
+        if "invalid_grant" in f"{err_code} {err_desc}".lower():
+            return {"ok": False, "error": "RT 已失效 (invalid_grant)，需要重新通过 📱OAuth扫码授权 获取新 RT。"}
+        return {"ok": False, "error": f"换取 access_token 失败 ({tok_status}): {err_code} {err_desc}".strip()}
+
+    access_token = str(tok_resp["access_token"]).strip()
+    id_token = str(tok_resp.get("id_token") or "").strip()
+    expires_in = int(tok_resp.get("expires_in") or 3600)
+    expiry_ts = int(time.time()) + expires_in
+    email = str(account.get("account") or cf.get("rt_email") or inspected.get("email") or "").strip()
+    claims = inspect_jwt_claims(id_token) if id_token else None
+    display_name = str((claims or {}).get("name") or (email.split("@")[0] if "@" in email else email))
+
     cred_file = ag_dir / "oauth_credentials.json"
     if cred_file.exists():
         try:
@@ -797,17 +1303,20 @@ def inject_rt_to_antigravity_client(account: dict, clear_session_dirs: bool = Tr
         "access_token": access_token,
         "refresh_token": rt,
         "email": email,
-        "name": email.split("@")[0] if "@" in email else email,
+        "name": display_name,
         "expiry_timestamp": expiry_ts,
         "expiry_date": expiry_ts * 1000,
         "token_type": "Bearer",
         "antigravity_cockpit_active_email": email,
     }
+    if id_token:
+        payload["id_token"] = id_token
     cred_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return {
         "ok": True,
         "path": str(cred_file),
         "email": email,
+        "expiry_timestamp": expiry_ts,
     }
 
 
@@ -821,10 +1330,18 @@ def _generate_pkce_pair() -> tuple[str, str]:
 class OAuthLoopbackManager:
     """Thread-safe local Loopback OAuth 2.0 + PKCE manager for Google / Antigravity RT capture."""
 
+    _SESSION_RETENTION_SECONDS = 900.0
+
     def __init__(self, on_success_callback=None):
         self._lock = threading.Lock()
         self._sessions: dict[str, dict] = {}
         self._on_success_callback = on_success_callback
+
+    def _prune_stale_sessions_locked(self, now: float | None = None) -> None:
+        cutoff = (now or time.time()) - self._SESSION_RETENTION_SECONDS
+        for sid, sess in list(self._sessions.items()):
+            if sess.get("status") != "pending" and float(sess.get("created_at") or 0.0) < cutoff:
+                self._sessions.pop(sid, None)
 
     def start_session(
         self,
@@ -832,7 +1349,27 @@ class OAuthLoopbackManager:
         login_hint: str = "",
         proxy_url: str = "",
         scopes: str = "",
+        hl: str = "zh-CN",
+        preempt: bool = True,
+        is_profile_alive=None,
     ) -> dict:
+        if preempt:
+            with self._lock:
+                pending_sids = [
+                    sid for sid, s in self._sessions.items() if s.get("status") == "pending"
+                ]
+            for old_sid in pending_sids:
+                self.cancel_session(old_sid, reason="已切换新的 OAuth 授权请求，上一等待已自动中止。")
+        else:
+            with self._lock:
+                same_sids = [
+                    sid
+                    for sid, s in self._sessions.items()
+                    if s.get("status") == "pending" and int(s.get("account_id") or 0) == int(account_id)
+                ]
+            for old_sid in same_sids:
+                self.cancel_session(old_sid, reason="已重新发起当前账号的 OAuth 授权请求。")
+
         session_id = secrets.token_hex(8)
         state = secrets.token_urlsafe(24)
         verifier, challenge = _generate_pkce_pair()
@@ -876,15 +1413,17 @@ class OAuthLoopbackManager:
                 ).start()
 
             def _send_html(self, status_code: int, title: str, message: str):
+                safe_title = html.escape(str(title or ""), quote=True)
+                safe_message = html.escape(str(message or ""), quote=True)
                 html_doc = (
                     "<!doctype html><html><head><meta charset='utf-8'>"
-                    f"<title>{title}</title>"
+                    f"<title>{safe_title}</title>"
                     "<style>body{font-family:system-ui,sans-serif;background:#0b1120;color:#e2e8f0;"
                     "display:flex;align-items:center;justify-content:center;height:100vh;margin:0}"
                     ".box{background:#111827;border:1px solid #334155;border-radius:14px;padding:28px 34px;"
                     "max-width:480px;text-align:center;box-shadow:0 16px 40px rgba(0,0,0,.45)}"
                     "h2{margin:0 0 10px;color:#38bdf8}p{margin:0;line-height:1.6;color:#cbd5e1}</style></head>"
-                    f"<body><div class='box'><h2>{title}</h2><p>{message}</p></div></body></html>"
+                    f"<body><div class='box'><h2>{safe_title}</h2><p>{safe_message}</p></div></body></html>"
                 )
                 body = html_doc.encode("utf-8")
                 self.send_response(status_code)
@@ -905,6 +1444,7 @@ class OAuthLoopbackManager:
             "scope": eff_scopes,
             "access_type": "offline",
             "prompt": "consent",
+            "hl": (hl or "zh-CN").strip() or "zh-CN",
             "state": state,
             "code_challenge": challenge,
             "code_challenge_method": "S256",
@@ -918,6 +1458,7 @@ class OAuthLoopbackManager:
             "session_id": session_id,
             "account_id": int(account_id),
             "status": "pending",
+            "exchanging": False,
             "auth_url": auth_url,
             "redirect_uri": redirect_uri,
             "code_verifier": verifier,
@@ -931,6 +1472,7 @@ class OAuthLoopbackManager:
             "created_at": time.time(),
         }
         with self._lock:
+            self._prune_stale_sessions_locked()
             self._sessions[session_id] = sess
 
         def serve_until_done():
@@ -946,11 +1488,56 @@ class OAuthLoopbackManager:
                 pass
             with self._lock:
                 cur = self._sessions.get(session_id)
-                if cur and cur["status"] == "pending":
+                if cur and cur["status"] == "pending" and not cur.get("exchanging"):
                     cur["status"] = "expired"
                     cur["error"] = "OAuth 授权等待超时（5分钟）"
+                    cur["stop_event"].set()
 
-        threading.Thread(target=serve_until_done, daemon=True).start()
+        def watch_browser_closed():
+            if not callable(is_profile_alive):
+                return
+            if stop_event.wait(3.5):
+                return
+            seen_alive = False
+            # Confirm lockfile was observed before assuming browser close means exit
+            for _ in range(10):
+                if stop_event.is_set():
+                    return
+                try:
+                    if is_profile_alive():
+                        seen_alive = True
+                        break
+                except Exception:
+                    return
+                if stop_event.wait(0.5):
+                    return
+            if not seen_alive:
+                return
+            while not stop_event.is_set():
+                try:
+                    alive = bool(is_profile_alive())
+                except Exception:
+                    return
+                if not alive:
+                    if stop_event.wait(1.5):
+                        return
+                    try:
+                        still_dead = not bool(is_profile_alive())
+                    except Exception:
+                        return
+                    if still_dead:
+                        with self._lock:
+                            cur = self._sessions.get(session_id)
+                            if not cur or cur.get("status") != "pending" or cur.get("exchanging"):
+                                return
+                        self.cancel_session(session_id, reason="检测到独立浏览器窗口已关闭，已自动结束 OAuth 授权等待。")
+                        return
+                if stop_event.wait(1.0):
+                    return
+
+        threading.Thread(target=serve_until_done, name=f"kv-oauth-srv-{session_id[:6]}", daemon=True).start()
+        if callable(is_profile_alive):
+            threading.Thread(target=watch_browser_closed, name=f"kv-oauth-watch-{session_id[:6]}", daemon=True).start()
         return {
             "ok": True,
             "session_id": session_id,
@@ -963,12 +1550,12 @@ class OAuthLoopbackManager:
     def _exchange_code(self, session_id: str, code: str) -> None:
         with self._lock:
             sess = self._sessions.get(session_id)
-            if not sess:
+            if not sess or sess.get("status") != "pending" or sess.get("exchanging"):
                 return
+            sess["exchanging"] = True
             redirect_uri = sess["redirect_uri"]
             verifier = sess["code_verifier"]
             proxy_url = sess["proxy_url"]
-            account_id = sess["account_id"]
 
         body = urllib.parse.urlencode({
             "client_id": ANTIGRAVITY_CLIENT_ID,
@@ -1021,12 +1608,7 @@ class OAuthLoopbackManager:
             "expiry_timestamp": int(time.time()) + expires_in,
         }
         rt_json_str = json.dumps(rt_payload, ensure_ascii=False)
-        if callable(self._on_success_callback):
-            try:
-                self._on_success_callback(account_id, rt_payload, rt_json_str)
-            except Exception:
-                pass
-        self._finish_session(session_id, ok=True, email=email, rt_json=rt_json_str)
+        self._finish_session(session_id, ok=True, email=email, rt_json=rt_json_str, rt_payload=rt_payload)
 
     def _finish_session(
         self,
@@ -1035,46 +1617,72 @@ class OAuthLoopbackManager:
         email: str = "",
         rt_json: str = "",
         error: str = "",
+        rt_payload: dict | None = None,
     ) -> None:
         with self._lock:
             sess = self._sessions.get(session_id)
-            if not sess:
+            if not sess or sess.get("status") != "pending":
+                return
+            sess["status"] = "completing"
+            account_id = sess["account_id"]
+            callback = self._on_success_callback if (ok and rt_payload is not None and callable(self._on_success_callback)) else None
+
+        if callback is not None:
+            try:
+                callback(account_id, rt_payload, rt_json)
+            except ValueError as exc:
+                ok, error = False, str(exc)
+            except Exception:
+                ok, error = False, "授权结果无法保存到所选 Google 账号。"
+
+        with self._lock:
+            sess = self._sessions.get(session_id)
+            if not sess or sess.get("status") != "completing":
                 return
             sess["status"] = "success" if ok else "error"
             sess["email"] = email or sess.get("email", "")
-            sess["rt_json"] = rt_json
+            sess["rt_json"] = rt_json if ok else ""
             sess["error"] = error
             sess["stop_event"].set()
+            srv = sess.get("server")
+            if srv is not None:
+                try:
+                    srv.server_close()
+                except Exception:
+                    pass
 
     def get_status(self, session_id: str) -> dict:
         with self._lock:
             sess = self._sessions.get(session_id)
             if not sess:
                 return {"ok": False, "status": "not_found", "error": "OAuth 会话不存在"}
+            eff_status = "pending" if sess.get("status") == "completing" else sess.get("status")
             return {
                 "ok": True,
                 "session_id": sess["session_id"],
                 "account_id": sess["account_id"],
-                "status": sess["status"],
+                "status": eff_status,
                 "auth_url": sess["auth_url"],
-                "email": sess["email"],
-                "error": sess["error"],
-                "has_rt": bool(sess["rt_json"]),
+                "email": sess.get("email", ""),
+                "error": sess.get("error", ""),
+                "has_rt": bool(sess.get("rt_json")),
             }
 
-    def cancel_session(self, session_id: str) -> dict:
+    def cancel_session(self, session_id: str, reason: str = "已手动取消") -> dict:
         with self._lock:
             sess = self._sessions.get(session_id)
             if not sess:
                 return {"ok": True, "cancelled": False}
-            if sess["status"] == "pending":
+            if sess.get("status") in ("pending", "completing"):
                 sess["status"] = "cancelled"
-                sess["error"] = "已手动取消"
+                sess["error"] = reason
             sess["stop_event"].set()
-            try:
-                sess["server"].server_close()
-            except Exception:
-                pass
+            srv = sess.get("server")
+            if srv is not None:
+                try:
+                    srv.server_close()
+                except Exception:
+                    pass
         return {"ok": True, "cancelled": True}
 
     def shutdown(self) -> None:
@@ -1188,4 +1796,80 @@ def probe_ai_credential(account: dict, proxy_url: str = "", timeout: float = 12.
         "models_count": 0,
         "checked_at": checked_at,
         "error": "未配置 API Key 或 Session Token",
+    }
+
+
+def probe_live_validation_challenge(
+    account: dict,
+    proxy_url: str = "",
+    timeout: float = 15.0,
+) -> dict:
+    """Fetch a live Google/Antigravity ``validationUrl`` via RT when available, or return safe fallback."""
+    cf = account.get("custom_fields") or {}
+    has_rt = bool(str(cf.get("rt_json") or cf.get("rt_refresh_token") or "").strip())
+    if not has_rt:
+        return {
+            "ok": True,
+            "status": "security_checkup",
+            "target_url": "https://myaccount.google.com/security-checkup",
+            "message": "该账号尚未录入 RT，已为您指向 Google 安全检查页（也可直接打开 g.co/verifyaccount）。",
+        }
+    res = probe_antigravity_rt(account, proxy_url=proxy_url, timeout=timeout)
+    val_url = str(res.get("validation_url") or "").strip()
+    if val_url:
+        return {
+            "ok": True,
+            "status": "live_validation_url",
+            "target_url": val_url,
+            "message": "已实时提取 Google Verify 验证直链！请在隔离浏览器内完成扫码或手机验证。",
+        }
+    if res.get("gcp_status") == "suspended":
+        return {
+            "ok": True,
+            "status": "tos_violation",
+            "target_url": "https://forms.gle/hGzM9MEUv2azZsrb9",
+            "message": res.get("error") or "检测到 TOS_VIOLATION，已指向官方申诉表单。",
+        }
+    if res.get("gcp_status") == "unsupported":
+        return {
+            "ok": True,
+            "status": "region_unsupported",
+            "target_url": "https://policies.google.com/country-association-form",
+            "message": res.get("error") or "当前地区不支持，可提交地区归属变更表单。",
+        }
+    if res.get("ok"):
+        return {
+            "ok": True,
+            "status": "healthy",
+            "target_url": "",
+            "message": "✓ 该账号 RT 与 Antigravity 探测正常（200 正常，无需验证）",
+        }
+    return {
+        "ok": True,
+        "status": "security_checkup",
+        "target_url": "https://myaccount.google.com/security-checkup",
+        "message": res.get("error") or "未提取到实时验证直链，已指向 Google 安全检查页。",
+    }
+
+
+def clear_antigravity_session_cache() -> dict:
+    """Clear local Antigravity ``Session Storage`` & ``Partitions`` dirs to break Verify loops."""
+    ag_dir = _get_antigravity_app_dir()
+    removed: list[str] = []
+    errors: list[str] = []
+    for sub in ("Session Storage", "Partitions"):
+        target = ag_dir / sub
+        if target.exists():
+            try:
+                shutil.rmtree(target)
+                removed.append(sub)
+            except Exception as exc:
+                errors.append(f"{sub}: {exc}")
+    if errors:
+        return {"ok": False, "removed": removed, "error": "; ".join(errors)}
+    return {
+        "ok": True,
+        "removed": removed,
+        "path": str(ag_dir),
+        "message": "已清理反重力本地 Session 缓存，请在反重力内重新登录或执行 Reset Onboarding。",
     }

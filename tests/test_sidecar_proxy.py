@@ -1088,7 +1088,7 @@ def test_live_sidecar_start_switch_and_clean_stop(tmp_path: Path, monkeypatch):
         assert switched["node"] == "🇯🇵 Japan | 01"
         assert switched["proxy_url"] == f"http://127.0.0.1:{manager.proxy_port}"
         assert ("PUT", "/proxies/KEYVAULT_PROXY", 204) in calls
-        assert ("DELETE", "/connections", 204) in calls
+        assert ("GET", "/connections", 200) in calls
         assert ("GET", "/proxies", 200) in calls
 
         # The sidecar's own controller must report the freshly selected leaf.
@@ -1197,3 +1197,115 @@ def test_ensure_started_accepts_preferred_node_without_breaking_no_arg_calls(tmp
         for name, p in signature.parameters.items()
         if name != "self"
     )
+
+
+def test_sidecar_isolated_slots_prevent_cross_account_node_clobber(tmp_path: Path, monkeypatch):
+    from src.sidecar_proxy import SidecarProxyManager, find_mihomo_binary
+
+    manager = SidecarProxyManager(runtime_dir=tmp_path / "slots", proxy_port=17941, ctrl_port=29141)
+    config = manager._build_config(
+        [
+            {"name": "🇸🇬 Singapore | 01", "type": "ss", "server": "127.0.0.1", "port": 30011},
+            {"name": "🇯🇵 Japan | 01", "type": "ss", "server": "127.0.0.1", "port": 30012},
+        ]
+    )
+    assert len(config["listeners"]) == 16
+    assert config["listeners"][0]["name"] == "kv-slot-0"
+    assert any(r == "IN-NAME,kv-slot-0,KV_SLOT_0" for r in config["rules"])
+    assert config["rules"].index("IN-NAME,kv-slot-0,KV_SLOT_0") < config["rules"].index("GEOIP,CN,DIRECT,no-resolve")
+
+    # Verify slot allocation via mocked controller
+    calls: list[tuple[str, str, dict | None]] = []
+    monkeypatch.setattr(manager, "ensure_started", lambda: {"ok": True, "proxy_url": "http://127.0.0.1:17941"})
+    monkeypatch.setattr(manager, "_ctrl_request", lambda m, p, b=None, **kw: calls.append((m, p, b)) or (204, {}))
+
+    r1 = manager.switch_node("🇸🇬 Singapore | 01", isolate_slot=True, account_id=101)
+    r2 = manager.switch_node("🇯🇵 Japan | 01", isolate_slot=True, account_id=102)
+    assert r1["ok"] and r2["ok"]
+    assert r1["slot"] != r2["slot"]
+    assert r1["proxy_url"] != r2["proxy_url"]
+    assert r1["groups"] == [f"KV_SLOT_{r1['slot']}"]
+    assert r2["groups"] == [f"KV_SLOT_{r2['slot']}"]
+
+    # Live Mihomo config & slot switch test when mihomo binary is installed
+    mihomo_bin = find_mihomo_binary()
+    if mihomo_bin:
+        cfg_file = tmp_path / "live-slots.yaml"
+        cfg_file.write_text(
+            yaml.safe_dump(
+                {
+                    "proxies": [
+                        {"name": "🇸🇬 Singapore | 01", "type": "ss", "server": "127.0.0.1", "port": 30011, "cipher": "aes-128-gcm", "password": "sg"},
+                        {"name": "🇯🇵 Japan | 01", "type": "ss", "server": "127.0.0.1", "port": 30012, "cipher": "aes-128-gcm", "password": "jp"},
+                    ]
+                },
+                allow_unicode=True,
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("KEYVAULT_CLASH_CONFIG", str(cfg_file))
+        monkeypatch.setattr("src.proxy_service.find_active_mihomo_pipe", lambda: "")
+        live = SidecarProxyManager(runtime_dir=tmp_path / "live_rt", proxy_port=_preferred_port(17961), ctrl_port=_preferred_port(29161))
+        try:
+            assert live.ensure_started()["ok"] is True
+            s1 = live.switch_node("🇸🇬 Singapore | 01", isolate_slot=True, account_id=1)
+            s2 = live.switch_node("🇯🇵 Japan | 01", isolate_slot=True, account_id=2)
+            assert s1["ok"] and s2["ok"] and s1["proxy_url"] != s2["proxy_url"]
+            st, px = live._ctrl_request("GET", "/proxies", timeout=2.0)
+            assert st == 200
+            assert px["proxies"][f"KV_SLOT_{s1['slot']}"]["now"] == "🇸🇬 Singapore | 01"
+            assert px["proxies"][f"KV_SLOT_{s2['slot']}"]["now"] == "🇯🇵 Japan | 01"
+        finally:
+            live.stop()
+
+
+def test_sidecar_lru_slot_eviction_selective_conn_close_and_provider_signature(tmp_path: Path, monkeypatch):
+    from src.sidecar_proxy import SidecarProxyManager
+
+    manager = SidecarProxyManager(runtime_dir=tmp_path / "slots", proxy_port=17941, ctrl_port=29141)
+    manager._slot_ports = [18000, 18001]  # Force 2 slots so account #3 evicts account #1
+    deleted_conns: list[str] = []
+
+    def fake_ctrl(method: str, path: str, body=None, timeout=1.5):
+        if method == "GET" and path == "/connections":
+            return 200, {
+                "connections": [
+                    {"id": "slot-conn", "metadata": {"inboundName": "kv-slot-0"}},
+                    {"id": "shared-conn", "metadata": {"inboundName": "mixed-in"}},
+                ]
+            }
+        if method == "DELETE":
+            deleted_conns.append(path)
+        return 204, {}
+
+    monkeypatch.setattr(manager, "ensure_started", lambda: {"ok": True, "proxy_url": "http://127.0.0.1:17941"})
+    monkeypatch.setattr(manager, "_ctrl_request", fake_ctrl)
+
+    r1 = manager.switch_node("NodeA", isolate_slot=True, account_id=101)
+    r2 = manager.switch_node("NodeB", isolate_slot=True, account_id=102)
+    manager._slot_last_used[r1["slot"]] = 1.0
+    manager._slot_last_used[r2["slot"]] = 100.0
+    r3 = manager.switch_node("NodeC", isolate_slot=True, account_id=103)
+    # Account 101 must have been evicted from _account_slots when its slot was taken by 103
+    assert r3["slot"] == r1["slot"]
+    assert 101 not in manager._account_slots
+    assert manager._account_slots[103] == r3["slot"]
+
+    # Non-isolated switch closes ONLY shared mixed-in connections, keeping kv-slot-0 untouched
+    deleted_conns.clear()
+    manager.switch_node("NodeA", isolate_slot=False)
+    assert deleted_conns == ["/connections/shared-conn"]
+
+    # proxy_provider/*.yaml updates change _yaml_signature
+    sub_dir = tmp_path / "cfg"
+    prov_dir = sub_dir / "proxy_provider"
+    prov_dir.mkdir(parents=True)
+    main_yaml = sub_dir / "config.yaml"
+    main_yaml.write_text("mixed-port: 7890\n", encoding="utf-8")
+    pfile = prov_dir / "extra.yaml"
+    pfile.write_text("proxies: []\n", encoding="utf-8")
+    sig1 = manager._yaml_signature(main_yaml)
+    pfile.write_text("proxies:\n  - name: X\n", encoding="utf-8")
+    sig2 = manager._yaml_signature(main_yaml)
+    assert sig1 != sig2

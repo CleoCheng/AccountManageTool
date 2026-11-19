@@ -1,4 +1,7 @@
 from pathlib import Path
+
+import pytest
+
 from src.db_service import DatabaseService, compute_usage_info
 
 
@@ -411,6 +414,7 @@ def test_security_checklist_and_credential_history_archiving(tmp_path: Path):
     assert acc["security"]["completed"] == 0
 
     partial = svc.quick_update_credentials(acc["id"], {
+        "google_confirmed": True,
         "password": "NewStrongPassword#2026",
         "password_modified": True,
         "sec_recovery_modified": True,
@@ -422,6 +426,7 @@ def test_security_checklist_and_credential_history_archiving(tmp_path: Path):
     assert partial["recovery_password"] == "NewRecPwd#2"
 
     secured = svc.quick_update_credentials(acc["id"], {
+        "google_confirmed": True,
         "secret_key": "MFRGGZDFMZTWQ2LKMFRGGZDFMZTWQ2LK",
         "twofa_modified": True,
         "sec_devices_cleared": True,
@@ -473,6 +478,121 @@ def test_warming_lifecycle_and_risk_rewarm_reset(tmp_path: Path):
     assert scan_acc["warming"]["phase"] == "scan_qr"
     assert scan_acc["warming"]["target_days"] == 30
     assert scan_acc["warming"]["days_remaining"] == 20
+
+
+def test_google_health_review_and_reminder_are_independent(tmp_path: Path):
+    from datetime import date, datetime, timedelta
+
+    svc = DatabaseService(tmp_path / "accounts.db")
+    purchase_date = (date.today() - timedelta(days=31)).isoformat()
+    account = svc.add_account({
+        "account_type": "Google",
+        "account": "review@example.com",
+        "purchase_date": purchase_date,
+    })
+    account_id = account["id"]
+    assert "google_reviewed_at" not in account["custom_fields"]
+    assert account["warming"]["label"] == "待复核"
+
+    with pytest.raises(ValueError, match="核对状态"):
+        svc.set_health_status(account_id, "invalid")
+    assert "google_reviewed_at" not in svc.get_account(account_id)["custom_fields"]
+
+    for status, label in (("封号", "封号"), ("不可用", "不可用"), ("短信", "待验证（短信）")):
+        reviewed = svc.set_health_status(account_id, status)
+        reviewed_at = datetime.fromisoformat(reviewed["custom_fields"]["google_reviewed_at"])
+        assert reviewed_at.utcoffset() == timedelta(0)
+        updated = svc.reset_warming_time(account_id, scan_qr_mode=True, reset_date=purchase_date)
+        assert updated["health_status"] == status
+        assert updated["warming"]["ready"] is True
+        assert updated["warming"]["label"] == label
+        assert updated["custom_fields"]["google_reviewed_at"] == reviewed_at.isoformat()
+
+    confirmed = svc.set_health_status(account_id, "可用")
+    assert confirmed["health_status"] == "可用"
+    assert confirmed["warming"]["target_days"] == 30
+    assert confirmed["warming"]["label"] == "待复核"
+    edited = svc.update_account(account_id, {"account": "another@example.com"})
+    assert "google_reviewed_at" not in edited["custom_fields"]
+
+
+def test_google_quick_update_requires_confirmation_and_archives_once(tmp_path: Path):
+    import sqlite3
+    from concurrent.futures import ThreadPoolExecutor
+
+    svc = DatabaseService(tmp_path / "accounts.db")
+    old_secret = "JBSWY3DPEHPK3PXP"
+    account = svc.add_account({
+        "account_type": "Google",
+        "account": "credentials@example.com",
+        "password": "old-password",
+        "recovery_email": "old-recovery@example.com",
+        "recovery_password": "old-recovery-password",
+        "secret_key": old_secret,
+    })
+    account_id = account["id"]
+    assert svc.quick_update_credentials(account_id, {"note": "reviewed locally"})["note"] == "reviewed locally"
+
+    for changes in (
+        {"password": "new-password"},
+        {"secret_key": "MFRGGZDFMZTWQ2LK"},
+        {"recovery_email": "new-recovery@example.com"},
+        {"recovery_password": "new-recovery-password"},
+        {"password_modified": True},
+        {"twofa_modified": True},
+        {"sec_recovery_modified": True},
+        {"sec_devices_cleared": True},
+    ):
+        with pytest.raises(ValueError, match="确认"):
+            svc.quick_update_credentials(account_id, {"note": "unsaved", "google_confirmed": "true", **changes})
+    unchanged = svc.get_account(account_id)
+    assert unchanged["note"] == "reviewed locally"
+    assert unchanged["password"] == "old-password"
+    assert unchanged["security"]["completed"] == 0
+    assert svc.get_credential_history(account_id) == []
+
+    changes = {"google_confirmed": True, "password": "new-password", "password_modified": True}
+    with svc._connect() as conn:
+        conn.execute("""
+            CREATE TRIGGER reject_update BEFORE UPDATE ON accounts
+            BEGIN SELECT RAISE(ABORT, 'simulated failure'); END
+        """)
+    with pytest.raises(sqlite3.IntegrityError, match="simulated failure"):
+        svc.quick_update_credentials(account_id, changes)
+    assert svc.get_account(account_id)["password"] == "old-password"
+    assert svc.get_credential_history(account_id) == []
+    with svc._connect() as conn:
+        conn.execute("DROP TRIGGER reject_update")
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        saves = list(workers.map(lambda _: svc.quick_update_credentials(account_id, changes), range(2)))
+    for saved in saves:
+        assert saved["password"] == "new-password"
+        assert saved["password_modified"] == 1
+    assert len(svc.get_credential_history(account_id)) == 1
+
+
+def test_google_import_and_local_correction_do_not_mark_credentials_changed(tmp_path: Path):
+    svc = DatabaseService(tmp_path / "accounts.db")
+    svc.batch_import_accounts([{
+        "account_type": "Google",
+        "account": "import@example.com",
+        "password": "original",
+        "initial_secret_key": "JBSWY3DPEHPK3PXP",
+        "secret_key": "MFRGGZDFMZTWQ2LK",
+        "twofa_modified": 1,
+    }])
+    account = svc.list_accounts(account_type="Google")[0]
+    assert account["twofa_modified"] == 0
+    assert account["totp"]["valid"] is True
+    corrected = svc.update_account(account["id"], {
+        "password": "local-correction",
+        "secret_key": "GEZDGNBVGY3TQOJQ",
+    })
+    assert corrected["password_modified"] == 0
+    assert corrected["twofa_modified"] == 0
+    assert corrected["secret_key"] == "GEZDGNBVGY3TQOJQ"
+    assert corrected["totp"]["valid"] is True
 
 
 def test_batch_import_duplicate_strategies_and_top_recovery(tmp_path: Path):
@@ -535,3 +655,45 @@ def test_rolling_backups_and_restore(tmp_path: Path):
     assert len(accounts) == 1
     assert accounts[0]["id"] == a1["id"]
     assert any("pre_restore" in b["filename"] for b in svc.list_backups())
+
+
+def test_delete_account_cleans_credential_history_and_restore_validates_schema(tmp_path: Path):
+    import sqlite3
+
+    svc = DatabaseService(tmp_path / "data" / "accounts.db")
+    acc = svc.add_account({"account_type": "ChatGPT", "account": "del@example.com", "password": "old"})
+    svc.update_account(acc["id"], {"password": "new"})
+    assert len(svc.get_credential_history(acc["id"])) == 1
+    assert svc.delete_account(acc["id"]) is True
+    assert svc.get_credential_history(acc["id"]) == []
+
+    # Invalid / foreign sqlite backup must be rejected without touching accounts.db
+    svc.add_account({"account_type": "ChatGPT", "account": "safe@example.com", "password": "p1"})
+    bad_backup = svc.backups_dir / "accounts_bad_schema.db"
+    bad_backup.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(bad_backup) as bad_conn:
+        bad_conn.execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)")
+    res = svc.restore_backup(bad_backup.name)
+    assert res["ok"] is False
+    assert len(svc.list_accounts()) == 1
+
+
+def test_allocate_clean_node_and_search_like_escape_and_concurrent_writes(tmp_path: Path):
+    import concurrent.futures
+
+    svc = DatabaseService(tmp_path / "data" / "accounts.db")
+    pct_acc = svc.add_account({"account_type": "ChatGPT", "account": "100%real_user@example.com"})
+    svc.add_account({"account_type": "ChatGPT", "account": "1000normal@example.com"})
+    matched = svc.list_accounts(search="100%real")
+    assert [a["id"] for a in matched] == [pct_acc["id"]]
+
+    # Concurrent node allocations must serialize cleanly under _write_tx without locked errors
+    mail_ids = [
+        svc.add_account({"account_type": "域名邮箱", "account": f"m{i}@domain.test"})["id"]
+        for i in range(6)
+    ]
+    nodes = ["NodeA", "NodeB", "NodeC"]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        futs = [pool.submit(svc.allocate_clean_node_for_account, mid, nodes) for mid in mail_ids]
+        assigned = [f.result(timeout=5) for f in futs]
+    assert all(n in nodes for n in assigned)

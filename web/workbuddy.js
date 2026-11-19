@@ -466,6 +466,7 @@ function syncLocalAccountsFromQueue(queueObj) {
     const acc = (state.accounts || []).find(a => a.id === it.account_id);
     if (acc && acc.account_type === "域名邮箱") {
       acc.custom_fields = acc.custom_fields || {};
+      if (acc.custom_fields.wb_reg_manually_set) continue;
       if (it.status === "done") {
         acc.custom_fields.wb_reg_status = "已完成";
         delete acc.custom_fields.wb_reg_step;
@@ -847,6 +848,23 @@ function closeWorkBuddyQuotaModal() {
 function renderWorkBuddyQuotaModal() {
   const body = document.getElementById("workbuddy-quota-body");
   if (!body || !workbuddy.quotaData) return;
+  if (!body._delegated) {
+    body._delegated = true;
+    body.addEventListener("click", (e) => {
+      const target = e.target.closest("[data-wb-action]");
+      if (!target) return;
+      const action = target.getAttribute("data-wb-action");
+      const nodeName = target.getAttribute("data-node-name") || "";
+      const proxyUrl = target.getAttribute("data-proxy-url") || "";
+      if (action === "choose") {
+        chooseWorkBuddyBatchNode(nodeName, proxyUrl);
+      } else if (action === "toggle-unlock") {
+        toggleWorkBuddyNodeUnlock(nodeName, target.getAttribute("data-unlock") === "1", proxyUrl);
+      } else if (action === "reset") {
+        resetWorkBuddyNodeQuota(nodeName);
+      }
+    });
+  }
   const data = workbuddy.quotaData;
   const nodes = data.nodes || [];
   const defaultPort = data.default_proxy_url || "";
@@ -854,7 +872,7 @@ function renderWorkBuddyQuotaModal() {
 
   const modeHtml = `
     <div class="wb-quota-mode-bar">
-      <div class="wb-quota-mode-option ${isAuto ? "active" : ""}" onclick="chooseWorkBuddyBatchNode('', '${escapeHtml(defaultPort)}')">
+      <div class="wb-quota-mode-option ${isAuto ? "active" : ""}" data-wb-action="choose" data-node-name="" data-proxy-url="${escapeHtml(defaultPort)}">
         <div>
           <strong>⚡ 自动轮换绑定订阅节点（推荐）</strong>
           <p>优先检测历史注册记录：已有记录的邮箱自动沿用原节点/同国家 IP 继续注册（防止跨国切换封号）；全新邮箱自动分配干净节点，每节点限 2 个账号。</p>
@@ -892,17 +910,17 @@ function renderWorkBuddyQuotaModal() {
 
     return `
       <div class="wb-quota-row ${isChosen ? "selected" : ""} ${exhausted ? "is-exhausted" : ""}">
-        <div class="wb-quota-info" onclick="chooseWorkBuddyBatchNode('${escapeHtml(n.node_name)}', '${escapeHtml(px)}')" title="点击指定使用此订阅节点">
+        <div class="wb-quota-info" data-wb-action="choose" data-node-name="${escapeHtml(n.node_name)}" data-proxy-url="${escapeHtml(px)}" title="点击指定使用此订阅节点">
           <strong>${isChosen ? "📌 " : ""}${escapeHtml(n.node_name)}</strong>
           <span class="wb-quota-meta">${escapeHtml(n.region || "")}${n.delay ? " · " + n.delay + "ms" : ""}</span>
         </div>
         <div class="wb-quota-actions">
           ${statusBadge}
           <button type="button" class="btn ${unlocked ? "btn-ghost" : "btn-secondary"} btn-xs"
-            onclick="toggleWorkBuddyNodeUnlock('${escapeHtml(n.node_name)}', ${!unlocked}, '${escapeHtml(px)}')">
+            data-wb-action="toggle-unlock" data-node-name="${escapeHtml(n.node_name)}" data-unlock="${unlocked ? "0" : "1"}" data-proxy-url="${escapeHtml(px)}">
             ${unlocked ? "🔒 恢复限额" : "🔓 主动解限"}
           </button>
-          ${(used > 0 || blocked) ? `<button type="button" class="btn btn-ghost btn-xs" onclick="resetWorkBuddyNodeQuota('${escapeHtml(n.node_name)}')">重置</button>` : ""}
+          ${(used > 0 || blocked) ? `<button type="button" class="btn btn-ghost btn-xs" data-wb-action="reset" data-node-name="${escapeHtml(n.node_name)}">重置</button>` : ""}
         </div>
       </div>
     `;

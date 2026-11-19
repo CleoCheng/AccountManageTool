@@ -1,18 +1,38 @@
 import base64
+import inspect
 import json
+import os
+import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from src.browser_service import launch_isolated_browser, reset_rejected_login_session
-from src.db_service import DatabaseService, compute_usage_info, normalize_gmail_address
+from tempfile import NamedTemporaryFile
+from src.browser_service import (
+    _call_supported,
+    _profile_has_active_lock,
+    launch_isolated_browser,
+    purge_legacy_google_profiles,
+    reset_rejected_login_session,
+    resolve_browser_env_config,
+)
+from src.db_service import (
+    AVAILABILITY_STATES,
+    DatabaseService,
+    compute_usage_info,
+    matches_health_filter,
+    normalize_gmail_address,
+)
 from src.github_mail import fetch_latest_mail_code
 from src.maintenance_service import (
     GCP_APPEAL_CHANNELS,
     OAuthLoopbackManager,
-    inspect_rt_json,
+    clear_antigravity_session_cache,
     inject_rt_to_antigravity_client,
+    inspect_rt_json,
     probe_ai_credential,
     probe_antigravity_rt,
+    probe_live_validation_challenge,
     probe_proxy_geo,
     shutdown_auth_relays,
 )
@@ -27,6 +47,14 @@ from src.totp_service import (
     normalize_secret,
     sync_google_time_offset,
 )
+from src.url_dispatcher import (
+    detect_url_platform,
+    disable_windows_url_interception,
+    enable_windows_url_interception,
+    forward_to_original_browser,
+    is_target_auth_url,
+    is_windows_url_interception_enabled,
+)
 from src.workbuddy import WorkBuddyQueue
 
 
@@ -38,27 +66,63 @@ DEFAULT_SETTINGS = {
     "totp_interval": 30,
     "totp_offset_seconds": 0,
     "domain_email_login_url": "https://mail.ggb6.com",
+    "default_start_url": "https://myaccount.google.com/",
     "last_filter_type": "All",
+    "browser_engine_mode": "inpage_edge",
+    "preferred_browser": "auto",
+    "custom_browser_path": "",
+    "default_browser_lang": "match_region",
+    "url_interception_enabled": False,
+    "auto_probe_geo_on_launch": True,
 }
 
 
 class AccountApi:
-    def __init__(self, data_dir: str | Path, auto_sync_account_data: bool = False):
+    def __init__(
+        self,
+        data_dir: str | Path,
+        auto_sync_account_data: bool = False,
+        base_dir: str | Path | None = None,
+    ):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        if base_dir is not None:
+            self.base_dir = Path(base_dir).resolve()
+        elif getattr(sys, "frozen", False):
+            self.base_dir = Path(sys.executable).resolve().parent
+        else:
+            self.base_dir = Path(__file__).resolve().parent.parent
         self.db = DatabaseService(self.data_dir / "accounts.db")
         self._workbuddy = WorkBuddyQueue(self.db, self.data_dir)
         self._oauth = OAuthLoopbackManager(on_success_callback=self._on_oauth_success)
         self.settings_path = self.data_dir / "settings.json"
+        self._settings_lock = threading.RLock()
         settings = self._ensure_settings()
         self.db.totp_offset_seconds = int(settings.get("totp_offset_seconds") or 0)
+        self._show_login_tools = None
+        self._login_tools_panel = None
+        self._on_account_updated_ui = None
         self.auto_sync_result: dict | None = None
+        # Startup sweep: purge stale in-page extension leftovers for Google
+        # profiles only (other platforms keep their toolbar extension).
+        try:
+            google_accs = self.db.list_accounts(account_type="Google")
+            purge_legacy_google_profiles(self.data_dir, google_accs)
+        except Exception:
+            pass
         if auto_sync_account_data:
             self.auto_sync_result = self._auto_sync_account_data_silent()
 
     def _on_oauth_success(self, account_id: int, rt_payload: dict, rt_json_str: str) -> None:
-        if int(account_id or 0) > 0:
-            self.save_account_rt(int(account_id), rt_json_str)
+        account = self.db.get_account(int(account_id))
+        if not account or account.get("account_type") != "Google":
+            raise ValueError("所选 Google 账号已不存在，授权结果未保存。")
+        authorized_email = normalize_gmail_address(rt_payload.get("email") or "")
+        if not authorized_email or authorized_email != normalize_gmail_address(account["account"]):
+            raise ValueError("授权账号与所选 Google 账号不一致，授权结果未保存。")
+        saved = self.save_account_rt(int(account_id), rt_json_str)
+        if not saved.get("ok") or not saved.get("account"):
+            raise ValueError("授权结果无法保存到所选 Google 账号。")
 
     def _auto_sync_account_data_silent(self) -> dict | None:
         try:
@@ -88,19 +152,83 @@ class AccountApi:
         except Exception:
             return None
 
-    def _ensure_settings(self) -> dict:
-        if not self.settings_path.exists():
-            self.settings_path.write_text(
-                json.dumps(DEFAULT_SETTINGS, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            return dict(DEFAULT_SETTINGS)
+    @staticmethod
+    def _sanitize_settings(raw: dict | None) -> dict:
+        merged = dict(DEFAULT_SETTINGS)
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                if k == "totp_offset_seconds":
+                    try:
+                        merged[k] = int(v or 0)
+                    except (TypeError, ValueError):
+                        merged[k] = 0
+                elif k == "theme":
+                    merged[k] = v if v in ("dark", "light") else DEFAULT_SETTINGS["theme"]
+                elif k == "browser_engine_mode":
+                    merged[k] = (
+                        v
+                        if v in ("inpage_edge", "inpage_chrome_cdp", "pure_native")
+                        else DEFAULT_SETTINGS["browser_engine_mode"]
+                    )
+                elif k == "preferred_browser":
+                    merged[k] = (
+                        v
+                        if v in ("auto", "chrome", "edge", "custom")
+                        else DEFAULT_SETTINGS["preferred_browser"]
+                    )
+                elif k in ("url_interception_enabled", "auto_probe_geo_on_launch"):
+                    merged[k] = bool(v)
+                else:
+                    merged[k] = v
+        return merged
+
+    def _write_settings_atomic(self, settings: dict) -> None:
+        self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(settings, ensure_ascii=False, indent=2)
+        tmp_path: Path | None = None
         try:
-            loaded = json.loads(self.settings_path.read_text(encoding="utf-8"))
-            merged = {**DEFAULT_SETTINGS, **loaded}
-            return merged
-        except Exception:
-            return dict(DEFAULT_SETTINGS)
+            with NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=self.settings_path.parent,
+                prefix=".settings_",
+                suffix=".tmp",
+                delete=False,
+            ) as tmp:
+                tmp.write(payload)
+                tmp.flush()
+                os.fsync(tmp.fileno())
+                tmp_path = Path(tmp.name)
+            os.replace(tmp_path, self.settings_path)
+            tmp_path = None
+        finally:
+            if tmp_path is not None:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def _ensure_settings(self) -> dict:
+        with self._settings_lock:
+            if not self.settings_path.exists():
+                clean = self._sanitize_settings(None)
+                try:
+                    self._write_settings_atomic(clean)
+                except OSError:
+                    pass
+                return clean
+            try:
+                loaded = json.loads(self.settings_path.read_text(encoding="utf-8"))
+                return self._sanitize_settings(loaded if isinstance(loaded, dict) else None)
+            except Exception:
+                return self._sanitize_settings(None)
+
+    def _notify_hud_account(self, account: dict | None) -> None:
+        if account and self._login_tools_panel is not None:
+            try:
+                self._login_tools_panel.notify_account_updated(account)
+            except Exception:
+                pass
 
     def get_dashboard(
         self,
@@ -110,6 +238,7 @@ class AccountApi:
         health_status: str = "All",
         antigravity_tier: str = "All",
         device_tag: str = "All",
+        custom_filters: dict[str, str] | None = None,
     ) -> dict:
         status_filter = "" if status in ("", "All") else status
         health_filter = "" if health_status in ("", "All") else health_status
@@ -122,17 +251,32 @@ class AccountApi:
             account_type=account_type,
             search=search,
             status=status_filter,
-            health_status=health_filter,
             antigravity_tier=ag_filter,
             device_tag=device_filter,
         )
+        filters = {
+            key: value
+            for key, value in custom_filters.items()
+            if isinstance(value, str) and value not in ("", "All")
+        } if isinstance(custom_filters, dict) else {}
+        if filters:
+            accounts = [
+                account for account in accounts
+                if all(account["custom_fields"].get(key) == value for key, value in filters.items())
+            ]
+        health_counts = dict.fromkeys(AVAILABILITY_STATES, 0)
+        for account in accounts:
+            health_counts[account["availability"]] += 1
+        accounts = [account for account in accounts if matches_health_filter(account, health_filter)]
         stats = self.db.get_stats()
         dicts = self.db.list_system_dicts()
         attributes = self.db.list_attributes()
         now = int(time.time()) + offset
+        settings["url_interception_live"] = is_windows_url_interception_enabled()
         return {
             "accounts": accounts,
             "stats": stats,
+            "health_counts": health_counts,
             "settings": settings,
             "dicts": dicts,
             "attributes": attributes,
@@ -161,15 +305,21 @@ class AccountApi:
         proxy_node: str,
         locked: bool = True,
     ) -> dict:
-        return self.db.bind_account_proxy_node(
+        res = self.db.bind_account_proxy_node(
             int(account_id),
             proxy_url=proxy_url,
             proxy_node=proxy_node,
             locked=bool(locked),
         )
+        if res.get("ok"):
+            self._notify_hud_account(res.get("account"))
+        return res
 
     def set_node_lock(self, account_id: int, locked: bool) -> dict:
-        return self.db.set_account_node_lock(int(account_id), bool(locked))
+        res = self.db.set_account_node_lock(int(account_id), bool(locked))
+        if res.get("ok"):
+            self._notify_hud_account(res.get("account"))
+        return res
 
     def smart_parse(self, raw_text: str, account_type: str = "") -> dict:
         import re
@@ -230,41 +380,63 @@ class AccountApi:
             return {"ok": False, "error": "账号不能为空"}
 
         acc_id = data.get("id")
-        if acc_id:
-            updated = self.db.update_account(int(acc_id), data)
-            return {"ok": True, "account": updated}
-        else:
-            created = self.db.add_account(data)
-            return {"ok": True, "account": created}
+        try:
+            account = (
+                self.db.update_account(int(acc_id), data, validate_totp=True)
+                if acc_id else self.db.add_account(data, validate_totp=True)
+            )
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        if not account:
+            return {"ok": False, "error": "账号不存在"}
+        self._notify_hud_account(account)
+        return {"ok": True, "account": account}
 
     def toggle_twofa_modified(self, account_id: int, modified: bool | int) -> dict:
         updated = self.db.set_twofa_modified(int(account_id), modified)
         if not updated:
             return {"ok": False, "error": "账号不存在"}
+        self._notify_hud_account(updated)
         return {"ok": True, "account": updated}
 
     def toggle_password_modified(self, account_id: int, modified: bool | int) -> dict:
         updated = self.db.set_password_modified(int(account_id), modified)
         if not updated:
             return {"ok": False, "error": "账号不存在"}
+        self._notify_hud_account(updated)
         return {"ok": True, "account": updated}
 
     def set_health_status(self, account_id: int, health_status: str) -> dict:
-        updated = self.db.set_health_status(int(account_id), health_status)
+        try:
+            updated = self.db.set_health_status(int(account_id), health_status)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
         if not updated:
             return {"ok": False, "error": "账号不存在"}
+        # Risk/challenge statuses leave automation markers behind; clear them for
+        # Google accounts without ever touching cookies (MainForm.RpcRouter.cs:931-944).
+        if updated.get("account_type") == "Google" and health_status in ("人机", "短信", "验证", "封号"):
+            try:
+                reset_rejected_login_session(
+                    self.data_dir, int(account_id), clear_unauth_cookies=False
+                )
+            except Exception:
+                pass
+        self._notify_hud_account(updated)
         return {"ok": True, "account": updated}
 
     def set_antigravity_tier(self, account_id: int, antigravity_tier: str) -> dict:
         updated = self.db.set_antigravity_tier(int(account_id), antigravity_tier)
         if not updated:
             return {"ok": False, "error": "账号不存在"}
+        self._notify_hud_account(updated)
         return {"ok": True, "account": updated}
 
     def set_device_tag(self, account_id: int, device_tag: str) -> dict:
         updated = self.db.set_device_tag(int(account_id), device_tag)
         if not updated:
             return {"ok": False, "error": "账号不存在"}
+        self._notify_hud_account(updated)
         return {"ok": True, "account": updated}
 
     def get_system_dicts(self, dict_type: str | None = None) -> list[dict]:
@@ -288,13 +460,28 @@ class AccountApi:
     def update_attribute_bindings(self, attr_id: int, bound_platforms) -> dict:
         return self.db.update_attribute_bindings(int(attr_id), bound_platforms)
 
+    def show_login_tools(self, account_id: int) -> dict:
+        if self._show_login_tools is None:
+            return {"ok": False, "error": "悬浮登录工具不可用，可在 KeyVault 主窗口复制。"}
+        account = self.db.get_account(int(account_id))
+        if not account:
+            return {"ok": False, "error": "该账号无法使用悬浮登录工具。"}
+        try:
+            self._show_login_tools(account["id"], self.data_dir / "browsers" / f"acc_{account['id']}")
+        except RuntimeError as exc:
+            return {"ok": False, "error": str(exc)}
+        except Exception:
+            return {"ok": False, "error": "无法打开悬浮登录工具，可在 KeyVault 主窗口复制。"}
+        return {"ok": True}
+
     def launch_browser(
         self,
         account_id: int,
         target_url: str = "",
-        pure_native: bool = False,
+        pure_native: bool | None = None,
     ) -> dict:
         import src.browser_service as bs
+
         account = self.db.get_account(int(account_id))
         if not account:
             return {"ok": False, "error": "账号不存在"}
@@ -303,30 +490,50 @@ class AccountApi:
             if not (fp_cfg.get("node_locked") and str(fp_cfg.get("proxy_node") or "").strip()):
                 self.allocate_node_for_domain_email(int(account_id))
                 account = self.db.get_account(int(account_id)) or account
-            result = (
-                bs.launch_isolated_browser(
-                    self.data_dir,
-                    account,
-                    target_url=target_url,
-                    pure_native=bool(pure_native),
-                )
-                if (target_url or pure_native)
-                else bs.launch_isolated_browser(self.data_dir, account)
-            )
+
+        settings = self._ensure_settings()
+        launch_fn = bs.launch_isolated_browser
+        kwargs: dict = {}
+        if target_url:
+            kwargs["target_url"] = target_url
+        if pure_native is not None:
+            kwargs["pure_native"] = bool(pure_native)
+        try:
+            params = inspect.signature(launch_fn).parameters
+            if "settings" in params:
+                kwargs["settings"] = settings
+        except (TypeError, ValueError):
+            pass
+
+        result = launch_fn(self.data_dir, account, **kwargs) if kwargs else launch_fn(self.data_dir, account)
+        if account["account_type"] == "域名邮箱":
             result.setdefault("fp_config", account.get("fp_config") or {})
             result.setdefault(
                 "profile_dir",
                 str(self.data_dir / "browsers" / f"acc_{int(account_id)}"),
             )
-            return result
-        if target_url or pure_native:
-            return bs.launch_isolated_browser(
-                self.data_dir,
-                account,
-                target_url=target_url,
-                pure_native=bool(pure_native),
-            )
-        return bs.launch_isolated_browser(self.data_dir, account)
+
+        if result.get("ok"):
+            updated = self.db.record_browser_launch(int(account_id))
+            if updated:
+                result["account"] = updated
+            if (
+                result.get("profile_dir")
+                and self._show_login_tools
+                and not result.get("inpage_toolbar")
+                and (not target_url or account.get("account_type") == "Google")
+            ):
+                try:
+                    _call_supported(
+                        self._show_login_tools,
+                        account["id"],
+                        Path(result["profile_dir"]),
+                        launching=True,
+                        runtime_proxy=str(result.get("runtime_proxy") or ""),
+                    )
+                except Exception:
+                    pass
+        return result
 
     def allocate_node_for_domain_email(self, account_id: int) -> str:
         env = self.get_proxy_nodes("WorkBuddy")
@@ -543,7 +750,9 @@ class AccountApi:
 
     def _shutdown(self) -> None:
         try:
-            self._workbuddy.close()
+            self._workbuddy.close(timeout=5.0)
+        except Exception:
+            pass
         finally:
             try:
                 self._oauth.shutdown()
@@ -578,24 +787,44 @@ class AccountApi:
         return {"text": text}
 
     def save_settings(self, new_settings: dict) -> dict:
-        current = self._ensure_settings()
-        current.update(new_settings or {})
-        self.db.totp_offset_seconds = int(current.get("totp_offset_seconds") or 0)
-        self.settings_path.write_text(
-            json.dumps(current, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        return current
+        with self._settings_lock:
+            current = self._ensure_settings()
+            if isinstance(new_settings, dict):
+                current.update(new_settings)
+            clean = self._sanitize_settings(current)
+            self.db.totp_offset_seconds = int(clean.get("totp_offset_seconds") or 0)
+            self._write_settings_atomic(clean)
+            return clean
 
     # --- Maintenance, Security, Warming, Backups, RT/OAuth & Appeal APIs ---
 
     def get_credential_history(self, account_id: int) -> dict:
         return {"ok": True, "history": self.db.get_credential_history(int(account_id))}
 
+    def get_account_change_history(self, account_id: int) -> dict:
+        return {"ok": True, "history": self.db.get_account_change_history(int(account_id))}
+
+    def set_domain_email_metadata(self, account_id: int, field: str, value) -> dict:
+        try:
+            account = self.db.set_domain_email_metadata(int(account_id), field, value)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        if account is None:
+            return {"ok": False, "error": "账号不存在"}
+        return {"ok": True, "account": account}
+
     def quick_update_credentials(self, account_id: int, payload: dict) -> dict:
-        updated = self.db.quick_update_credentials(int(account_id), payload or {})
+        try:
+            updated = self.db.quick_update_credentials(int(account_id), payload or {})
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
         if not updated:
             return {"ok": False, "error": "账号不存在"}
+        if self._login_tools_panel is not None:
+            try:
+                self._login_tools_panel.notify_account_updated(updated)
+            except Exception:
+                pass
         return {"ok": True, "account": updated}
 
     def generate_strong_password(self, length: int = 16) -> dict:
@@ -627,6 +856,14 @@ class AccountApi:
         )
         if not updated:
             return {"ok": False, "error": "账号不存在"}
+        if updated.get("account_type") == "Google":
+            try:
+                reset_rejected_login_session(
+                    self.data_dir, int(account_id), clear_unauth_cookies=False
+                )
+            except Exception:
+                pass
+        self._notify_hud_account(updated)
         return {"ok": True, "account": updated}
 
     def sync_google_time(self, proxy_url: str = "") -> dict:
@@ -663,6 +900,7 @@ class AccountApi:
             "rt_status": "active",
         }
         updated = self.db.update_account(int(account_id), {"custom_fields": cf_patch})
+        self._notify_hud_account(updated)
         return {"ok": True, "account": updated}
 
     def batch_import_rt_json(self, raw_text: str) -> dict:
@@ -770,6 +1008,7 @@ class AccountApi:
         if res.get("antigravity_tier") in ("蓝色Pro", "金色Pro"):
             update_payload["antigravity_tier"] = res["antigravity_tier"]
         updated = self.db.update_account(int(account_id), update_payload)
+        self._notify_hud_account(updated)
         return {**res, "account": updated}
 
     def batch_probe_gcp_rt(self, account_ids: list[int] | None = None) -> dict:
@@ -807,7 +1046,8 @@ class AccountApi:
             up: dict = {"custom_fields": cf_patch}
             if res.get("antigravity_tier") in ("蓝色Pro", "金色Pro"):
                 up["antigravity_tier"] = res["antigravity_tier"]
-            self.db.update_account(acc["id"], up)
+            updated = self.db.update_account(acc["id"], up)
+            self._notify_hud_account(updated)
             if res.get("rt_status") == "active":
                 active_cnt += 1
             results.append({"id": acc["id"], "account": acc["account"], **res})
@@ -828,17 +1068,28 @@ class AccountApi:
         acc = self.db.get_account(int(account_id))
         if not acc:
             return {"ok": False, "error": "账号不存在"}
+        if acc.get("account_type") != "Google":
+            return {"ok": False, "error": "请选择一个 Google 账号"}
         proxy = str((acc.get("fp_config") or {}).get("proxy") or "").strip()
+        settings = self._ensure_settings()
+        env_cfg = resolve_browser_env_config(
+            acc,
+            default_lang=settings.get("default_browser_lang", "match_region"),
+        )
+        profile_dir = self.data_dir / "browsers" / f"acc_{int(account_id)}"
         sess = self._oauth.start_session(
             account_id=int(account_id),
             login_hint=acc.get("account", ""),
             proxy_url=proxy,
+            hl=env_cfg.get("lang") or "zh-CN",
+            preempt=True,
+            is_profile_alive=(lambda: _profile_has_active_lock(profile_dir)) if launch_isolated else None,
         )
         if launch_isolated and sess.get("ok"):
             launch_res = self.launch_browser(
                 int(account_id),
                 target_url=sess["auth_url"],
-                pure_native=bool(pure_native),
+                pure_native=True,
             )
             sess["browser_launch"] = launch_res
         return sess
@@ -865,7 +1116,101 @@ class AccountApi:
         return {**res, "account": updated}
 
     def reset_rejected_session(self, account_id: int) -> dict:
+        account = self.db.get_account(int(account_id))
+        if not account:
+            return {"ok": False, "error": "账号不存在"}
         return reset_rejected_login_session(self.data_dir, int(account_id))
+
+    def probe_live_validation(self, account_id: int) -> dict:
+        acc = self.db.get_account(int(account_id))
+        if not acc:
+            return {"ok": False, "error": "账号不存在"}
+        proxy = str((acc.get("fp_config") or {}).get("proxy") or "").strip()
+        return probe_live_validation_challenge(acc, proxy_url=proxy)
+
+    def clear_antigravity_cache(self) -> dict:
+        return clear_antigravity_session_cache()
+
+    def get_url_interception_status(self) -> dict:
+        return {
+            "ok": True,
+            "enabled": is_windows_url_interception_enabled(),
+        }
+
+    def toggle_url_interception(self, enabled: bool) -> dict:
+        target = bool(enabled)
+        if target:
+            ok = enable_windows_url_interception(base_dir=self.base_dir)
+            actual = is_windows_url_interception_enabled()
+            if ok and actual:
+                self.save_settings({"url_interception_enabled": True})
+            return {
+                "ok": bool(ok and actual),
+                "enabled": actual,
+                "error": "" if (ok and actual) else "开启系统外链接管失败，请检查系统注册表权限。",
+            }
+        ok = disable_windows_url_interception()
+        actual = is_windows_url_interception_enabled()
+        if ok and not actual:
+            self.save_settings({"url_interception_enabled": False})
+        return {
+            "ok": bool(ok and not actual),
+            "enabled": actual,
+            "error": "" if (ok and not actual) else "关闭系统外链接管失败，部分接管注册表项可能仍生效。",
+        }
+
+    def pick_browser_executable(self) -> dict:
+        if sys.platform != "win32":
+            return {"ok": False, "canceled": True, "path": "", "error": "仅支持 Windows 文件选择器"}
+        try:
+            import clr
+
+            clr.AddReference("System.Windows.Forms")
+            from System.Windows.Forms import DialogResult, OpenFileDialog
+
+            dlg = OpenFileDialog()
+            dlg.Title = "选择 Chromium 内核浏览器可执行文件 (chrome.exe / msedge.exe)"
+            dlg.Filter = "浏览器程序 (*.exe)|*.exe|所有文件 (*.*)|*.*"
+            dlg.CheckFileExists = True
+            if dlg.ShowDialog() == DialogResult.OK and dlg.FileName:
+                return {"ok": True, "canceled": False, "path": str(dlg.FileName)}
+            return {"ok": True, "canceled": True, "path": ""}
+        except Exception as exc:
+            return {"ok": False, "canceled": True, "path": "", "error": str(exc)}
+
+    def handle_dispatched_url(self, url: str) -> dict:
+        clean_url = (url or "").strip()
+        if not clean_url:
+            return {"ok": False, "error": "空链接"}
+        if not is_target_auth_url(clean_url):
+            forwarded = forward_to_original_browser(clean_url)
+            return {"ok": forwarded, "forwarded": True, "url": clean_url}
+
+        target_id = None
+        if self._login_tools_panel is not None:
+            try:
+                target_id = self._login_tools_panel.get_active_or_last_account_id()
+            except Exception:
+                target_id = None
+
+        if target_id is None:
+            plat = detect_url_platform(clean_url)
+            all_accs = self.db.list_accounts()
+            picked = (
+                next((a for a in all_accs if a.get("account_type") == plat and a.get("health_status") == "可用"), None)
+                or next((a for a in all_accs if a.get("account_type") == plat), None)
+                or next((a for a in all_accs if a.get("has_rt")), None)
+                or (all_accs[0] if all_accs else None)
+            )
+            if picked:
+                target_id = int(picked["id"])
+
+        if target_id is None:
+            forwarded = forward_to_original_browser(clean_url)
+            return {"ok": forwarded, "forwarded": True, "url": clean_url}
+
+        res = self.launch_browser(target_id, target_url=clean_url, pure_native=True)
+        return {**res, "dispatched_account_id": target_id, "url": clean_url}
 
     def probe_account_proxy_geo(self, account_id: int, auto_apply_tz: bool = True) -> dict:
         acc = self.db.get_account(int(account_id))
@@ -873,15 +1218,13 @@ class AccountApi:
             return {"ok": False, "error": "账号不存在"}
         proxy = str((acc.get("fp_config") or {}).get("proxy") or "").strip()
         res = probe_proxy_geo(proxy)
-        if res.get("ok") and auto_apply_tz and res.get("timezone"):
-            updated = self.db.update_account(
+        if res.get("ok"):
+            updated = self.db.update_account_fp_geo_silent(
                 int(account_id),
-                {
-                    "timezone": res["timezone"],
-                    "locale": res.get("locale", ""),
-                    "accept_languages": res.get("accept_languages", ""),
-                },
+                res,
+                auto_apply_tz=bool(auto_apply_tz),
             )
+            self._notify_hud_account(updated)
             return {**res, "account": updated}
         return res
 

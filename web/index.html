@@ -4,13 +4,13 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>KeyVault · 全平台账号与凭据管家</title>
-  <link rel="stylesheet" href="style.css?v=20261117_1" />
+  <link rel="stylesheet" href="style.css?v=20261118_2" />
 </head>
 <body>
   <div class="app-shell">
     <!-- Sticky Navigation Wrapper: 固定顶部主菜单和次级筛选菜单 -->
     <div class="sticky-nav">
-      <!-- Top Header & Stats Bar: 仅保留 总计、ChatGPT、Google、可用、不可用 5个核心统计 -->
+      <!-- Top Header & Stats Bar -->
       <header class="topbar">
         <div class="brand">
           <div class="brand-logo" title="KeyVault 全平台账号与凭据管家">
@@ -34,7 +34,7 @@
 
         <!-- 顶部第一级状态统计胶囊（总计 · 平台动态下拉 · 可用 · 不可用） -->
         <div class="stats-bar" id="topbar-stats">
-          <div class="stat-pill active" onclick="setFilterType('All'); setHealthFilter('All'); setAntigravityFilter('All'); setDeviceFilter('All');" id="stat-pill-total" title="查看全部账号">
+          <div class="stat-pill active" onclick="resetTopBarFilters()" id="stat-pill-total" title="查看全部账号">
             <span class="stat-label">总计</span>
             <span class="stat-value" id="stat-total">0</span>
           </div>
@@ -60,13 +60,18 @@
             <span class="stat-label">不可用</span>
             <span class="stat-value" id="stat-health-unavailable">0</span>
           </div>
+          <button type="button" class="stat-pill" onclick="setHealthFilter('未核对')" id="stat-pill-unreviewed" aria-pressed="false" title="筛选未核对的 Google 账号" hidden>
+            <span class="stat-dot dot-unavailable"></span>
+            <span class="stat-label">未核对</span>
+            <span class="stat-value" id="stat-health-unreviewed">0</span>
+          </button>
         </div>
 
         <div class="top-actions">
-          <button class="btn btn-secondary" id="btn-rt-oauth" onclick="openRtOAuthModal()" title="Antigravity / GCP RT 诊断与内置 OAuth 抓包授权">
+          <button class="btn btn-secondary" id="btn-rt-oauth" onclick="openRtOAuthModal()" hidden title="Antigravity / GCP RT 诊断与内置 OAuth 抓包授权">
             <span>🛸 RT/OAuth</span>
           </button>
-          <button class="btn btn-secondary" id="btn-appeal" onclick="openAppealModal()" title="Google / GCP 封禁申诉与风控救号通道">
+          <button class="btn btn-secondary" id="btn-appeal" onclick="openAppealModal()" hidden title="Google / GCP 封禁申诉与风控救号通道">
             <span>🏥 申诉救号</span>
           </button>
           <button class="icon-btn" id="btn-settings" onclick="openSettingsModal()" title="系统常用设置与字典表维护">
@@ -123,6 +128,15 @@
 
           <!-- 动态属性筛选下拉容器 (由 account_attributes 及其平台绑定动态驱动) -->
           <div id="dynamic-filter-attributes-container" class="dynamic-filters-wrap"></div>
+
+          <div class="health-select-wrap">
+            <select id="sort-mode-select" class="health-filter-select" onchange="setSortMode(this.value)" title="按养号活跃度或默认顺序排列">
+              <option value="default">默认排序</option>
+              <option value="warming_stale">🌱 最久未开窗</option>
+              <option value="warming_recent">🕒 最近开窗</option>
+              <option value="warming_count">🔥 开窗次数多</option>
+            </select>
+          </div>
         </div>
 
         <!-- Search Box (Flex 1) -->
@@ -162,6 +176,25 @@
             </button>
           </div>
         </div>
+      </section>
+      <section id="login-tools" class="login-tools" aria-labelledby="login-tools-title" hidden>
+        <div class="login-tool-identity">
+          <strong id="login-tools-title">登录工具</strong>
+          <span id="login-tool-account"></span>
+        </div>
+        <div class="login-tool-code">
+          <span>2FA</span>
+          <strong id="login-tool-totp">—</strong>
+          <span id="login-tool-totp-time"></span>
+        </div>
+        <div class="login-tool-actions">
+          <button type="button" class="copy-btn" onclick="copyLoginToolValue(this, 'account')">复制账号</button>
+          <button type="button" class="copy-btn" id="login-tool-copy-password" onclick="copyLoginToolValue(this, 'password')">复制密码</button>
+          <button type="button" class="copy-btn" id="login-tool-copy-totp" onclick="copyLoginToolValue(this, 'totp')">复制验证码</button>
+          <button type="button" class="btn btn-ghost btn-xs" onclick="showFloatingLoginTools()">贴到浏览器</button>
+          <button type="button" class="btn btn-ghost btn-xs" onclick="openQuickCredModal(state.loginToolsAccountId)">养护</button>
+        </div>
+        <button type="button" class="btn btn-ghost btn-xs" onclick="closeLoginTools()" aria-label="关闭 登录工具">关闭</button>
       </section>
     </div><!-- /.sticky-nav -->
 
@@ -449,6 +482,11 @@
             </div>
           </div>
 
+          <section id="account-edit-history" class="account-edit-history" aria-labelledby="account-edit-history-title" hidden>
+            <h3 id="account-edit-history-title">变更历史</h3>
+            <div id="account-edit-history-list" class="account-edit-history-list"></div>
+          </section>
+
           <div class="modal-footer">
             <button type="button" class="btn btn-ghost" onclick="closeAccountModal()">取消</button>
             <button type="submit" class="btn btn-primary" id="btn-save-account">保存账号</button>
@@ -709,6 +747,87 @@
           <div class="settings-section" style="margin-top: 14px;">
             <div class="settings-section-head">
               <span class="sec-dot dot-blue"></span>
+              <h3 class="settings-section-title">🛡️ 独立养号浏览器与防风控引擎</h3>
+            </div>
+            <div class="form-grid-2">
+              <div class="form-group">
+                <label for="set-browser-engine">浏览器工具栏与防风控模式（非 Google 平台）</label>
+                <div class="settings-select-wrap">
+                  <select id="set-browser-engine" class="settings-select">
+                    <option value="inpage_edge">🌐 网页内顶部停靠栏 · Edge 免 CDP（推荐 · 全屏可见/零调试端口）</option>
+                    <option value="inpage_chrome_cdp">🌐 网页内顶部停靠栏 · Chrome 静默 CDP（沿用 Chrome Cookie）</option>
+                    <option value="pure_native">🛡️ 外部悬浮领航栏 · PurpleShield 纯原生零注入（零扩展）</option>
+                  </select>
+                </div>
+              </div>
+              <div class="form-group">
+                <label for="set-preferred-browser">首选浏览器内核</label>
+                <div class="settings-select-wrap">
+                  <select id="set-preferred-browser" class="settings-select" onchange="onPreferredBrowserChange()">
+                    <option value="auto">自动智能选择（Google 优先 Chrome · 其余按引擎模式）</option>
+                    <option value="chrome">强制 Google Chrome</option>
+                    <option value="edge">强制 Microsoft Edge</option>
+                    <option value="custom">自定义可执行文件路径</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+            <div style="font-size:11.5px;color:var(--text-muted);margin-top:6px;line-height:1.45;">
+              🛡️ <strong>Google 账号养护专属策略：</strong>固定使用官方 Chrome 纯 C++ 原生隔离模式（零扩展、零调试端口、零脚本注入，自动清理残留扩展并拉起外部紫盾领航栏），彻底规避人机验证；上方「网页内顶部停靠栏」仅对 ChatGPT / Claude / 域名邮箱生效（点 <code>⊟ 最小</code> 缩胶囊，按 <code>Alt+K</code> 显隐）。
+            </div>
+            <div class="form-group" id="set-custom-browser-group" style="display: none; margin-top: 10px;">
+              <label for="set-custom-browser-path">自定义浏览器路径</label>
+              <div style="display:flex;gap:8px;align-items:center;">
+                <input type="text" id="set-custom-browser-path" class="settings-input" placeholder="C:\Program Files\Google\Chrome\Application\chrome.exe" />
+                <button type="button" class="btn btn-secondary btn-sm" onclick="onClickPickBrowserExe()">浏览...</button>
+              </div>
+            </div>
+            <div class="form-grid-2" style="margin-top: 10px;">
+              <div class="form-group">
+                <label for="set-browser-lang">默认浏览器语言 (Accept-Language)</label>
+                <div class="settings-select-wrap">
+                  <select id="set-browser-lang" class="settings-select">
+                    <option value="match_region">自动匹配代理/注册地区 (推荐)</option>
+                    <option value="en-US">English (US) · en-US</option>
+                    <option value="en-GB">English (UK) · en-GB</option>
+                    <option value="ja-JP">日本語 · ja-JP</option>
+                    <option value="zh-TW">繁體中文 · zh-TW</option>
+                    <option value="zh-CN">简体中文 · zh-CN</option>
+                    <option value="system">跟随宿主机系统语言</option>
+                  </select>
+                </div>
+              </div>
+              <div class="form-group">
+                <label for="set-default-start-url">Google 养号默认启动页</label>
+                <div class="settings-select-wrap">
+                  <select id="set-default-start-url" class="settings-select">
+                    <option value="https://myaccount.google.com/">Google 账号中心 (myaccount · 推荐)</option>
+                    <option value="https://mail.google.com/">Gmail 邮箱 (mail.google.com)</option>
+                    <option value="https://www.google.com/">Google 首页 (www.google.com)</option>
+                    <option value="about:blank">空白页 (about:blank)</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+            <div class="form-grid-2" style="margin-top: 10px;">
+              <div class="form-group" style="display:flex;flex-direction:column;justify-content:center;gap:8px;">
+                <label class="switch-row" title="启动浏览器后后台检测出口 IP，并与宿主机系统时区比对，偏差 >= 1 小时在悬浮栏告警">
+                  <input type="checkbox" id="set-auto-probe-geo" checked />
+                  <span class="switch-slider"></span>
+                  <span class="switch-text">开窗自动检测出口 IP 与时区差告警</span>
+                </label>
+                <label class="switch-row" title="拦截 Antigravity / Claude Code / ChatGPT 外部登录验证链接，防止 Edge 抢跑，直接路由进隔离浏览器">
+                  <input type="checkbox" id="set-url-interception" />
+                  <span class="switch-slider"></span>
+                  <span class="switch-text">🔗 Windows 外链智能接管 (防默认浏览器抢跑)</span>
+                </label>
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-section" style="margin-top: 14px;">
+            <div class="settings-section-head">
+              <span class="sec-dot dot-blue"></span>
               <h3 class="settings-section-title">TOTP 时间校准（防本地时钟偏差）</h3>
             </div>
             <div class="maintenance-bar-row">
@@ -933,12 +1052,30 @@
       <div class="modal-header">
         <div>
           <h2 id="qc-modal-title">🛡️ 账号养护与快捷改密</h2>
-          <p class="modal-subtitle" id="qc-modal-subtitle">四步安全加固清单 · 科学养号周期 · 凭据变更自动归档历史</p>
+          <p class="modal-subtitle" id="qc-modal-subtitle">养护提醒、凭据与变更历史</p>
         </div>
         <button class="modal-close" onclick="closeQuickCredModal()">×</button>
       </div>
       <div class="modal-body">
         <input type="hidden" id="qc-account-id" value="" />
+        <div class="qc-warming-box" id="qc-google-review" hidden>
+          <div class="qc-warming-info">
+            <strong id="qc-google-review-status"></strong>
+            <span class="qc-warming-hint" id="qc-google-review-time"></span>
+          </div>
+          <div class="qc-warming-actions">
+            <button type="button" class="btn btn-secondary btn-xs" onclick="openGoogleSecurityPage()">打开 Google 安全页</button>
+            <select id="qc-google-review-select" class="settings-select" data-native-select aria-label="记录人工核对结果" onchange="onGoogleReviewChange(this)">
+              <option value="">记录核对结果</option>
+              <option value="可用">已确认登录</option>
+              <option value="人机">待验证 · 人机</option>
+              <option value="短信">待验证 · 短信</option>
+              <option value="验证">待验证 · 身份</option>
+              <option value="不可用">不可用</option>
+              <option value="封号">封号</option>
+            </select>
+          </div>
+        </div>
 
         <!-- Warming Cycle Status Bar -->
         <div class="qc-warming-box">
@@ -947,10 +1084,10 @@
             <span class="qc-warming-hint" id="qc-warming-hint">加载中...</span>
           </div>
           <div class="qc-warming-actions">
-            <label class="switch-row" title="针对扫码登录获取的高防号，开启 30 天长养号周期">
+            <label class="switch-row" title="开启 30 天本地复核提醒">
               <input type="checkbox" id="qc-scan-qr-mode" />
               <span class="switch-slider"></span>
-              <span class="switch-text">30天扫码养号</span>
+              <span class="switch-text">扫码账号 · 30 天提醒</span>
             </label>
             <button type="button" class="btn btn-secondary btn-xs" onclick="onClickResetWarming()">
               🔄 从今日重新计时
@@ -959,7 +1096,7 @@
         </div>
 
         <!-- 4-Step Security Hardening Checklist -->
-        <div class="qc-section-title">四步安全加固检查清单（全勾选自动标记为「🔒 安全」）</div>
+        <div class="qc-section-title">安全设置完成记录</div>
         <div class="qc-checklist-grid">
           <label class="qc-check-card">
             <input type="checkbox" id="qc-sec-pwd" />
@@ -984,14 +1121,14 @@
             <div class="form-group">
               <label for="qc-password">
                 登录密码
-                <button type="button" class="btn-link" onclick="onClickQcGenPassword()">🎲 生成16位强密并复制</button>
+                 <button type="button" class="btn-link" id="qc-generate-password" onclick="onClickQcGenPassword()">生成密码</button>
               </label>
               <input type="text" id="qc-password" placeholder="输入新密码（变更将自动归档旧密码）" />
             </div>
             <div class="form-group">
               <label for="qc-secret">
                 2FA 密钥 (Base32)
-                <button type="button" class="btn-link" onclick="onClickQcGenSecret()">🎲 随机新密钥</button>
+                 <button type="button" class="btn-link" id="qc-generate-secret" onclick="onClickQcGenSecret()">随机新密钥</button>
               </label>
               <input type="text" id="qc-secret" oninput="onQcSecretInput(this.value)" placeholder="输入或生成 Base32 密钥" />
               <span class="field-hint" id="qc-totp-preview">实时验证码预览: —</span>
@@ -1026,7 +1163,11 @@
             </div>
           </div>
 
-          <div class="modal-footer">
+           <label class="qc-check-card" id="qc-google-confirm-label" hidden>
+             <input type="checkbox" id="qc-google-confirmed" />
+             <span>我确认上述变更已在 Google 生效</span>
+           </label>
+           <div class="modal-footer">
             <button type="button" class="btn btn-ghost" onclick="closeQuickCredModal()">取消</button>
             <button type="submit" class="btn btn-primary">💾 保存并归档变更</button>
           </div>
@@ -1057,8 +1198,11 @@
             <button type="button" class="btn btn-secondary btn-sm" onclick="onClickProbeProxyGeo()" title="检测当前绑定代理出口归属地并匹配时区">
               🌍 检测代理出口/同步时区
             </button>
-            <button type="button" class="btn btn-secondary btn-sm" onclick="onClickResetRejectedSession()" title="清理被 Google 拒绝登录会话残留锁与 DevToolsActivePort">
-              🧹 重置被拒会话
+            <button type="button" class="btn btn-secondary btn-sm" onclick="onClickProbeLiveValidation()" title="拉取本号实时 Google Verify 验证直链并在隔离浏览器打开">
+              🔐 拉取实时 Verify
+            </button>
+            <button type="button" class="btn btn-secondary btn-sm" onclick="onClickResetRejectedSession()" title="清理当前账号残留调试端口与未认证被拒缓存">
+              🧹 清理异常会话
             </button>
           </div>
         </div>
@@ -1068,16 +1212,11 @@
         <!-- OAuth 2.0 + PKCE Loopback -->
         <div class="rt-box">
           <div class="rt-box-head">
-            <strong>🔐 1. 内置 OAuth 2.0 PKCE 抓包授权（自动获取并绑定 RT）</strong>
-            <label class="switch-row">
-              <input type="checkbox" id="rt-oauth-pure-native" checked />
-              <span class="switch-slider"></span>
-              <span class="switch-text">纯净无扩展启动（防风控推荐）</span>
-            </label>
+            <strong>OAuth 2.0 授权</strong>
           </div>
           <div class="rt-btn-row">
             <button type="button" class="btn btn-primary btn-sm" onclick="onClickStartBuiltinOAuth()">
-              🚀 在隔离浏览器启动 OAuth 授权
+              在浏览器打开授权页
             </button>
             <button type="button" class="btn btn-ghost btn-sm" id="btn-cancel-oauth" style="display:none;" onclick="onClickCancelBuiltinOAuth()">
               ⏹ 取消监听
@@ -1086,7 +1225,7 @@
               📋 复制授权 URL
             </button>
           </div>
-          <div id="oauth-loopback-status" class="oauth-status-line">待启动：点击上方按钮将开启本地 127.0.0.1 回调服务并用账号专属代理拉起授权页</div>
+          <div id="oauth-loopback-status" class="oauth-status-line">请在浏览器中完成 Google 授权。</div>
         </div>
 
         <!-- RT JSON Import/Inspect/Inject/Probe -->
@@ -1130,8 +1269,8 @@
       </div>
       <div class="modal-body">
         <div class="form-group" style="margin-bottom: 12px;">
-          <label for="appeal-account-select">指定使用哪个账号的代理与指纹环境打开申诉页</label>
-          <select id="appeal-account-select" class="settings-select" onchange="renderAppealValidationBanner()">
+          <label for="appeal-account-select">选择需救号的异常 / 不可用 Google 账号</label>
+          <select id="appeal-account-select" class="settings-select" onchange="renderAppealValidationBanner(); renderAppealChannelsList()">
             <!-- populated dynamically -->
           </select>
         </div>
@@ -1143,7 +1282,7 @@
     </div>
   </div>
 
-  <script src="app.js?v=20261117_1"></script>
-  <script src="workbuddy.js?v=20261117_1"></script>
+  <script src="app.js?v=20261118_8"></script>
+  <script src="workbuddy.js?v=20261118_2"></script>
 </body>
 </html>

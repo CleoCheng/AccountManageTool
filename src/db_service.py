@@ -1,9 +1,11 @@
 import re
 import shutil
+import threading
 import time
+from collections import Counter
 from collections.abc import Iterator
 from contextlib import closing, contextmanager
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 import json
 import sqlite3
 from pathlib import Path
@@ -19,6 +21,23 @@ from src.totp_service import (
 
 
 VALID_HEALTH_STATUSES = ["可用", "不可用", "封号", "人机", "短信", "验证"]
+AVAILABILITY_STATES = ("可用", "不可用", "未核对")
+HEALTH_CHALLENGES = ("人机", "短信", "验证")
+MAILBOX_REGISTRATION_STATES = ("未完成", "进行中", "已完成")
+ACCOUNT_EDIT_FIELDS = {
+    "account_type": "账号类型", "health_status": "可用状态", "antigravity_tier": "Pro 选项",
+    "device_tag": "设备标记", "account": "账号", "password": "登录密码",
+    "password_modified": "密码已改", "recovery_email": "辅助邮箱", "secret_key": "2FA 密钥",
+    "initial_secret_key": "初始 2FA 密钥", "twofa_modified": "2FA 已改", "purchase_date": "购买日期",
+    "deactivated_date": "停用日期", "reg_year": "注册年份", "reg_region": "注册地区", "note": "备注",
+}
+ACCOUNT_CUSTOM_EDIT_FIELDS = {
+    "recovery_password": "辅助邮箱密码", "api_key": "API Key", "session_token": "Session Token",
+    "wb_reg_status": "WorkBuddy 注册状态", "chatgpt_bound": "是否绑定 ChatGPT",
+    "sec_recovery_modified": "已更换辅助邮箱", "sec_devices_cleared": "已清理旧登录设备",
+    "scan_qr_mode": "30 天复核提醒", "warming_reset_at": "复核提醒起始日",
+}
+SENSITIVE_HISTORY_FIELD = re.compile(r"password|secret|token|api[_-]?key|credential|proxy|密码|密钥|令牌", re.I)
 VALID_ANTIGRAVITY_TIERS = ["无", "蓝色Pro", "金色Pro", "蓝色背景色Pro", "金色背景色Pro"]
 VALID_DEVICE_TAGS = ["主机", "iPhone", "Pad"]
 
@@ -134,6 +153,33 @@ def normalize_gmail_address(email: str) -> str:
     return f"{local}@{domain}"
 
 
+def _decode_custom_fields(raw: str | None) -> dict:
+    try:
+        fields = json.loads(raw) if raw else {}
+    except (TypeError, ValueError):
+        return {}
+    return fields if isinstance(fields, dict) else {}
+
+
+def _account_availability(account_type: str, health_status: str, deactivated_date: str, reviewed: bool) -> str:
+    if deactivated_date or health_status != "可用":
+        return "不可用"
+    if account_type == "Google" and not reviewed:
+        return "未核对"
+    return "可用"
+
+
+def matches_health_filter(account: dict, status: str) -> bool:
+    if status in AVAILABILITY_STATES:
+        return account["availability"] == status
+    return status in ("", "All", account["health_status"])
+
+
+def _validate_changed_totp(secret_key: str, previous_key: str = "") -> None:
+    if secret_key and secret_key != previous_key and not generate_totp(secret_key, at_time=0)["valid"]:
+        raise ValueError("2FA 密钥格式无效，请填写 Base32 密钥或验证器设置链接。")
+
+
 def compute_security_info(
     password_modified: int | bool,
     twofa_modified: int | bool,
@@ -174,6 +220,8 @@ def compute_warming_info(
     health_status: str,
     custom_fields: dict,
     today_dt: date | None = None,
+    *,
+    google_account: bool = False,
 ) -> dict:
     cf = custom_fields if isinstance(custom_fields, dict) else {}
     today = today_dt or date.today()
@@ -184,13 +232,13 @@ def compute_warming_info(
         anchor_raw = str(created_at).strip()[:10]
     anchor_dt = _parse_date(anchor_raw) or today
     elapsed = max((today - anchor_dt).days, 0)
-    is_risk = (health_status or "").strip() in ("人机", "短信", "验证")
+    status = (health_status or "").strip()
+    is_risk = status in HEALTH_CHALLENGES
     is_scan_qr = bool(cf.get("scan_qr_mode"))
-
+    target_days = 30 if is_scan_qr and not is_risk else 7
+    remaining = max(target_days - elapsed, 0)
+    ready = remaining == 0
     if is_risk:
-        target_days = 7
-        remaining = max(target_days - elapsed, 0)
-        ready = elapsed >= target_days
         phase = "rewarm_ready" if ready else "rewarm"
         label = "风控静默已满" if ready else f"二次养号 {elapsed}/{target_days}天"
         hint = (
@@ -199,9 +247,6 @@ def compute_warming_info(
             else f"触发风控后需静默 {target_days} 天再试（还差 {remaining} 天）"
         )
     elif is_scan_qr:
-        target_days = 30
-        remaining = max(target_days - elapsed, 0)
-        ready = elapsed >= target_days
         phase = "scan_qr_ready" if ready else "scan_qr"
         label = "扫码期已满" if ready else f"扫码养号 {elapsed}/{target_days}天"
         hint = (
@@ -210,9 +255,6 @@ def compute_warming_info(
             else f"扫码防风控养号第 {elapsed}/{target_days} 天（还差 {remaining} 天）"
         )
     else:
-        target_days = 7
-        remaining = max(target_days - elapsed, 0)
-        ready = elapsed >= target_days
         phase = "ready" if ready else "warming"
         label = "可改密" if ready else f"养号 {elapsed}/{target_days}天"
         hint = (
@@ -220,6 +262,14 @@ def compute_warming_info(
             if ready
             else f"新号第 {elapsed}/{target_days} 天养号期，建议第7天后再改密（还差 {remaining} 天）"
         )
+
+    if google_account:
+        label = "待复核" if ready else f"复核提醒 {elapsed}/{target_days}天"
+        hint = "本地复核提醒已到期" if ready else f"距本地复核提醒还剩 {remaining} 天"
+        if is_risk:
+            label = f"待验证（{status}）"
+        elif status in ("不可用", "封号"):
+            label = status
 
     return {
         "phase": phase,
@@ -281,18 +331,26 @@ class DatabaseService:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.totp_offset_seconds = 0
+        self._write_lock = threading.RLock()
         self._init_db()
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+        with closing(sqlite3.connect(self.db_path, timeout=30.0)) as conn, conn:
             conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA busy_timeout=15000;")
             conn.execute("PRAGMA synchronous=NORMAL;")
             yield conn
 
+    @contextmanager
+    def _write_tx(self) -> Iterator[sqlite3.Connection]:
+        with self._write_lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            yield conn
+
     def _init_db(self) -> None:
-        with self._connect() as conn:
+        with self._write_lock, self._connect() as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS accounts (
@@ -428,6 +486,22 @@ class DatabaseService:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_cred_hist_account ON credential_history(account_id, id DESC);"
             )
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS account_change_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id INTEGER NOT NULL,
+                    field TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    old_value TEXT NOT NULL,
+                    new_value TEXT NOT NULL,
+                    sensitive INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_account_change_history
+                ON account_change_history(account_id, created_at DESC, id DESC)
+            """)
 
             # Backfill permanent paired fingerprint config for any account missing it
             rows = conn.execute(
@@ -486,18 +560,16 @@ class DatabaseService:
         item["totp"] = generate_totp(item["secret_key"], offset_seconds=eff_offset)
         item["usage"] = compute_usage_info(item["purchase_date"], item["deactivated_date"])
 
-        raw_cf = item.get("custom_fields_json") or "{}"
-        try:
-            item["custom_fields"] = json.loads(raw_cf) if isinstance(raw_cf, str) else (raw_cf or {})
-        except Exception:
-            item["custom_fields"] = {}
-        if not isinstance(item["custom_fields"], dict):
-            item["custom_fields"] = {}
+        item["custom_fields"] = _decode_custom_fields(item.get("custom_fields_json"))
         if item.get("account_type") == "域名邮箱":
-            if item["custom_fields"].get("wb_reg_status") not in ("已完成", "进行中", "未完成"):
+            if item["custom_fields"].get("wb_reg_status") not in MAILBOX_REGISTRATION_STATES:
                 item["custom_fields"]["wb_reg_status"] = "未完成"
+            item["custom_fields"]["chatgpt_bound"] = item["custom_fields"].get("chatgpt_bound") is True
 
         cf = item["custom_fields"]
+        item["availability"] = _account_availability(
+            item["account_type"], item["health_status"], item["deactivated_date"], bool(cf.get("google_reviewed_at"))
+        )
         item["sec_recovery_modified"] = 1 if cf.get("sec_recovery_modified") else 0
         item["sec_devices_cleared"] = 1 if cf.get("sec_devices_cleared") else 0
         item["recovery_password"] = str(cf.get("recovery_password") or "")
@@ -505,8 +577,16 @@ class DatabaseService:
         item["security"] = compute_security_info(
             item["password_modified"], item["twofa_modified"], cf, item["recovery_email"]
         )
+        is_google = item.get("account_type") == "Google"
+        if is_google:
+            security = item["security"]
+            security["label"] = f"养护清单 {security['completed']}/{security['total']}"
         item["warming"] = compute_warming_info(
-            str(item.get("created_at") or ""), item["purchase_date"], item["health_status"], cf
+            str(item.get("created_at") or ""),
+            item["purchase_date"],
+            item["health_status"],
+            cf,
+            google_account=is_google,
         )
         item["has_rt"] = bool(cf.get("rt_json") or cf.get("rt_refresh_token"))
         item["rt_status"] = str(cf.get("rt_status") or ("active" if item["has_rt"] else "none"))
@@ -521,6 +601,11 @@ class DatabaseService:
             else ("****" if item["api_key"] else "")
         )
         item["has_ai_cred"] = bool(cf.get("api_key") or cf.get("session_token"))
+        item["browser_last_opened_at"] = str(cf.get("browser_last_opened_at") or "")
+        try:
+            item["browser_open_count"] = int(cf.get("browser_open_count") or 0)
+        except (TypeError, ValueError):
+            item["browser_open_count"] = 0
 
         raw_fp = item.get("fp_config_json") or ""
         try:
@@ -532,7 +617,7 @@ class DatabaseService:
         fp_cfg.setdefault("proxy", "")
         fp_cfg.setdefault("proxy_node", "")
         fp_cfg.setdefault("node_locked", False)
-        for key in ("timezone", "locale", "accept_languages"):
+        for key in ("timezone", "locale", "accept_languages", "browser_lang", "last_exit_ip", "exit_country_code"):
             if fp_cfg.get(key) is None:
                 fp_cfg[key] = ""
         item["fp_config"] = fp_cfg
@@ -559,14 +644,6 @@ class DatabaseService:
             query += " AND (deactivated_date IS NULL OR deactivated_date = '')"
         elif status == "deactivated":
             query += " AND (deactivated_date IS NOT NULL AND deactivated_date != '')"
-        if health_status and health_status != "All":
-            if health_status == "可用":
-                query += " AND health_status = '可用' AND (deactivated_date IS NULL OR deactivated_date = '')"
-            elif health_status == "不可用":
-                query += " AND (health_status != '可用' OR (deactivated_date IS NOT NULL AND deactivated_date != ''))"
-            else:
-                query += " AND health_status = ?"
-                params.append(health_status)
         if antigravity_tier and antigravity_tier != "All":
             if antigravity_tier in ("蓝色Pro", "蓝色背景色Pro", "蓝Pro"):
                 query += " AND (antigravity_tier = '蓝色Pro' OR antigravity_tier = '蓝色背景色Pro' OR antigravity_tier = '蓝Pro')"
@@ -575,19 +652,21 @@ class DatabaseService:
             else:
                 query += " AND (antigravity_tier = '无' OR antigravity_tier IS NULL OR antigravity_tier = '')"
         if search and search.strip():
-            kw = f"%{search.strip()}%"
+            escaped = search.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            kw = f"%{escaped}%"
             query += (
-                " AND (account LIKE ? OR recovery_email LIKE ? OR reg_region LIKE ? "
-                "OR reg_year LIKE ? OR note LIKE ? OR purchase_date LIKE ? OR deactivated_date LIKE ? "
-                "OR health_status LIKE ? OR antigravity_tier LIKE ? OR device_tag LIKE ? OR account_type LIKE ? "
-                "OR custom_fields_json LIKE ?)"
+                " AND (account LIKE ? ESCAPE '\\' OR recovery_email LIKE ? ESCAPE '\\' OR reg_region LIKE ? ESCAPE '\\' "
+                "OR reg_year LIKE ? ESCAPE '\\' OR note LIKE ? ESCAPE '\\' OR purchase_date LIKE ? ESCAPE '\\' OR deactivated_date LIKE ? ESCAPE '\\' "
+                "OR health_status LIKE ? ESCAPE '\\' OR antigravity_tier LIKE ? ESCAPE '\\' OR device_tag LIKE ? ESCAPE '\\' OR account_type LIKE ? ESCAPE '\\' "
+                "OR custom_fields_json LIKE ? ESCAPE '\\')"
             )
-            params.extend([kw, kw, kw, kw, kw, kw, kw, kw, kw, kw, kw, kw])
+            params.extend([kw] * 12)
         query += " ORDER BY id ASC"
 
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
-        return [self._enrich_row(r) for r in rows]
+        accounts = [self._enrich_row(row) for row in rows]
+        return [account for account in accounts if matches_health_filter(account, health_status)]
 
     def get_account(self, account_id: int) -> dict | None:
         with self._connect() as conn:
@@ -617,7 +696,7 @@ class DatabaseService:
         secret_key = normalize_secret(data.get("secret_key") or "")
         initial_secret_key = normalize_secret(data.get("initial_secret_key") or "")
         twofa_modified = 1 if data.get("twofa_modified") in (1, True, "1", "true") else 0
-        if initial_secret_key and secret_key and initial_secret_key != secret_key:
+        if account_type != "Google" and initial_secret_key and secret_key and initial_secret_key != secret_key:
             twofa_modified = 1
         purchase_date = normalize_date_str(data.get("purchase_date") or "")
         deactivated_date = normalize_date_str(data.get("deactivated_date") or "")
@@ -635,8 +714,12 @@ class DatabaseService:
                 cf_dict = {}
         else:
             cf_dict = {}
-        if account_type == "域名邮箱" and cf_dict.get("wb_reg_status") not in ("已完成", "未完成"):
-            cf_dict["wb_reg_status"] = "未完成"
+        if account_type == "域名邮箱":
+            if cf_dict.get("wb_reg_status") not in MAILBOX_REGISTRATION_STATES:
+                cf_dict["wb_reg_status"] = "未完成"
+            if cf_dict["wb_reg_status"] == "已完成":
+                cf_dict.pop("wb_reg_step", None)
+                cf_dict.pop("wb_reg_step_label", None)
         custom_fields_json = json.dumps(cf_dict, ensure_ascii=False)
         return (
             account_type,
@@ -708,39 +791,48 @@ class DatabaseService:
         )
         return True
 
-    def add_account(self, data: dict) -> dict:
+    def _insert_account_in_tx(
+        self, conn: sqlite3.Connection, data: dict, *, validate_totp: bool = False
+    ) -> dict:
         prepared_input = dict(data)
         cf_dict = self._merge_maintenance_cf(prepared_input)
-        if cf_dict:
-            prepared_input["custom_fields"] = cf_dict
+        cf_dict.pop("google_reviewed_at", None)
+        prepared_input["custom_fields"] = cf_dict
         fields = self._prepare_fields(prepared_input)
+        if validate_totp and fields[0] == "Google":
+            _validate_changed_totp(fields[8])
         proxy = (data.get("proxy") or "").strip()
-        with self._connect() as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO accounts (
-                    account_type, health_status, antigravity_tier, device_tag, account, password, password_modified, recovery_email,
-                    secret_key, initial_secret_key, twofa_modified,
-                    purchase_date, deactivated_date, reg_year, reg_region, note, custom_fields_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                fields,
-            )
-            new_id = cur.lastrowid
-            fp = generate_fingerprint_config(
-                new_id,
-                fields[4],
-                proxy=proxy,
-                timezone=str(data.get("timezone") or "").strip(),
-                locale=str(data.get("locale") or "").strip(),
-                accept_languages=str(data.get("accept_languages") or "").strip(),
-            )
-            conn.execute(
-                "UPDATE accounts SET fp_config_json = ? WHERE id = ?",
-                (json.dumps(fp, ensure_ascii=False), new_id),
-            )
-            row = conn.execute("SELECT * FROM accounts WHERE id = ?", (new_id,)).fetchone()
+        cur = conn.execute(
+            """
+            INSERT INTO accounts (
+                account_type, health_status, antigravity_tier, device_tag, account, password, password_modified, recovery_email,
+                secret_key, initial_secret_key, twofa_modified,
+                purchase_date, deactivated_date, reg_year, reg_region, note, custom_fields_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            fields,
+        )
+        new_id = cur.lastrowid
+        fp = generate_fingerprint_config(
+            new_id,
+            fields[4],
+            proxy=proxy,
+            proxy_node=str(data.get("proxy_node") or "").strip(),
+            node_locked=bool(data.get("node_locked", False)),
+            timezone=str(data.get("timezone") or "").strip(),
+            locale=str(data.get("locale") or "").strip(),
+            accept_languages=str(data.get("accept_languages") or "").strip(),
+        )
+        conn.execute(
+            "UPDATE accounts SET fp_config_json = ? WHERE id = ?",
+            (json.dumps(fp, ensure_ascii=False), new_id),
+        )
+        row = conn.execute("SELECT * FROM accounts WHERE id = ?", (new_id,)).fetchone()
         return self._enrich_row(row)
+
+    def add_account(self, data: dict, *, validate_totp: bool = False) -> dict:
+        with self._write_tx() as conn:
+            return self._insert_account_in_tx(conn, data, validate_totp=validate_totp)
 
     def batch_add_accounts(self, items: list[dict]) -> int:
         res = self.batch_import_accounts(items, duplicate_strategy="none")
@@ -751,126 +843,138 @@ class DatabaseService:
         if strategy not in ("skip", "fill_empty", "overwrite", "none"):
             strategy = "skip"
 
-        existing_map: dict[tuple[str, str], dict] = {}
-        if strategy != "none":
-            for acc in self.list_accounts():
-                atype = (acc.get("account_type") or "").strip().lower()
-                email_key = (
-                    normalize_gmail_address(acc.get("account") or "")
-                    if atype == "google"
-                    else (acc.get("account") or "").strip().lower()
-                )
-                if email_key:
-                    existing_map[(atype, email_key)] = acc
-
         imported = 0
         updated = 0
         skipped = 0
-        for data in items:
-            account = (data.get("account") or "").strip()
-            if not account:
-                continue
-            atype = (data.get("account_type") or "ChatGPT").strip().lower()
-            email_key = normalize_gmail_address(account) if atype == "google" else account.lower()
-            dup = existing_map.get((atype, email_key)) if strategy != "none" else None
+        with self._write_tx() as conn:
+            existing_map: dict[tuple[str, str], dict] = {}
+            if strategy != "none":
+                for row in conn.execute("SELECT * FROM accounts ORDER BY id ASC").fetchall():
+                    acc = self._enrich_row(row)
+                    atype = (acc.get("account_type") or "").strip().lower()
+                    email_key = (
+                        normalize_gmail_address(acc.get("account") or "")
+                        if atype == "google"
+                        else (acc.get("account") or "").strip().lower()
+                    )
+                    if email_key:
+                        existing_map[(atype, email_key)] = acc
 
-            if dup is not None:
-                if strategy == "skip":
-                    skipped += 1
+            for data in items:
+                account = (data.get("account") or "").strip()
+                if not account:
                     continue
-                if strategy == "fill_empty":
-                    patch: dict = {}
-                    for col in ("password", "recovery_email", "secret_key", "initial_secret_key",
-                                "purchase_date", "deactivated_date", "reg_year", "reg_region", "note"):
-                        new_val = str(data.get(col) or "").strip()
-                        old_val = str(dup.get(col) or "").strip()
-                        if new_val and not old_val:
-                            patch[col] = new_val
-                    fp_old = dup.get("fp_config") or {}
-                    for fkey in ("proxy", "timezone", "locale", "accept_languages"):
-                        new_fval = str(data.get(fkey) or "").strip()
-                        old_fval = str(fp_old.get(fkey) or "").strip()
-                        if new_fval and not old_fval:
-                            patch[fkey] = new_fval
-                    cf_in = self._merge_maintenance_cf(data)
-                    cf_old = dup.get("custom_fields") or {}
-                    cf_patch = {}
-                    for ck, cv in cf_in.items():
-                        if cv not in ("", None, False) and cf_old.get(ck) in ("", None, False):
-                            cf_patch[ck] = cv
-                    if cf_patch:
-                        patch["custom_fields"] = cf_patch
-                    if patch:
-                        updated_row = self.update_account(dup["id"], patch)
-                        if updated_row:
-                            existing_map[(atype, email_key)] = updated_row
+                atype = (data.get("account_type") or "ChatGPT").strip().lower()
+                email_key = normalize_gmail_address(account) if atype == "google" else account.lower()
+                dup = existing_map.get((atype, email_key)) if strategy != "none" else None
+
+                if dup is not None:
+                    if strategy == "skip":
+                        skipped += 1
+                        continue
+                    if strategy == "fill_empty":
+                        patch: dict = {}
+                        for col in ("password", "recovery_email", "secret_key", "initial_secret_key",
+                                    "purchase_date", "deactivated_date", "reg_year", "reg_region", "note"):
+                            new_val = str(data.get(col) or "").strip()
+                            old_val = str(dup.get(col) or "").strip()
+                            if new_val and not old_val:
+                                patch[col] = new_val
+                        fp_old = dup.get("fp_config") or {}
+                        for fkey in ("proxy", "timezone", "locale", "accept_languages"):
+                            new_fval = str(data.get(fkey) or "").strip()
+                            old_fval = str(fp_old.get(fkey) or "").strip()
+                            if new_fval and not old_fval:
+                                patch[fkey] = new_fval
+                        cf_in = self._merge_maintenance_cf(data)
+                        cf_old = dup.get("custom_fields") or {}
+                        cf_patch = {}
+                        for ck, cv in cf_in.items():
+                            if cv not in ("", None, False) and cf_old.get(ck) in ("", None, False):
+                                cf_patch[ck] = cv
+                        if cf_patch:
+                            patch["custom_fields"] = cf_patch
+                        if patch:
+                            upd_row = self._update_account(conn, dup, patch)
+                            existing_map[(atype, email_key)] = self._enrich_row(upd_row)
                             updated += 1
                         else:
                             skipped += 1
-                    else:
-                        skipped += 1
-                    continue
-                if strategy == "overwrite":
-                    patch = {}
-                    for col in ("health_status", "antigravity_tier", "device_tag", "password",
-                                "recovery_email", "secret_key", "initial_secret_key",
-                                "purchase_date", "deactivated_date", "reg_year", "reg_region", "note"):
-                        val = data.get(col)
-                        if val not in (None, ""):
-                            patch[col] = val
-                    for fkey in ("proxy", "timezone", "locale", "accept_languages"):
-                        val = str(data.get(fkey) or "").strip()
-                        if val:
-                            patch[fkey] = val
-                    cf_in = self._merge_maintenance_cf(data)
-                    cf_non_empty = {k: v for k, v in cf_in.items() if v not in ("", None)}
-                    if cf_non_empty:
-                        patch["custom_fields"] = cf_non_empty
-                    if patch:
-                        updated_row = self.update_account(dup["id"], patch)
-                        if updated_row:
-                            existing_map[(atype, email_key)] = updated_row
+                        continue
+                    if strategy == "overwrite":
+                        patch = {}
+                        for col in ("health_status", "antigravity_tier", "device_tag", "password",
+                                    "recovery_email", "secret_key", "initial_secret_key",
+                                    "purchase_date", "deactivated_date", "reg_year", "reg_region", "note"):
+                            val = data.get(col)
+                            if val not in (None, ""):
+                                patch[col] = val
+                        for fkey in ("proxy", "timezone", "locale", "accept_languages"):
+                            val = str(data.get(fkey) or "").strip()
+                            if val:
+                                patch[fkey] = val
+                        cf_in = self._merge_maintenance_cf(data)
+                        cf_non_empty = {k: v for k, v in cf_in.items() if v not in ("", None)}
+                        if cf_non_empty:
+                            patch["custom_fields"] = cf_non_empty
+                        if patch:
+                            upd_row = self._update_account(conn, dup, patch)
+                            existing_map[(atype, email_key)] = self._enrich_row(upd_row)
                             updated += 1
                         else:
                             skipped += 1
-                    else:
-                        skipped += 1
-                    continue
+                        continue
 
-            created = self.add_account(data)
-            imported += 1
-            if strategy != "none" and email_key:
-                existing_map[(atype, email_key)] = created
+                if atype == "google":
+                    data = {**data, "password_modified": 0, "twofa_modified": 0}
+                created = self._insert_account_in_tx(conn, data)
+                imported += 1
+                if strategy != "none" and email_key:
+                    existing_map[(atype, email_key)] = created
 
         return {"imported": imported, "updated": updated, "skipped": skipped}
 
-    def update_account(self, account_id: int, data: dict) -> dict | None:
-        existing = self.get_account(account_id)
-        if not existing:
-            return None
+    def update_account(self, account_id: int, data: dict, *, validate_totp: bool = False) -> dict | None:
+        with self._write_tx() as conn:
+            row = conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,)).fetchone()
+            if row is None:
+                return None
+            updated = self._update_account(conn, self._enrich_row(row), data, validate_totp=validate_totp)
+        return self._enrich_row(updated)
+
+    def _update_account(
+        self, conn: sqlite3.Connection, existing: dict, data: dict, *, validate_totp: bool = False
+    ) -> sqlite3.Row:
+        account_id = existing["id"]
         merged = dict(existing)
         merged.update(data)
+        is_google = (merged.get("account_type") or "").strip() == "Google"
         cf_dict = self._merge_maintenance_cf(data, existing.get("custom_fields"))
-        if data.get("health_status") in ("人机", "短信", "验证") and existing.get("health_status") != data.get("health_status"):
+        cf_dict.pop("google_reviewed_at", None)
+        reviewed_at = existing["custom_fields"].get("google_reviewed_at")
+        if (
+            is_google
+            and reviewed_at
+            and existing["account_type"] == "Google"
+            and normalize_gmail_address(merged["account"]) == normalize_gmail_address(existing["account"])
+            and merged["health_status"] == existing["health_status"]
+        ):
+            cf_dict["google_reviewed_at"] = reviewed_at
+        if data.get("health_status") in HEALTH_CHALLENGES and existing.get("health_status") != data.get("health_status"):
             has_explicit_reset = (
                 "warming_reset_at" in data
                 or (isinstance(data.get("custom_fields"), dict) and "warming_reset_at" in data["custom_fields"])
             )
             if not has_explicit_reset:
                 cf_dict["warming_reset_at"] = date.today().strftime("%Y-%m-%d")
-        if cf_dict:
-            merged["custom_fields"] = cf_dict
-            merged.pop("custom_fields_json", None)
-        elif "custom_fields_json" in data:
-            merged["custom_fields_json"] = data["custom_fields_json"]
-            merged.pop("custom_fields", None)
+        merged["custom_fields"] = cf_dict
 
-        if "password_modified" not in data:
+        if not is_google and "password_modified" not in data:
             if data.get("password") and existing.get("password") and data["password"].strip() != existing["password"]:
                 merged["password_modified"] = 1
             else:
                 merged["password_modified"] = existing.get("password_modified", 0)
-        if "twofa_modified" not in data:
+        if not is_google and "twofa_modified" not in data:
             new_sk_norm = normalize_secret(data.get("secret_key") or "")
             old_sk_norm = normalize_secret(existing.get("secret_key") or "")
             if new_sk_norm and old_sk_norm and new_sk_norm != old_sk_norm:
@@ -878,7 +982,9 @@ class DatabaseService:
                 if not merged.get("initial_secret_key"):
                     merged["initial_secret_key"] = old_sk_norm
         fields = self._prepare_fields(merged)
-        fp_cfg = existing.get("fp_config") or generate_fingerprint_config(account_id, fields[4])
+        if validate_totp and is_google:
+            _validate_changed_totp(fields[8], existing["secret_key"])
+        fp_cfg = dict(existing.get("fp_config") or generate_fingerprint_config(account_id, fields[4]))
         if not fp_cfg.get("node_locked"):
             if "proxy" in data:
                 fp_cfg["proxy"] = (data.get("proxy") or "").strip()
@@ -894,45 +1000,137 @@ class DatabaseService:
         for key in ("timezone", "locale", "accept_languages"):
             fp_cfg.setdefault(key, "")
 
+        self._record_credential_history(
+            conn,
+            account_id,
+            existing,
+            new_pwd=fields[5],
+            new_rec=fields[7],
+            new_sk=fields[8],
+            new_rpwd=str(cf_dict.get("recovery_password") or ""),
+            reason=str(data.get("_history_reason") or "update"),
+        )
+        conn.execute(
+            """
+            UPDATE accounts SET
+                account_type = ?,
+                health_status = ?,
+                antigravity_tier = ?,
+                device_tag = ?,
+                account = ?,
+                password = ?,
+                password_modified = ?,
+                recovery_email = ?,
+                secret_key = ?,
+                initial_secret_key = ?,
+                twofa_modified = ?,
+                purchase_date = ?,
+                deactivated_date = ?,
+                reg_year = ?,
+                reg_region = ?,
+                note = ?,
+                custom_fields_json = ?,
+                fp_config_json = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (*fields, json.dumps(fp_cfg, ensure_ascii=False), account_id),
+        )
+        updated = conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,)).fetchone()
+        self._record_account_changes(conn, existing, updated)
+        return updated
+
+    def _record_account_changes(self, conn: sqlite3.Connection, previous: dict, updated: sqlite3.Row) -> None:
+        current = self._enrich_row(updated)
+        changes = [
+            (key, label, previous[key], current[key])
+            for key, label in ACCOUNT_EDIT_FIELDS.items()
+            if previous[key] != current[key]
+        ]
+        previous_proxy = previous["fp_config"].get("proxy", "")
+        current_proxy = current["fp_config"].get("proxy", "")
+        if previous_proxy != current_proxy:
+            changes.append(("proxy", "专属代理", previous_proxy, current_proxy))
+
+        before = previous["custom_fields"]
+        after = current["custom_fields"]
+        custom_keys = {key for key in before.keys() | after.keys() if before.get(key, "") != after.get(key, "")}
+        if custom_keys:
+            editable = {
+                row["attr_key"]: row["attr_label"]
+                for row in conn.execute("SELECT attr_key, attr_label FROM account_attributes")
+                if row["attr_key"] not in ACCOUNT_EDIT_FIELDS and row["attr_key"] != "proxy"
+            }
+            editable.update(ACCOUNT_CUSTOM_EDIT_FIELDS)
+            changes.extend(
+                (key, editable[key], before.get(key, ""), after.get(key, ""))
+                for key in sorted(custom_keys & editable.keys())
+            )
+        if changes:
+            created_at = datetime.now(timezone.utc).isoformat()
+            conn.executemany("""
+                INSERT INTO account_change_history
+                    (account_id, field, label, old_value, new_value, sensitive, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, [
+                (
+                    previous["id"], key, label, json.dumps(old, ensure_ascii=False),
+                    json.dumps(new, ensure_ascii=False),
+                    int(key not in ("password_modified", "twofa_modified") and bool(
+                        SENSITIVE_HISTORY_FIELD.search(key) or SENSITIVE_HISTORY_FIELD.search(label)
+                    )),
+                    created_at,
+                )
+                for key, label, old, new in changes
+            ])
+
+    def get_account_change_history(self, account_id: int) -> list[dict]:
         with self._connect() as conn:
-            self._record_credential_history(
-                conn,
-                account_id,
-                existing,
-                new_pwd=fields[5],
-                new_rec=fields[7],
-                new_sk=fields[8],
-                new_rpwd=str(cf_dict.get("recovery_password") or ""),
-                reason=str(data.get("_history_reason") or "update"),
-            )
+            rows = conn.execute("""
+                SELECT id, field, label, old_value, new_value, sensitive, created_at
+                FROM account_change_history WHERE account_id = ?
+                ORDER BY created_at DESC, id DESC
+            """, (int(account_id),)).fetchall()
+        return [
+            {
+                **dict(row),
+                "old_value": json.loads(row["old_value"]),
+                "new_value": json.loads(row["new_value"]),
+                "sensitive": bool(row["sensitive"]),
+            }
+            for row in rows
+        ]
+
+    def set_domain_email_metadata(self, account_id: int, field: str, value: object) -> dict | None:
+        if field == "chatgpt_bound":
+            if type(value) is not bool:
+                raise ValueError("请选择有效的 ChatGPT 绑定状态")
+        elif field == "wb_reg_status":
+            if value not in MAILBOX_REGISTRATION_STATES:
+                raise ValueError("请选择有效的注册状态")
+        else:
+            raise ValueError("不支持的域名邮箱标记")
+        with self._write_tx() as conn:
+            row = conn.execute("SELECT * FROM accounts WHERE id = ?", (int(account_id),)).fetchone()
+            if row is None:
+                return None
+            if row["account_type"] != "域名邮箱":
+                raise ValueError("此标记仅适用于域名邮箱")
+            previous = self._enrich_row(row)
+            if previous["custom_fields"][field] == value:
+                return previous
+            fields = {**previous["custom_fields"], field: value}
+            if field == "wb_reg_status":
+                fields["wb_reg_manually_set"] = True
+                fields.pop("wb_reg_step", None)
+                fields.pop("wb_reg_step_label", None)
             conn.execute(
-                """
-                UPDATE accounts SET
-                    account_type = ?,
-                    health_status = ?,
-                    antigravity_tier = ?,
-                    device_tag = ?,
-                    account = ?,
-                    password = ?,
-                    password_modified = ?,
-                    recovery_email = ?,
-                    secret_key = ?,
-                    initial_secret_key = ?,
-                    twofa_modified = ?,
-                    purchase_date = ?,
-                    deactivated_date = ?,
-                    reg_year = ?,
-                    reg_region = ?,
-                    note = ?,
-                    custom_fields_json = ?,
-                    fp_config_json = ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-                (*fields, json.dumps(fp_cfg, ensure_ascii=False), account_id),
+                "UPDATE accounts SET custom_fields_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (json.dumps(fields, ensure_ascii=False), int(account_id)),
             )
-            row = conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,)).fetchone()
-        return self._enrich_row(row) if row else None
+            updated = conn.execute("SELECT * FROM accounts WHERE id = ?", (int(account_id),)).fetchone()
+            self._record_account_changes(conn, previous, updated)
+        return self._enrich_row(updated)
 
     def bind_account_proxy_node(
         self,
@@ -988,12 +1186,12 @@ class DatabaseService:
         existing = self.get_account(int(account_id))
         if not existing or not isinstance(code_info, dict):
             return existing
-        cf = dict(existing.get("custom_fields") or {})
-        cf["latest_code"] = str(code_info.get("code") or "")
-        cf["code_received_at"] = int(code_info.get("timestamp") or time.time())
-        cf["code_subject"] = str(code_info.get("subject") or "")
-        cf["has_received_code"] = True
-        return self.update_account(int(account_id), {"custom_fields": cf})
+        return self.update_account(int(account_id), {"custom_fields": {
+            "latest_code": str(code_info.get("code") or ""),
+            "code_received_at": int(code_info.get("timestamp") or time.time()),
+            "code_subject": str(code_info.get("subject") or ""),
+            "has_received_code": True,
+        }})
 
     def get_node_code_stats(self) -> dict[str, int]:
         stats: dict[str, int] = {}
@@ -1100,36 +1298,39 @@ class DatabaseService:
         return self._enrich_row(row) if row else None
 
     def set_twofa_modified(self, account_id: int, modified: int | bool) -> dict | None:
-        val = 1 if modified else 0
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            previous = conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,)).fetchone()
+            if previous is None:
+                return None
             conn.execute(
                 "UPDATE accounts SET twofa_modified = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (val, account_id),
+                (int(bool(modified)), account_id),
             )
-            row = conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,)).fetchone()
-        return self._enrich_row(row) if row else None
+            updated = conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,)).fetchone()
+            self._record_account_changes(conn, self._enrich_row(previous), updated)
+        return self._enrich_row(updated)
 
     def set_password_modified(self, account_id: int, modified: int | bool) -> dict | None:
-        val = 1 if modified else 0
-        with self._connect() as conn:
-            conn.execute(
-                "UPDATE accounts SET password_modified = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (val, account_id),
-            )
-            row = conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,)).fetchone()
-        return self._enrich_row(row) if row else None
+        return self.update_account(account_id, {"password_modified": int(bool(modified))})
 
     def set_health_status(self, account_id: int, health_status: str) -> dict | None:
-        status_val = (health_status or "可用").strip()
-        if status_val not in VALID_HEALTH_STATUSES:
-            status_val = "可用"
-        existing = self.get_account(int(account_id))
-        if not existing:
-            return None
-        cf = dict(existing.get("custom_fields") or {})
-        if status_val in ("人机", "短信", "验证") and existing.get("health_status") != status_val:
-            cf["warming_reset_at"] = date.today().strftime("%Y-%m-%d")
-        with self._connect() as conn:
+        status_val = str(health_status or "").strip()
+        with self._write_tx() as conn:
+            row = conn.execute("SELECT * FROM accounts WHERE id = ?", (int(account_id),)).fetchone()
+            if row is None:
+                return None
+            existing = self._enrich_row(row)
+            is_google = existing["account_type"] == "Google"
+            if status_val not in VALID_HEALTH_STATUSES:
+                if is_google:
+                    raise ValueError("请选择有效的 Google 账号核对状态")
+                status_val = "可用"
+            cf = dict(existing["custom_fields"])
+            if is_google:
+                cf["google_reviewed_at"] = datetime.now(timezone.utc).isoformat()
+            if status_val in HEALTH_CHALLENGES and existing["health_status"] != status_val:
+                cf["warming_reset_at"] = date.today().isoformat()
             conn.execute(
                 """
                 UPDATE accounts SET
@@ -1141,33 +1342,14 @@ class DatabaseService:
                 (status_val, json.dumps(cf, ensure_ascii=False), int(account_id)),
             )
             row = conn.execute("SELECT * FROM accounts WHERE id = ?", (int(account_id),)).fetchone()
+            self._record_account_changes(conn, existing, row)
         return self._enrich_row(row) if row else None
 
     def set_antigravity_tier(self, account_id: int, antigravity_tier: str) -> dict | None:
-        tier_val = (antigravity_tier or "无").strip()
-        if tier_val in ("蓝色Pro", "蓝色背景色Pro", "蓝Pro"):
-            tier_val = "蓝色Pro"
-        elif tier_val in ("金色Pro", "金色背景色Pro", "金Pro"):
-            tier_val = "金色Pro"
-        else:
-            tier_val = "无"
-        with self._connect() as conn:
-            conn.execute(
-                "UPDATE accounts SET antigravity_tier = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (tier_val, int(account_id)),
-            )
-            row = conn.execute("SELECT * FROM accounts WHERE id = ?", (int(account_id),)).fetchone()
-        return self._enrich_row(row) if row else None
+        return self.update_account(int(account_id), {"antigravity_tier": antigravity_tier})
 
     def set_device_tag(self, account_id: int, device_tag: str) -> dict | None:
-        tag_val = (device_tag or "主机").strip()
-        with self._connect() as conn:
-            conn.execute(
-                "UPDATE accounts SET device_tag = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (tag_val, int(account_id)),
-            )
-            row = conn.execute("SELECT * FROM accounts WHERE id = ?", (int(account_id),)).fetchone()
-        return self._enrich_row(row) if row else None
+        return self.update_account(int(account_id), {"device_tag": device_tag})
 
     # -------------------------------------------------------------
     # System Dictionaries CRUD
@@ -1199,7 +1381,7 @@ class DatabaseService:
         if not dict_type or not dict_key:
             return {"ok": False, "error": "字典分类和标识键不能为空"}
 
-        with self._connect() as conn:
+        with self._write_tx() as conn:
             existing = conn.execute(
                 "SELECT id FROM system_dicts WHERE dict_type = ? AND dict_key = ?",
                 (dict_type, dict_key),
@@ -1237,7 +1419,7 @@ class DatabaseService:
         return {"ok": True, "dict": dict(row) if row else None}
 
     def delete_system_dict(self, dict_id: int) -> dict:
-        with self._connect() as conn:
+        with self._write_tx() as conn:
             row = conn.execute("SELECT * FROM system_dicts WHERE id = ?", (int(dict_id),)).fetchone()
             if not row:
                 return {"ok": False, "error": "字典项不存在"}
@@ -1267,48 +1449,58 @@ class DatabaseService:
             return {"ok": True}
 
     def delete_account(self, account_id: int) -> bool:
-        with self._connect() as conn:
+        with self._write_tx() as conn:
             cur = conn.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
+            conn.execute("DELETE FROM account_change_history WHERE account_id = ?", (account_id,))
+            conn.execute("DELETE FROM credential_history WHERE account_id = ?", (account_id,))
             return cur.rowcount > 0
 
     def get_stats(self) -> dict:
         with self._connect() as conn:
-            total = conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
-            google = conn.execute("SELECT COUNT(*) FROM accounts WHERE account_type = 'Google'").fetchone()[0]
-            chatgpt = conn.execute("SELECT COUNT(*) FROM accounts WHERE account_type = 'ChatGPT'").fetchone()[0]
-            claude = conn.execute("SELECT COUNT(*) FROM accounts WHERE account_type = 'Claude'").fetchone()[0]
-            available = conn.execute(
-                "SELECT COUNT(*) FROM accounts WHERE health_status = '可用' AND (deactivated_date IS NULL OR deactivated_date = '')"
-            ).fetchone()[0]
-            unavailable = total - available
+            rows = conn.execute("""
+                SELECT account_type, health_status, deactivated_date, device_tag, antigravity_tier,
+                       CASE WHEN account_type = 'Google' THEN custom_fields_json END AS review_fields
+                FROM accounts
+            """).fetchall()
+            total = len(rows)
+            platform_totals = Counter(row["account_type"] for row in rows)
+            device_totals = Counter(row["device_tag"] for row in rows)
+            google, chatgpt, claude = (platform_totals[key] for key in ("Google", "ChatGPT", "Claude"))
+            health_counts = dict.fromkeys((*VALID_HEALTH_STATUSES, "未核对"), 0)
+            ag_none = 0
+            ag_blue = 0
+            ag_gold = 0
+            for row in rows:
+                status = (row["health_status"] or "可用").strip()
+                reviewed = bool(_decode_custom_fields(row["review_fields"]).get("google_reviewed_at"))
+                availability = _account_availability(row["account_type"], status, row["deactivated_date"], reviewed)
+                health_counts[availability] += 1
+                if status in health_counts and status not in AVAILABILITY_STATES:
+                    health_counts[status] += 1
+                tier = row["antigravity_tier"] or ""
+                if tier in ("蓝色Pro", "蓝色背景色Pro", "蓝Pro"):
+                    ag_blue += 1
+                elif tier in ("金色Pro", "金色背景色Pro", "金Pro"):
+                    ag_gold += 1
+                elif tier in ("", "无"):
+                    ag_none += 1
+            available = health_counts["可用"]
+            unavailable = health_counts["不可用"]
 
             # Dynamic account_type counts
             type_counts = {}
             dict_types = conn.execute("SELECT dict_key FROM system_dicts WHERE dict_type = 'account_type' ORDER BY sort_order ASC, id ASC").fetchall()
             for r in dict_types:
                 k = r["dict_key"]
-                type_counts[k] = conn.execute("SELECT COUNT(*) FROM accounts WHERE account_type = ?", (k,)).fetchone()[0]
+                type_counts[k] = platform_totals[k]
 
             # Dynamic device_tag counts
             device_counts = {}
             dict_devices = conn.execute("SELECT dict_key FROM system_dicts WHERE dict_type = 'device_tag' ORDER BY sort_order ASC, id ASC").fetchall()
             for r in dict_devices:
                 k = r["dict_key"]
-                device_counts[k] = conn.execute("SELECT COUNT(*) FROM accounts WHERE device_tag = ?", (k,)).fetchone()[0]
+                device_counts[k] = device_totals[k]
 
-            health_counts = {}
-            for hs in VALID_HEALTH_STATUSES:
-                if hs == "可用":
-                    health_counts[hs] = available
-                elif hs == "不可用":
-                    health_counts[hs] = unavailable
-                else:
-                    cnt = conn.execute("SELECT COUNT(*) FROM accounts WHERE health_status = ?", (hs,)).fetchone()[0]
-                    health_counts[hs] = cnt
-
-            ag_none = conn.execute("SELECT COUNT(*) FROM accounts WHERE antigravity_tier = '无' OR antigravity_tier IS NULL OR antigravity_tier = ''").fetchone()[0]
-            ag_blue = conn.execute("SELECT COUNT(*) FROM accounts WHERE antigravity_tier = '蓝色Pro' OR antigravity_tier = '蓝色背景色Pro' OR antigravity_tier = '蓝Pro'").fetchone()[0]
-            ag_gold = conn.execute("SELECT COUNT(*) FROM accounts WHERE antigravity_tier = '金色Pro' OR antigravity_tier = '金色背景色Pro' OR antigravity_tier = '金Pro'").fetchone()[0]
             antigravity_counts = {
                 "无": ag_none,
                 "蓝色Pro": ag_blue,
@@ -1327,6 +1519,7 @@ class DatabaseService:
             "other": max(0, total - google - chatgpt - claude),
             "available": available,
             "unavailable": unavailable,
+            "unreviewed": health_counts["未核对"],
             "active": available,
             "deactivated": unavailable,
             "health": health_counts,
@@ -1427,7 +1620,7 @@ class DatabaseService:
         if attr_type == "select" and not dict_type:
             dict_type = attr_key
 
-        with self._connect() as conn:
+        with self._write_tx() as conn:
             if attr_id:
                 existing = conn.execute("SELECT * FROM account_attributes WHERE id = ?", (int(attr_id),)).fetchone()
                 if not existing:
@@ -1469,7 +1662,7 @@ class DatabaseService:
         return {"ok": True, "attribute": self.get_attribute(target_id)}
 
     def delete_attribute(self, attr_id: int) -> dict:
-        with self._connect() as conn:
+        with self._write_tx() as conn:
             existing = conn.execute("SELECT * FROM account_attributes WHERE id = ?", (int(attr_id),)).fetchone()
             if not existing:
                 return {"ok": False, "error": "属性不存在"}
@@ -1489,7 +1682,7 @@ class DatabaseService:
         else:
             bound_str = "All"
 
-        with self._connect() as conn:
+        with self._write_tx() as conn:
             existing = conn.execute("SELECT * FROM account_attributes WHERE id = ?", (int(attr_id),)).fetchone()
             if not existing:
                 return {"ok": False, "error": "属性不存在"}
@@ -1505,7 +1698,7 @@ class DatabaseService:
     def batch_import_domain_emails(self, items: list[dict]) -> dict:
         imported = 0
         skipped = 0
-        with self._connect() as conn:
+        with self._write_tx() as conn:
             existing_emails = {
                 (r["account"] or "").strip().casefold()
                 for r in conn.execute(
@@ -1544,30 +1737,30 @@ class DatabaseService:
         return {"imported": imported, "skipped": skipped}
 
     def save_workbuddy_credential(self, account_id: int, credential: dict) -> dict | None:
-        existing = self.get_account(int(account_id))
-        if not existing or not isinstance(credential, dict):
-            return existing
-        cf = dict(existing.get("custom_fields") or {})
-        cf["wb_credential"] = credential
-        if credential.get("uid"):
-            cf["wb_uid"] = str(credential["uid"])
-        updated = self.update_account(int(account_id), {"custom_fields": cf})
-        # Sync linked WorkBuddy record if present
-        if existing.get("account_type") == "域名邮箱":
-            with self._connect() as conn:
+        if not isinstance(credential, dict):
+            return self.get_account(int(account_id))
+        with self._write_tx() as conn:
+            row = conn.execute("SELECT * FROM accounts WHERE id = ?", (int(account_id),)).fetchone()
+            if not row:
+                return None
+            existing = self._enrich_row(row)
+            cf = {"wb_credential": credential}
+            if credential.get("uid"):
+                cf["wb_uid"] = str(credential["uid"])
+            updated_row = self._update_account(conn, existing, {"custom_fields": cf})
+            if existing.get("account_type") == "域名邮箱":
                 wb_row = conn.execute(
-                    "SELECT id FROM accounts WHERE account_type = 'WorkBuddy' AND LOWER(account) = LOWER(?)",
+                    "SELECT * FROM accounts WHERE account_type = 'WorkBuddy' AND LOWER(account) = LOWER(?)",
                     (existing["account"],),
                 ).fetchone()
-            if wb_row:
-                wb_acc = self.get_account(wb_row["id"])
-                if wb_acc:
+                if wb_row:
+                    wb_acc = self._enrich_row(wb_row)
                     wb_cf = dict(wb_acc.get("custom_fields") or {})
                     wb_cf["wb_credential"] = credential
                     if credential.get("uid"):
                         wb_cf["wb_uid"] = str(credential["uid"])
-                    self.update_account(wb_row["id"], {"custom_fields": wb_cf})
-        return updated
+                    self._update_account(conn, wb_acc, {"custom_fields": wb_cf})
+        return self._enrich_row(updated_row)
 
     def update_workbuddy_progress(
         self,
@@ -1581,13 +1774,15 @@ class DatabaseService:
         existing = self.get_account(int(account_id))
         if not existing:
             return None
-        cf = dict(existing.get("custom_fields") or {})
-        if cf.get("wb_reg_status") == "已完成":
+        if existing["custom_fields"].get("wb_reg_status") == "已完成":
             return existing
 
-        cf["wb_reg_status"] = "进行中"
-        cf["wb_reg_step"] = str(step or "")
-        cf["wb_reg_step_label"] = str(step_label or step or "")
+        cf = {
+            "wb_reg_status": "进行中",
+            "wb_reg_manually_set": False,
+            "wb_reg_step": str(step or ""),
+            "wb_reg_step_label": str(step_label or step or ""),
+        }
         if username:
             cf["github_username"] = str(username)
         if proxy_node:
@@ -1609,102 +1804,116 @@ class DatabaseService:
         proxy_url: str = "",
         proxy_node: str = "",
     ) -> dict | None:
-        existing = self.get_account(int(account_id))
-        if not existing:
-            return None
-        cf = dict(existing.get("custom_fields") or {})
-        cf["wb_reg_status"] = "已完成"
-        cf.pop("wb_reg_step", None)
-        cf.pop("wb_reg_step_label", None)
-        cf["github_username"] = username
-        if region:
-            cf["wb_region"] = region
-        if proxy_node:
-            cf["proxy_node"] = proxy_node
-        if isinstance(credential, dict) and credential:
-            cf["wb_credential"] = credential
-            if credential.get("uid"):
-                cf["wb_uid"] = str(credential["uid"])
+        with self._write_tx() as conn:
+            row = conn.execute("SELECT * FROM accounts WHERE id = ?", (int(account_id),)).fetchone()
+            if not row:
+                return None
+            existing = self._enrich_row(row)
+            cf = {
+                "wb_reg_status": "已完成",
+                "wb_reg_manually_set": False,
+                "wb_reg_step": "",
+                "wb_reg_step_label": "",
+                "github_username": username,
+            }
+            if region:
+                cf["wb_region"] = region
+            if proxy_node:
+                cf["proxy_node"] = proxy_node
+            if isinstance(credential, dict) and credential:
+                cf["wb_credential"] = credential
+                if credential.get("uid"):
+                    cf["wb_uid"] = str(credential["uid"])
 
-        upd_payload: dict = {"custom_fields": cf}
-        if region:
-            upd_payload["reg_region"] = region
-        if proxy_url:
-            upd_payload["proxy"] = proxy_url
-        if proxy_node:
-            upd_payload["proxy_node"] = proxy_node
-        updated_mail = self.update_account(int(account_id), upd_payload)
+            upd_payload: dict = {"custom_fields": cf}
+            if region:
+                upd_payload["reg_region"] = region
+            if proxy_url:
+                upd_payload["proxy"] = proxy_url
+            if proxy_node:
+                upd_payload["proxy_node"] = proxy_node
+            updated_mail_row = self._update_account(conn, existing, upd_payload)
+            updated_mail = self._enrich_row(updated_mail_row)
 
-        # Also upsert a paired WorkBuddy account entry so it appears in WorkBuddy platform list
-        wb_cf = {
-            "wb_reg_status": "已完成",
-            "github_username": username,
-            "source_email_id": int(account_id),
-        }
-        if region:
-            wb_cf["wb_region"] = region
-        if proxy_node:
-            wb_cf["proxy_node"] = proxy_node
-        if isinstance(credential, dict) and credential:
-            wb_cf["wb_credential"] = credential
-            if credential.get("uid"):
-                wb_cf["wb_uid"] = str(credential["uid"])
+            # Also upsert a paired WorkBuddy account entry so it appears in WorkBuddy platform list
+            wb_cf = {
+                "wb_reg_status": "已完成",
+                "github_username": username,
+                "source_email_id": int(account_id),
+            }
+            if region:
+                wb_cf["wb_region"] = region
+            if proxy_node:
+                wb_cf["proxy_node"] = proxy_node
+            if isinstance(credential, dict) and credential:
+                wb_cf["wb_credential"] = credential
+                if credential.get("uid"):
+                    wb_cf["wb_uid"] = str(credential["uid"])
 
-        note_parts = [f"GitHub: {username}"]
-        if isinstance(credential, dict) and credential.get("uid"):
-            note_parts.append(f"UID: {credential['uid']}")
-        if proxy_node:
-            note_parts.append(f"节点: {proxy_node}")
-        wb_note = " | ".join(note_parts)
+            note_parts = [f"GitHub: {username}"]
+            if isinstance(credential, dict) and credential.get("uid"):
+                note_parts.append(f"UID: {credential['uid']}")
+            if proxy_node:
+                note_parts.append(f"节点: {proxy_node}")
+            wb_note = " | ".join(note_parts)
 
-        with self._connect() as conn:
             wb_row = conn.execute(
-                "SELECT id FROM accounts WHERE account_type = 'WorkBuddy' AND LOWER(account) = LOWER(?)",
+                "SELECT * FROM accounts WHERE account_type = 'WorkBuddy' AND LOWER(account) = LOWER(?)",
                 (existing["account"],),
             ).fetchone()
 
-        if wb_row:
-            prev_wb = self.get_account(wb_row["id"]) or {}
-            merged_wb_cf = {**(prev_wb.get("custom_fields") or {}), **wb_cf}
-            self.update_account(
-                wb_row["id"],
-                {
-                    "password": existing["password"],
-                    "reg_region": region or prev_wb.get("reg_region", ""),
-                    "note": wb_note,
-                    "custom_fields": merged_wb_cf,
-                    "proxy": proxy_url,
-                    "proxy_node": proxy_node,
-                },
-            )
-        else:
-            created_wb = self.add_account(
-                {
-                    "account_type": "WorkBuddy",
-                    "account": existing["account"],
-                    "password": existing["password"],
-                    "reg_region": region,
-                    "note": wb_note,
-                    "custom_fields": wb_cf,
-                    "proxy": proxy_url,
-                }
-            )
-            if proxy_node:
-                self.bind_account_proxy_node(
-                    created_wb["id"],
-                    proxy_url=proxy_url,
-                    proxy_node=proxy_node,
-                    locked=False,
+            if wb_row:
+                prev_wb = self._enrich_row(wb_row)
+                merged_wb_cf = {**(prev_wb.get("custom_fields") or {}), **wb_cf}
+                self._update_account(
+                    conn,
+                    prev_wb,
+                    {
+                        "password": existing["password"],
+                        "reg_region": region or prev_wb.get("reg_region", ""),
+                        "note": wb_note,
+                        "custom_fields": merged_wb_cf,
+                        "proxy": proxy_url,
+                        "proxy_node": proxy_node,
+                    },
+                )
+            else:
+                self._insert_account_in_tx(
+                    conn,
+                    {
+                        "account_type": "WorkBuddy",
+                        "account": existing["account"],
+                        "password": existing["password"],
+                        "reg_region": region,
+                        "note": wb_note,
+                        "custom_fields": wb_cf,
+                        "proxy": proxy_url,
+                        "proxy_node": proxy_node,
+                        "node_locked": False,
+                    },
                 )
         return updated_mail
 
     def export_workbuddy_credentials_json(self, account_ids: list[int] | None = None) -> dict:
+        all_accs = self.list_accounts()
+        wb_creds_by_email: dict[str, dict] = {}
+        mail_creds_by_email: dict[str, dict] = {}
+        for a in all_accs:
+            cred_a = (a.get("custom_fields") or {}).get("wb_credential")
+            if not isinstance(cred_a, dict) or not cred_a:
+                continue
+            key_a = (a.get("account") or "").casefold()
+            if a.get("account_type") == "WorkBuddy" and key_a not in wb_creds_by_email:
+                wb_creds_by_email[key_a] = cred_a
+            elif a.get("account_type") == "域名邮箱" and key_a not in mail_creds_by_email:
+                mail_creds_by_email[key_a] = cred_a
+
         if account_ids:
             wanted = {int(i) for i in account_ids if int(i) > 0}
-            candidates = [a for a in self.list_accounts() if a["id"] in wanted]
+            candidates = [a for a in all_accs if a["id"] in wanted]
         else:
             candidates = [
-                a for a in self.list_accounts()
+                a for a in all_accs
                 if a["account_type"] in ("WorkBuddy", "域名邮箱")
             ]
 
@@ -1716,21 +1925,11 @@ class DatabaseService:
             cf = acc.get("custom_fields") or {}
             cred = cf.get("wb_credential")
             if not isinstance(cred, dict) or not cred:
-                # Check if paired record has the credential
+                email_cf = (acc.get("account") or "").casefold()
                 if acc["account_type"] == "域名邮箱":
-                    paired = [
-                        x for x in self.list_accounts(account_type="WorkBuddy")
-                        if x["account"].casefold() == acc["account"].casefold()
-                    ]
-                    if paired:
-                        cred = (paired[0].get("custom_fields") or {}).get("wb_credential")
+                    cred = wb_creds_by_email.get(email_cf)
                 elif acc["account_type"] == "WorkBuddy":
-                    paired = [
-                        x for x in self.list_accounts(account_type="域名邮箱")
-                        if x["account"].casefold() == acc["account"].casefold()
-                    ]
-                    if paired:
-                        cred = (paired[0].get("custom_fields") or {}).get("wb_credential")
+                    cred = mail_creds_by_email.get(email_cf)
 
             if not isinstance(cred, dict) or not cred:
                 if account_ids:
@@ -1808,9 +2007,17 @@ class DatabaseService:
         return result
 
     def quick_update_credentials(self, account_id: int, payload: dict) -> dict | None:
-        existing = self.get_account(int(account_id))
-        if not existing:
-            return None
+        with self._write_tx() as conn:
+            row = conn.execute("SELECT * FROM accounts WHERE id = ?", (int(account_id),)).fetchone()
+            if row is None:
+                return None
+            existing = self._enrich_row(row)
+            patch = self._quick_credential_patch(existing, payload)
+            updated = self._update_account(conn, existing, patch, validate_totp=True)
+        return self._enrich_row(updated)
+
+    def _quick_credential_patch(self, existing: dict, payload: dict) -> dict:
+        is_google = existing["account_type"] == "Google"
         patch: dict = {"_history_reason": str(payload.get("reason") or "quick_edit")}
         for key in ("password", "recovery_email", "note"):
             if key in payload:
@@ -1821,7 +2028,8 @@ class DatabaseService:
             patch["secret_key"] = new_sk
             if new_sk and old_sk and new_sk != old_sk and not existing.get("initial_secret_key"):
                 patch["initial_secret_key"] = old_sk
-                patch["twofa_modified"] = 1
+                if not is_google:
+                    patch["twofa_modified"] = 1
         for flag_key in ("password_modified", "twofa_modified"):
             if flag_key in payload:
                 patch[flag_key] = 1 if payload[flag_key] else 0
@@ -1830,7 +2038,18 @@ class DatabaseService:
                 patch[cf_flag] = bool(payload[cf_flag])
         if "recovery_password" in payload:
             patch["recovery_password"] = str(payload.get("recovery_password") or "")
-        return self.update_account(int(account_id), patch)
+        if is_google and payload.get("google_confirmed") is not True:
+            credentials_changed = (
+                any((patch[key] or "").strip() != existing[key] for key in ("password", "recovery_email") if key in patch)
+                or any(patch[key] != existing[key] for key in ("secret_key", "recovery_password") if key in patch)
+            )
+            marked_complete = any(
+                patch.get(key) and not existing[key]
+                for key in ("password_modified", "twofa_modified", "sec_recovery_modified", "sec_devices_cleared")
+            )
+            if credentials_changed or marked_complete:
+                raise ValueError("请先确认这些变更已在 Google 生效")
+        return patch
 
     def reset_warming_time(
         self,
@@ -1838,15 +2057,70 @@ class DatabaseService:
         scan_qr_mode: bool | None = None,
         reset_date: str = "",
     ) -> dict | None:
-        existing = self.get_account(int(account_id))
-        if not existing:
-            return None
-        cf = dict(existing.get("custom_fields") or {})
         anchor = normalize_date_str(reset_date.strip()) if reset_date and reset_date.strip() else ""
-        cf["warming_reset_at"] = anchor or date.today().strftime("%Y-%m-%d")
+        cf = {"warming_reset_at": anchor or date.today().isoformat()}
         if scan_qr_mode is not None:
             cf["scan_qr_mode"] = bool(scan_qr_mode)
         return self.update_account(int(account_id), {"custom_fields": cf})
+
+    def record_browser_launch(self, account_id: int) -> dict | None:
+        """Record latest isolated browser launch timestamp & cumulative open count silently."""
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self._write_tx() as conn:
+            row = conn.execute("SELECT * FROM accounts WHERE id = ?", (int(account_id),)).fetchone()
+            if row is None:
+                return None
+            cf = _decode_custom_fields(row["custom_fields_json"])
+            try:
+                prev_cnt = int(cf.get("browser_open_count") or 0)
+            except (TypeError, ValueError):
+                prev_cnt = 0
+            cf["browser_last_opened_at"] = now_str
+            cf["browser_open_count"] = prev_cnt + 1
+            conn.execute(
+                "UPDATE accounts SET custom_fields_json = ? WHERE id = ?",
+                (json.dumps(cf, ensure_ascii=False), int(account_id)),
+            )
+            updated = conn.execute("SELECT * FROM accounts WHERE id = ?", (int(account_id),)).fetchone()
+        return self._enrich_row(updated)
+
+    def update_account_fp_geo_silent(
+        self,
+        account_id: int,
+        geo_info: dict,
+        *,
+        auto_apply_tz: bool = True,
+    ) -> dict | None:
+        """Silently persist exit IP & geo metadata on ``fp_config_json`` without history spam."""
+        if not isinstance(geo_info, dict):
+            return self.get_account(int(account_id))
+        with self._write_tx() as conn:
+            row = conn.execute("SELECT * FROM accounts WHERE id = ?", (int(account_id),)).fetchone()
+            if row is None:
+                return None
+            enriched = self._enrich_row(row)
+            fp_cfg = dict(enriched.get("fp_config") or {})
+            ip = str(geo_info.get("ip") or "").strip()
+            cc = str(geo_info.get("country_code") or "").strip().upper()
+            if ip:
+                fp_cfg["last_exit_ip"] = f"{ip} ({cc})" if cc else ip
+            if cc:
+                fp_cfg["exit_country_code"] = cc
+            tz = str(geo_info.get("timezone") or "").strip()
+            if auto_apply_tz and tz:
+                fp_cfg["timezone"] = tz
+            loc = str(geo_info.get("locale") or "").strip()
+            if auto_apply_tz and loc and not str(fp_cfg.get("browser_lang") or "").strip():
+                fp_cfg["locale"] = loc
+            accept_lang = str(geo_info.get("accept_languages") or "").strip()
+            if auto_apply_tz and accept_lang and not str(fp_cfg.get("browser_lang") or "").strip():
+                fp_cfg["accept_languages"] = accept_lang
+            conn.execute(
+                "UPDATE accounts SET fp_config_json = ? WHERE id = ?",
+                (json.dumps(fp_cfg, ensure_ascii=False), int(account_id)),
+            )
+            updated = conn.execute("SELECT * FROM accounts WHERE id = ?", (int(account_id),)).fetchone()
+        return self._enrich_row(updated)
 
     def get_top_recovery_emails(self, limit: int = 8) -> list[dict]:
         lim = max(1, min(50, int(limit or 8)))
@@ -1923,6 +2197,33 @@ class DatabaseService:
             })
         return items
 
+    def _validate_backup_db(self, src_path: Path) -> str | None:
+        required_cols = {
+            "id",
+            "account_type",
+            "account",
+            "password",
+            "fp_config_json",
+            "custom_fields_json",
+        }
+        try:
+            with closing(sqlite3.connect(src_path, timeout=10.0)) as conn:
+                chk = conn.execute("PRAGMA quick_check;").fetchone()
+                if not chk or str(chk[0]).lower() != "ok":
+                    return f"备份数据库完整性校验失败: {chk[0] if chk else 'unknown'}"
+                tbl = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='accounts'"
+                ).fetchone()
+                if not tbl:
+                    return "备份文件缺少 accounts 主表，已拒绝恢复。"
+                cols = {r[1] for r in conn.execute("PRAGMA table_info(accounts);").fetchall()}
+                missing = sorted(required_cols - cols)
+                if missing:
+                    return f"备份文件缺少必要字段 ({', '.join(missing)})，已拒绝恢复。"
+        except Exception as exc:
+            return f"备份文件无法读取或已损坏: {exc}"
+        return None
+
     def restore_backup(self, filename: str) -> dict:
         fname = Path(str(filename or "")).name
         if not fname or fname != str(filename).strip() or not fname.endswith(".db"):
@@ -1935,13 +2236,18 @@ class DatabaseService:
         if not src_path.exists():
             return {"ok": False, "error": f"备份文件不存在: {fname}"}
 
-        self.create_rolling_backup(reason="pre_restore", max_keep=15, min_interval_minutes=0)
-        try:
-            with closing(sqlite3.connect(src_path)) as src_conn:
-                with closing(sqlite3.connect(self.db_path)) as dst_conn:
-                    src_conn.backup(dst_conn)
-            self._init_db()
-            return {"ok": True, "restored": fname}
-        except Exception as exc:
-            return {"ok": False, "error": str(exc)}
+        invalid_reason = self._validate_backup_db(src_path)
+        if invalid_reason:
+            return {"ok": False, "error": invalid_reason}
+
+        with self._write_lock:
+            self.create_rolling_backup(reason="pre_restore", max_keep=15, min_interval_minutes=0)
+            try:
+                with closing(sqlite3.connect(src_path, timeout=30.0)) as src_conn:
+                    with closing(sqlite3.connect(self.db_path, timeout=30.0)) as dst_conn:
+                        src_conn.backup(dst_conn)
+                self._init_db()
+                return {"ok": True, "restored": fname}
+            except Exception as exc:
+                return {"ok": False, "error": str(exc)}
 

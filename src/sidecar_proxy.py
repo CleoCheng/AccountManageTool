@@ -36,9 +36,10 @@ from src.proxy_service import (
 DEFAULT_SIDECAR_PROXY_PORT = 17899
 DEFAULT_SIDECAR_CTRL_PORT = 29091
 SIDECAR_GROUP_NAME = "KEYVAULT_PROXY"
+SIDECAR_SLOT_COUNT = 16
 # Bumped whenever the generated sidecar config layout changes so a live kernel
 # hot-reloads instead of silently keeping a stale config.
-SIDECAR_CONFIG_VERSION = "v3-isolated-no-resolve"
+SIDECAR_CONFIG_VERSION = "v4-per-slot-listeners"
 
 _GITHUB_PREFLIGHT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -395,6 +396,12 @@ class SidecarProxyManager:
         self._last_hosts_map: dict[str, str] = {}
         self._atexit_registered = False
         self._config_path = self.runtime_dir / "config.yaml"
+        self._slot_ports: list[int] = [
+            self.proxy_port + 1 + i for i in range(SIDECAR_SLOT_COUNT)
+        ]
+        self._slot_nodes: dict[int, str] = {}
+        self._slot_last_used: dict[int, float] = {}
+        self._account_slots: dict[int, int] = {}
 
     # ------------------------------------------------------------------
     # Read-only discovery
@@ -515,8 +522,10 @@ class SidecarProxyManager:
         elif is_claude:
             nodes = rank_nodes_for_claude(nodes)
 
-        running = self._proc is not None and self._proc.poll() is None
-        port = int(self.proxy_port)
+        with self._lock:
+            running = self._proc is not None and self._proc.poll() is None
+            port = int(self.proxy_port)
+            active_node_snapshot = self.active_node
         if not running:
             port = _pick_free_port(
                 self.preferred_proxy_port,
@@ -575,8 +584,8 @@ class SidecarProxyManager:
             "system_proxy": sys_proxy,
             "ports": ports,
             "nodes": nodes,
-            "current_groups": {SIDECAR_GROUP_NAME: self.active_node} if self.active_node else {},
-            "active_node": self.active_node,
+            "current_groups": {SIDECAR_GROUP_NAME: active_node_snapshot} if active_node_snapshot else {},
+            "active_node": active_node_snapshot,
             "sidecar": bool(sidecar),
         }
         if is_claude:
@@ -711,6 +720,17 @@ class SidecarProxyManager:
                         )
         except OSError:
             pass
+        provider_dir = Path(yaml_path).parent / "proxy_provider"
+        try:
+            if provider_dir.is_dir():
+                for pfile in sorted(provider_dir.glob("*.yaml")):
+                    try:
+                        pstat = pfile.stat()
+                        signature.extend([str(pfile), float(pstat.st_mtime), int(pstat.st_size)])
+                    except OSError:
+                        continue
+        except OSError:
+            pass
         return tuple(signature)
 
     def _build_config(
@@ -723,12 +743,44 @@ class SidecarProxyManager:
             if hosts_map is not None
             else dict(getattr(self, "_last_hosts_map", {}) or {})
         )
+        proxy_names = [p["name"] for p in raw_proxies]
+        slot_ports = getattr(self, "_slot_ports", None) or [
+            self.proxy_port + 1 + i for i in range(SIDECAR_SLOT_COUNT)
+        ]
+        listeners = [
+            {
+                "name": f"kv-slot-{idx}",
+                "type": "mixed",
+                "listen": "127.0.0.1",
+                "port": int(port),
+            }
+            for idx, port in enumerate(slot_ports)
+        ]
+        proxy_groups = [
+            {
+                "name": SIDECAR_GROUP_NAME,
+                "type": "select",
+                "proxies": proxy_names,
+            },
+            *[
+                {
+                    "name": f"KV_SLOT_{idx}",
+                    "type": "select",
+                    "proxies": proxy_names,
+                }
+                for idx in range(len(slot_ports))
+            ],
+        ]
+        slot_rules = [
+            f"IN-NAME,kv-slot-{idx},KV_SLOT_{idx}"
+            for idx in range(len(slot_ports))
+        ]
         config: dict = {
             "mixed-port": self.proxy_port,
             "bind-address": "127.0.0.1",
             "allow-lan": False,
             "mode": "rule",
-            # The sidecar serves one dedicated local port, so process sniffing
+            # The sidecar serves dedicated local ports, so process sniffing
             # only wastes time and could mix rules across kernels.
             "find-process-mode": "off",
             "log-level": "warning",
@@ -740,20 +792,17 @@ class SidecarProxyManager:
             # ``use-hosts`` lets the kernel resolve the subscription's decoy
             # hostnames through the ``hosts`` map we merge below.
             "dns": {"enable": False, "use-hosts": True},
+            "listeners": listeners,
             "proxies": raw_proxies,
-            "proxy-groups": [
-                {
-                    "name": SIDECAR_GROUP_NAME,
-                    "type": "select",
-                    "proxies": [p["name"] for p in raw_proxies],
-                }
-            ],
+            "proxy-groups": proxy_groups,
             "rules": [
                 # Block STUN/TURN so WebRTC can never leak the local IP.
                 "DOMAIN-KEYWORD,stun,REJECT",
                 "DST-PORT,3478,REJECT",
                 "DST-PORT,5349,REJECT",
                 "DOMAIN-SUFFIX,ggb6.com,DIRECT",
+                # Dedicated per-account/per-node concurrent isolation slots.
+                *slot_rules,
                 # Anthropic/Claude traffic must always exit through the proxy.
                 f"DOMAIN-SUFFIX,claude.ai,{SIDECAR_GROUP_NAME}",
                 f"DOMAIN-SUFFIX,anthropic.com,{SIDECAR_GROUP_NAME}",
@@ -1052,6 +1101,7 @@ class SidecarProxyManager:
                             preferred_node=preferred_node,
                             account_type=account_type,
                         )
+                        self._reapply_slot_nodes()
                     return {
                         "ok": True,
                         "proxy_url": f"http://127.0.0.1:{self.proxy_port}",
@@ -1073,6 +1123,11 @@ class SidecarProxyManager:
             self.ctrl_port = _pick_free_port(
                 self.preferred_ctrl_port,
                 range(self.preferred_ctrl_port + 1, self.preferred_ctrl_port + 30),
+            )
+            self._slot_ports = self._allocate_free_slot_ports(
+                start_port=max(self.proxy_port + 1, 17900),
+                count=SIDECAR_SLOT_COUNT,
+                exclude={self.proxy_port, self.ctrl_port},
             )
 
             self.runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -1135,10 +1190,82 @@ class SidecarProxyManager:
                 "active_node": self.active_node,
             }
 
-    def preflight_github(self, timeout: float = 6.0) -> dict:
-        proxy_url = f"http://127.0.0.1:{self.proxy_port}"
+    def _allocate_free_slot_ports(
+        self, start_port: int, count: int, exclude: set[int]
+    ) -> list[int]:
+        ports: list[int] = []
+        used = set(exclude)
+        candidate = int(start_port)
+        limit = candidate + 200
+        while len(ports) < count and candidate < limit:
+            if candidate not in used and _port_is_free(candidate):
+                ports.append(candidate)
+                used.add(candidate)
+            candidate += 1
+        while len(ports) < count:
+            ports.append(candidate)
+            candidate += 1
+        return ports
+
+    def _reapply_slot_nodes(self) -> None:
+        for slot_idx, node_name in list(self._slot_nodes.items()):
+            if node_name:
+                self._ctrl_request(
+                    "PUT",
+                    f"/proxies/KV_SLOT_{slot_idx}",
+                    {"name": node_name},
+                    timeout=2.0,
+                )
+
+    def _choose_slot_for_account(
+        self, node_name: str, account_id: int | None
+    ) -> int:
+        total = max(1, len(self._slot_ports))
+        if account_id is not None:
+            aid = int(account_id)
+            if aid in self._account_slots and 0 <= self._account_slots[aid] < total:
+                return self._account_slots[aid]
+            assigned = set(self._account_slots.values())
+            for idx in range(total):
+                if idx not in assigned:
+                    return idx
+        # Reuse a slot already pointed at the exact same node if available
+        for idx in range(total):
+            if self._slot_nodes.get(idx) == node_name:
+                return idx
+        # Otherwise pick an unused slot first, else LRU
+        for idx in range(total):
+            if idx not in self._slot_nodes:
+                return idx
+        return min(range(total), key=lambda i: self._slot_last_used.get(i, 0.0))
+
+    def _close_slot_connections(self, slot_idx: int) -> None:
+        inbound = f"kv-slot-{slot_idx}"
+        status, payload = self._ctrl_request("GET", "/connections", timeout=1.5)
+        if status != 200 or not isinstance(payload, dict):
+            return
+        for conn in payload.get("connections") or []:
+            if not isinstance(conn, dict):
+                continue
+            meta = conn.get("metadata") or {}
+            if meta.get("inboundName") == inbound and conn.get("id"):
+                self._ctrl_request("DELETE", f"/connections/{conn['id']}", timeout=1.0)
+
+    def _close_shared_connections(self) -> None:
+        status, payload = self._ctrl_request("GET", "/connections", timeout=1.5)
+        if status != 200 or not isinstance(payload, dict):
+            return
+        for conn in payload.get("connections") or []:
+            if not isinstance(conn, dict) or not conn.get("id"):
+                continue
+            inbound = str(((conn.get("metadata") or {}).get("inboundName")) or "")
+            if not inbound.startswith("kv-slot-"):
+                self._ctrl_request("DELETE", f"/connections/{conn['id']}", timeout=1.0)
+
+    def preflight_github(self, timeout: float = 6.0, proxy_url: str = "") -> dict:
+        eff_proxy = proxy_url or f"http://127.0.0.1:{self.proxy_port}"
         opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+            urllib.request.ProxyHandler({"http": eff_proxy, "https": eff_proxy})
         )
         req = urllib.request.Request(
             "https://github.com/",
@@ -1185,58 +1312,112 @@ class SidecarProxyManager:
         *,
         preflight: bool = False,
         preflight_timeout: float = 6.0,
+        isolate_slot: bool = False,
+        account_id: int | None = None,
     ) -> dict:
-        started = self.ensure_started()
-        if not started.get("ok"):
-            return {
-                "ok": False,
-                "switched": False,
-                "error": started.get("error", "sidecar unavailable"),
-            }
-
-        status, _ = self._ctrl_request(
-            "PUT",
-            f"/proxies/{SIDECAR_GROUP_NAME}",
-            {"name": node_name},
-            timeout=2.5,
-        )
-        if status not in (200, 204):
-            return {
-                "ok": False,
-                "switched": False,
-                "error": f"独立代理内核未找到节点: {node_name}",
-                "proxy_url": started["proxy_url"],
-            }
-
-        # Drop previous keep-alive connections so the next request really exits
-        # through the freshly selected node.
-        self._ctrl_request("DELETE", "/connections", timeout=2.0)
-
-        self.active_node = node_name
-        result = {
-            "ok": True,
-            "switched": True,
-            "node": node_name,
-            "proxy_url": f"http://127.0.0.1:{self.proxy_port}",
-            "groups": [SIDECAR_GROUP_NAME],
-        }
-        if preflight:
-            pf = self.preflight_github(timeout=preflight_timeout)
-            result.update(
-                {
-                    "preflight_ok": pf["ok"],
-                    "reachable": pf["reachable"],
-                    "restricted": pf["restricted"],
-                    "latency_ms": pf["latency_ms"],
+        with self._lock:
+            started = self.ensure_started()
+            if not started.get("ok"):
+                return {
+                    "ok": False,
+                    "switched": False,
+                    "error": started.get("error", "sidecar unavailable"),
                 }
+
+            if isolate_slot and self._slot_ports:
+                slot_idx = self._choose_slot_for_account(node_name, account_id)
+                group_name = f"KV_SLOT_{slot_idx}"
+                prev_node = self._slot_nodes.get(slot_idx, "")
+                status, _ = self._ctrl_request(
+                    "PUT",
+                    f"/proxies/{group_name}",
+                    {"name": node_name},
+                    timeout=2.5,
+                )
+                if status not in (200, 204):
+                    return {
+                        "ok": False,
+                        "switched": False,
+                        "error": f"独立代理内核未找到节点: {node_name}",
+                        "proxy_url": started["proxy_url"],
+                    }
+                if prev_node and prev_node != node_name:
+                    self._close_slot_connections(slot_idx)
+                self._slot_nodes[slot_idx] = node_name
+                self._slot_last_used[slot_idx] = time.time()
+                if account_id is not None:
+                    aid = int(account_id)
+                    for other_aid, other_slot in list(self._account_slots.items()):
+                        if other_slot == slot_idx and other_aid != aid:
+                            del self._account_slots[other_aid]
+                    self._account_slots[aid] = slot_idx
+                slot_port = self._slot_ports[slot_idx]
+                slot_url = f"http://127.0.0.1:{slot_port}"
+                result = {
+                    "ok": True,
+                    "switched": True,
+                    "node": node_name,
+                    "slot": slot_idx,
+                    "proxy_url": slot_url,
+                    "groups": [group_name],
+                }
+                if preflight:
+                    pf = self.preflight_github(timeout=preflight_timeout, proxy_url=slot_url)
+                    result.update(
+                        {
+                            "preflight_ok": pf["ok"],
+                            "reachable": pf["reachable"],
+                            "restricted": pf["restricted"],
+                            "latency_ms": pf["latency_ms"],
+                        }
+                    )
+                return result
+
+            status, _ = self._ctrl_request(
+                "PUT",
+                f"/proxies/{SIDECAR_GROUP_NAME}",
+                {"name": node_name},
+                timeout=2.5,
             )
-        return result
+            if status not in (200, 204):
+                return {
+                    "ok": False,
+                    "switched": False,
+                    "error": f"独立代理内核未找到节点: {node_name}",
+                    "proxy_url": started["proxy_url"],
+                }
+
+            # Drop only shared mixed-port connections so isolated account slots stay untouched.
+            self._close_shared_connections()
+
+            self.active_node = node_name
+            result = {
+                "ok": True,
+                "switched": True,
+                "node": node_name,
+                "proxy_url": f"http://127.0.0.1:{self.proxy_port}",
+                "groups": [SIDECAR_GROUP_NAME],
+            }
+            if preflight:
+                pf = self.preflight_github(timeout=preflight_timeout)
+                result.update(
+                    {
+                        "preflight_ok": pf["ok"],
+                        "reachable": pf["reachable"],
+                        "restricted": pf["restricted"],
+                        "latency_ms": pf["latency_ms"],
+                    }
+                )
+            return result
 
     def stop(self) -> None:
         with self._lock:
             proc = self._proc
             self._proc = None
             self.active_node = ""
+            self._slot_nodes.clear()
+            self._slot_last_used.clear()
+            self._account_slots.clear()
             if proc is None:
                 return
             try:

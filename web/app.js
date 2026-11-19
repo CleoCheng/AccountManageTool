@@ -29,6 +29,7 @@ const state = {
   nodeCodeStats: {},
   autoMailCodePolling: false,
   // Maintenance, Warming, OAuth & Appeal State
+  loginToolsAccountId: null,
   topRecoveryEmails: [],
   appealChannels: [],
   activeQuickCredAccountId: null,
@@ -39,6 +40,11 @@ const state = {
   // System Settings State
   currentDictTab: "account_type",
   editingDictId: null,
+  sortMode: "default",
+};
+
+window.__kvOnAccountUpdated = () => {
+  loadDashboard();
 };
 
 async function callApi(method, ...args) {
@@ -64,8 +70,13 @@ function syncDomainEmailLoginHint(accountType) {
   }
 }
 
+let appInitialized = false;
+let totpTickerTimer = null;
+
 function initApp() {
   initAllCustomSelects();
+  if (appInitialized) return;
+  appInitialized = true;
   loadDashboard();
   startZeroOverheadTotpTicker();
 }
@@ -77,13 +88,16 @@ window.addEventListener("pywebviewready", () => {
 document.addEventListener("DOMContentLoaded", () => {
   initAllCustomSelects();
   setTimeout(() => {
-    if (window.pywebview && window.pywebview.api) {
+    if (!appInitialized && window.pywebview && window.pywebview.api) {
       initApp();
     }
   }, 120);
 });
 
+let dashboardRequestId = 0;
+
 async function loadDashboard() {
+  const requestId = ++dashboardRequestId;
   try {
     const data = await callApi(
       "get_dashboard",
@@ -92,8 +106,10 @@ async function loadDashboard() {
       state.statusFilter,
       state.healthFilter,
       state.antigravityFilter,
-      state.deviceFilter
+      state.deviceFilter,
+      state.customFilters
     );
+    if (requestId !== dashboardRequestId) return;
     if (!state._initialFilterRestored) {
       state._initialFilterRestored = true;
       const savedFilter = data.settings?.last_filter_type;
@@ -102,7 +118,14 @@ async function loadDashboard() {
         return await loadDashboard();
       }
     }
+    if (data.dicts) state.dicts = data.dicts;
+    if (data.attributes) state.attributes = data.attributes;
+    if (renderFilterDropdowns()) return await loadDashboard();
     state.accounts = data.accounts || [];
+    if (Array.isArray(state.modalAccountsPool) && state.modalAccountsPool.length && state.accounts.length) {
+      const freshById = new Map(state.accounts.map((a) => [a.id, a]));
+      state.modalAccountsPool = state.modalAccountsPool.map((prev) => freshById.get(prev.id) || prev);
+    }
     if (data.node_code_stats) {
       state.nodeCodeStats = data.node_code_stats;
     }
@@ -115,23 +138,18 @@ async function loadDashboard() {
     }
     updateWorkBuddyQueue(data.workbuddy);
     state.stats = data.stats || { total: 0, google: 0, chatgpt: 0, types: {}, devices: {}, other: 0, active: 0, deactivated: 0, available: 0, unavailable: 0, health: {}, antigravity: {} };
-    if (data.dicts) {
-      state.dicts = data.dicts;
-    }
-    if (data.attributes) {
-      state.attributes = data.attributes;
-    }
     if (data.settings) {
       state.settings = data.settings;
       applyTheme(data.settings.theme || "dark", false);
       const savedMode = data.settings.view_mode === "grid" ? "compact" : data.settings.view_mode || "compact";
       applyViewMode(savedMode, false);
     }
-    renderFilterDropdowns();
-    renderStats();
+    renderStats(data.health_counts);
     syncTopBarPills();
+    syncGoogleTopActions();
     syncAntigravitySelectStyle();
     renderAccounts();
+    renderLoginTools();
     if (state.filterType === "域名邮箱" && state.autoMailCodePolling) {
       startMailCodePolling();
     } else {
@@ -145,17 +163,18 @@ async function loadDashboard() {
   }
 }
 
-function renderStats() {
-  const setEl = (id, val) => {
-    const el = document.getElementById(id);
-    if (el) el.textContent = val !== undefined && val !== null ? val : 0;
-  };
-  setEl("stat-total", state.stats.total);
-  const h = state.stats.health || {};
-  const avail = state.stats.available !== undefined ? state.stats.available : (h["可用"] || 0);
-  const unavail = state.stats.unavailable !== undefined ? state.stats.unavailable : (h["不可用"] || 0);
-  setEl("stat-health-available", avail);
-  setEl("stat-health-unavailable", unavail);
+function renderHealthStats(counts) {
+  document.getElementById("stat-health-available").textContent = counts?.["可用"] ?? "—";
+  document.getElementById("stat-health-unavailable").textContent = counts?.["不可用"] ?? "—";
+  document.getElementById("stat-health-unreviewed").textContent = counts?.["未核对"] ?? "—";
+  document.getElementById("stat-pill-unreviewed").hidden =
+    state.filterType !== "Google" &&
+    !(state.filterType === "All" && (counts?.["未核对"] > 0 || state.healthFilter === "未核对"));
+}
+
+function renderStats(healthCounts) {
+  document.getElementById("stat-total").textContent = state.stats.total ?? 0;
+  renderHealthStats(healthCounts);
 
   // Dynamically populate and update topbar platform dropdown
   const topSel = document.getElementById("topbar-platform-select");
@@ -184,6 +203,15 @@ function renderStats() {
   }
 
   syncPlatformDotColor();
+  syncGoogleTopActions();
+}
+
+function syncGoogleTopActions() {
+  const isGoogle = state.filterType === "Google";
+  const btnRt = document.getElementById("btn-rt-oauth");
+  const btnAppeal = document.getElementById("btn-appeal");
+  if (btnRt) btnRt.hidden = !isGoogle;
+  if (btnAppeal) btnAppeal.hidden = !isGoogle;
 }
 
 function syncPlatformDotColor() {
@@ -224,13 +252,20 @@ function syncTopBarPills() {
   const pillPlatWrap = document.getElementById("stat-pill-platform-wrap");
   const pillAvail = document.getElementById("stat-pill-available");
   const pillUnavail = document.getElementById("stat-pill-unavailable");
+  const pillUnreviewed = document.getElementById("stat-pill-unreviewed");
 
   if (pillTotal) pillTotal.classList.toggle("active", isTotal);
   if (pillPlatWrap) pillPlatWrap.classList.toggle("active", state.filterType !== "All");
   if (pillAvail) pillAvail.classList.toggle("active", state.healthFilter === "可用");
   if (pillUnavail) pillUnavail.classList.toggle("active", state.healthFilter === "不可用");
+  if (pillUnreviewed) {
+    const selected = state.healthFilter === "未核对";
+    pillUnreviewed.classList.toggle("active", selected);
+    pillUnreviewed.setAttribute("aria-pressed", String(selected));
+  }
 
   syncPlatformDotColor();
+  syncGoogleTopActions();
 }
 
 function isAttributeApplicable(attr, platform) {
@@ -259,7 +294,7 @@ function renderFilterDropdowns() {
     let html = `<option value="All">全部平台</option>`;
     if (typeDicts.length > 0) {
       html += typeDicts
-        .map((d) => `<option value="${escapeHtml(d.dict_key)}">${d.icon || ""} ${escapeHtml(d.dict_label || d.dict_key)}</option>`)
+        .map((d) => `<option value="${escapeHtml(d.dict_key)}">${d.icon ? escapeHtml(d.icon) + " " : ""}${escapeHtml(d.dict_label || d.dict_key)}</option>`)
         .join("");
     } else {
       html += `
@@ -285,17 +320,19 @@ function renderFilterDropdowns() {
     (a) => a.is_filter && a.attr_type === "select" && isAttributeApplicable(a, activePlatform)
   );
 
-  // If built-in or custom filters are hidden for activePlatform, reset their values
   const applicableKeys = new Set(applicableAttrs.map((a) => a.attr_key));
-  if (!applicableKeys.has("health_status")) state.healthFilter = "All";
-  if (!applicableKeys.has("device_tag")) state.deviceFilter = "All";
-  if (!applicableKeys.has("antigravity_tier")) state.antigravityFilter = "All";
-  if (state.customFilters) {
-    Object.keys(state.customFilters).forEach((k) => {
-      if (!applicableKeys.has(k)) {
-        state.customFilters[k] = "All";
-      }
-    });
+  let filtersChanged = false;
+  for (const [key, field] of [["device_tag", "deviceFilter"], ["antigravity_tier", "antigravityFilter"]]) {
+    if (!applicableKeys.has(key) && state[field] !== "All") {
+      state[field] = "All";
+      filtersChanged = true;
+    }
+  }
+  for (const [key, value] of Object.entries(state.customFilters)) {
+    if (!applicableKeys.has(key) && value !== "All") {
+      delete state.customFilters[key];
+      filtersChanged = true;
+    }
   }
 
   container.innerHTML = "";
@@ -326,6 +363,9 @@ function renderFilterDropdowns() {
     });
 
     if (attr.attr_key === "health_status") {
+      if ((activePlatform === "Google" || activePlatform === "All") && !dictItems.some((d) => d.dict_key === "未核对")) {
+        sel.add(new Option("未核对", "未核对"));
+      }
       sel.value = state.healthFilter || "All";
       sel.onchange = () => onHealthSelectChange(sel.value);
     } else if (attr.attr_key === "antigravity_tier") {
@@ -348,6 +388,7 @@ function renderFilterDropdowns() {
       syncAntigravitySelectStyle();
     }
   });
+  return filtersChanged;
 }
 
 function setCustomFilter(attrKey, val) {
@@ -358,7 +399,7 @@ function setCustomFilter(attrKey, val) {
     sel.value = state.customFilters[attrKey];
   }
   syncCustomSelect(sel);
-  renderAccounts();
+  loadDashboard();
 }
 
 function setDeviceFilter(dev) {
@@ -372,8 +413,22 @@ function setDeviceFilter(dev) {
   loadDashboard();
 }
 
+function resetTopBarFilters() {
+  state.healthFilter = "All";
+  state.antigravityFilter = "All";
+  state.deviceFilter = "All";
+  setFilterType("All");
+}
+
 function setFilterType(type) {
-  state.filterType = type || "All";
+  const nextType = type || "All";
+  const platformChanged = state.filterType !== nextType;
+  state._initialFilterRestored = true;
+  state.filterType = nextType;
+  if (state.healthFilter === "未核对" && nextType !== "Google" && nextType !== "All") {
+    state.healthFilter = "All";
+  }
+  if (platformChanged) renderHealthStats();
   if (state.filterType === "域名邮箱" && state.autoMailCodePolling) {
     startMailCodePolling();
   } else {
@@ -394,6 +449,7 @@ function setFilterType(type) {
   syncCustomSelect(platSel);
   renderFilterDropdowns();
   syncTopBarPills();
+  syncGoogleTopActions();
   syncPlatformDotColor();
   callApi("save_settings", { last_filter_type: state.filterType }).catch(() => {});
   loadDashboard();
@@ -464,6 +520,23 @@ function getHealthMeta(status) {
     default:
       return { key: "available", label: "可用", dotClass: "dot-available" };
   }
+}
+
+function getAccountHealthMeta(account) {
+  const meta = getHealthMeta(account.health_status);
+  if (account.account_type !== "Google") return meta;
+  if (meta.key === "available") {
+    if (account.deactivated_date || account.availability === "不可用") return getHealthMeta("不可用");
+    return account.custom_fields?.google_reviewed_at
+      ? { ...meta, label: "已确认登录" }
+      : { ...getHealthMeta("不可用"), key: "unreviewed", label: "未核对" };
+  }
+  const pendingLabels = { captcha: "待验证 · 人机", sms: "待验证 · 短信", verify: "待验证 · 身份" };
+  return { ...meta, label: pendingLabels[meta.key] || meta.label };
+}
+
+function getWarmingInfo(account) {
+  return account.warming || { phase: "warming", label: "待复核", hint: "" };
 }
 
 function getAntigravityMeta(tier) {
@@ -570,7 +643,12 @@ async function onQuickSelectHealth(accountId, nextStatus) {
   try {
     const res = await callApi("set_health_status", accountId, nextStatus);
     if (res && res.ok) {
-      showToast(`✓ 已标记账号状态为「${nextStatus}」`);
+      const label = res.account ? getAccountHealthMeta(res.account).label : nextStatus;
+      showToast(`✓ 已记录「${label}」`);
+      if (res.account && state.activeQuickCredAccountId === accountId) {
+        renderGoogleReview(res.account);
+        renderQuickCredWarming(res.account);
+      }
       await loadDashboard();
     } else {
       showToast(res.error || "状态更新失败");
@@ -671,18 +749,33 @@ function getFpSummary(item) {
   };
 }
 
+function getSortedAccounts(list) {
+  const arr = Array.isArray(list) ? list.slice() : [];
+  if (state.sortMode === "warming_stale") {
+    arr.sort((a, b) => {
+      const ta = a.browser_last_opened_at || "";
+      const tb = b.browser_last_opened_at || "";
+      if (ta !== tb) return ta.localeCompare(tb);
+      return (a.browser_open_count || 0) - (b.browser_open_count || 0);
+    });
+  } else if (state.sortMode === "warming_recent") {
+    arr.sort((a, b) => (b.browser_last_opened_at || "").localeCompare(a.browser_last_opened_at || ""));
+  } else if (state.sortMode === "warming_count") {
+    arr.sort((a, b) => (b.browser_open_count || 0) - (a.browser_open_count || 0));
+  }
+  return arr;
+}
+
+function setSortMode(mode) {
+  state.sortMode = mode || "default";
+  renderAccounts();
+}
+
 function renderAccounts() {
   const container = document.getElementById("accounts-container");
   const emptyState = document.getElementById("empty-state");
 
-  let accountsToDisplay = state.accounts || [];
-  if (state.customFilters) {
-    Object.entries(state.customFilters).forEach(([k, v]) => {
-      if (v && v !== "All") {
-        accountsToDisplay = accountsToDisplay.filter((a) => a.custom_fields && a.custom_fields[k] === v);
-      }
-    });
-  }
+  const accountsToDisplay = getSortedAccounts(state.accounts);
 
   renderWorkBuddyToolbar(accountsToDisplay);
 
@@ -708,20 +801,48 @@ function renderAccounts() {
 }
 
 
+const mailboxRegistrationStates = ["未完成", "进行中", "已完成"];
+
+async function toggleMailboxMarker(button, accountId, field) {
+  const account = state.accounts.find((item) => item.id === accountId && item.account_type === "域名邮箱");
+  if (!account || button.disabled) return;
+  const fields = account.custom_fields || {};
+  const current = mailboxRegistrationStates.indexOf(fields.wb_reg_status || "未完成");
+  const value = field === "chatgpt_bound"
+    ? fields.chatgpt_bound !== true
+    : mailboxRegistrationStates[(current + 1) % mailboxRegistrationStates.length];
+  button.disabled = true;
+  try {
+    const result = await callApi("set_domain_email_metadata", accountId, field, value);
+    if (!result?.ok) {
+      showToast(result?.error || "保存标记失败");
+      return;
+    }
+    await loadDashboard();
+  } catch (error) {
+    showToast("保存标记失败: " + error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
 function renderWorkBuddyItemBadges(item) {
   if (!item) return "";
   const cf = item.custom_fields || {};
   const parts = [];
   if (item.account_type === "域名邮箱") {
-    const done = cf.wb_reg_status === "已完成" || (typeof isWorkBuddyCompleted === "function" && isWorkBuddyCompleted(item));
-    if (done) {
-      parts.push('<span class="u-wb-badge wb-done" title="已完成 WorkBuddy 国际版注册">✅ 已完成注册</span>');
-    } else if (cf.wb_reg_status === "进行中") {
-      const stepTxt = cf.wb_reg_step_label ? ` · ${escapeHtml(cf.wb_reg_step_label)}` : "";
-      parts.push(`<span class="u-wb-badge wb-progress" title="注册进行中，支持勾选或从任务进度继续">🔄 进行中${stepTxt}</span>`);
-    } else {
-      parts.push('<span class="u-wb-badge wb-pending" title="尚未完成 WorkBuddy 国际版注册">⏳ 未完成注册</span>');
-    }
+    const bound = cf.chatgpt_bound === true;
+    const statuses = {
+      "未完成": ["wb-pending", "⏳ 未完成注册"],
+      "进行中": ["wb-progress", `🔄 进行中${cf.wb_reg_step_label ? ` · ${escapeHtml(cf.wb_reg_step_label)}` : ""}`],
+      "已完成": ["wb-done", "✅ 已完成注册"],
+    };
+    const registration = mailboxRegistrationStates.includes(cf.wb_reg_status) ? cf.wb_reg_status : "未完成";
+    const [statusClass, statusLabel] = statuses[registration];
+    parts.push(
+      `<button type="button" class="u-wb-badge ${statusClass}" title="点击切换 WorkBuddy 注册状态" onclick="toggleMailboxMarker(this, ${item.id}, 'wb_reg_status')">${statusLabel}</button>`,
+      `<button type="button" class="u-wb-badge ${bound ? "wb-done" : "wb-unbound"}" aria-pressed="${bound}" title="点击切换 ChatGPT 绑定标记" onclick="toggleMailboxMarker(this, ${item.id}, 'chatgpt_bound')">ChatGPT ${bound ? "已绑定" : "未绑定"}</button>`
+    );
   }
   if (cf.wb_credential && cf.wb_credential.accessToken) {
     parts.push('<span class="u-wb-badge wb-cred" title="已保存 WorkBuddy2API 登录凭据，可勾选导出 JSON">🔑 凭据已存</span>');
@@ -743,7 +864,7 @@ function renderCardItem(item, remaining) {
       ? usage.duration_text
       : usage.status_label;
 
-  const hMeta = getHealthMeta(item.health_status || "可用");
+  const hMeta = getAccountHealthMeta(item);
   const agMeta = getAntigravityMeta(item.antigravity_tier || "无");
 
   const isPwdModified = !!item.password_modified;
@@ -777,6 +898,7 @@ function renderCardItem(item, remaining) {
           <span class="u-totp-label mail-code-label">邮件码</span>
           <span class="u-totp-code mail-code-val" id="totp-code-${item.id}">${escapeHtml(item.custom_fields.latest_code)}</span>
           <span class="u-totp-sec">(${formatTimeAgo(item.custom_fields.code_received_at)})</span>
+          <button type="button" class="mail-code-refresh" aria-label="刷新此邮箱验证码" onclick="event.stopPropagation(); refreshSingleEmailCode(${item.id}, this)">刷新</button>
         </div>
       `;
     } else {
@@ -785,6 +907,7 @@ function renderCardItem(item, remaining) {
           <span class="u-totp-label mail-code-label">邮件码</span>
           <span class="u-totp-code pending-mail-code" id="totp-code-${item.id}">暂无 (查信)</span>
           <span class="u-totp-sec">🔄</span>
+          <button type="button" class="mail-code-refresh" aria-label="刷新此邮箱验证码" onclick="event.stopPropagation(); refreshSingleEmailCode(${item.id}, this)">刷新</button>
         </div>
       `;
     }
@@ -865,7 +988,7 @@ function renderCardItem(item, remaining) {
       <div class="u-health-popover" id="health-menu-${item.id}" style="display: none;">
         <div class="popover-title">维护账号可用状态</div>
         <button class="health-opt ${hMeta.key === 'available' ? 'active' : ''}" onclick="onQuickSelectHealth(${item.id}, '可用')">
-          <span class="badge-dot dot-available"></span><span>可用 (正常使用)</span>
+          <span class="badge-dot dot-available"></span><span>${item.account_type === "Google" ? "已确认登录" : "可用 (正常使用)"}</span>
         </button>
         <button class="health-opt ${hMeta.key === 'banned' ? 'active' : ''}" onclick="onQuickSelectHealth(${item.id}, '封号')">
           <span class="badge-dot dot-banned"></span><span>封号 (官方封禁)</span>
@@ -1001,7 +1124,7 @@ function renderCardItem(item, remaining) {
     : "";
 
   const secInfo = item.security || { status: "unmodified", label: "⚠️ 未改密", completed: 0, total: 4 };
-  const warmInfo = item.warming || { phase: "ready", label: "可改密", hint: "" };
+  const warmInfo = getWarmingInfo(item);
   const secBadgeHtml = `<button class="sec-badge sec-${escapeHtml(secInfo.status)}" onclick="openQuickCredModal(${item.id})" title="点击进入4步安全改密与历史凭据归档 (${secInfo.completed || 0}/4)">${escapeHtml(secInfo.label)}</button>`;
   const warmBadgeHtml = `<button class="warm-badge warm-${escapeHtml(warmInfo.phase)}" onclick="openQuickCredModal(${item.id})" title="${escapeHtml(warmInfo.hint || warmInfo.label)}">🌱 ${escapeHtml(warmInfo.label)}</button>`;
   const rtBadgeHtml =
@@ -1056,6 +1179,11 @@ function renderCardItem(item, remaining) {
             ${escapeHtml(statusText)}
           </span>
           ${warmBadgeHtml}
+          ${
+            (item.browser_open_count || 0) > 0
+              ? `<span class="u-usage-badge" title="最近开窗: ${escapeHtml(item.browser_last_opened_at || "未知")}${fpInfo.proxyNode ? ` · 节点: ${escapeHtml(fpInfo.proxyNode)}` : ""}">🖥️ ${item.browser_open_count}次</span>`
+              : ""
+          }
         </div>
         <div class="u-status-right">
           <button class="u-node-pill ${fpInfo.locked ? "locked" : ""} ${isUnboundClaude ? "unbound-warn" : ""}" onclick="openNodeModal(${item.id})" title="专属代理节点">
@@ -1076,7 +1204,7 @@ function renderCardItem(item, remaining) {
               ? `<button class="copy-btn" onclick="copyFieldValue(this, ${item.id}, 'secret_key', '2FA秘钥')">2FA</button>`
               : ""
           }
-          <button class="btn-browser" onclick="onClickLaunchBrowser(${item.id}, this)" title="${escapeHtml(fpInfo.tooltip)}">
+          <button class="btn-browser" onclick="onClickLaunchBrowser(${item.id}, this)" title="${item.account_type === "Google" ? "在账号专属浏览器中手动登录 Google" : escapeHtml(fpInfo.tooltip)}">
             🌐 启动浏览器
           </button>
         </div>
@@ -1093,6 +1221,7 @@ function renderCardItem(item, remaining) {
 
         <div class="u-card-tools">
           <button class="tool-link" onclick="openQuickCredModal(${item.id})" title="4步安全改密、养号进度与历史凭据">🛡️ 养护</button>
+          ${item.account_type === "域名邮箱" ? "" : `<button class="tool-link" onclick="openLoginTools(${item.id})">登录工具</button>`}
           ${
             item.account_type === "Google"
               ? `<button class="tool-link" onclick="openRtOAuthModal(${item.id})" title="Antigravity RT 探测与 OAuth 授权">🛸 RT</button>`
@@ -1130,7 +1259,8 @@ function renderTableView(remaining, list = state.accounts) {
       const hasTotp = item.secret_key && item.totp && item.totp.valid;
       const totpFormatted = hasTotp ? formatTotpCode(item.totp.code) : "-";
       const usage = item.usage || { status: "active", status_label: "使用中", duration_text: "使用中" };
-      const hMeta = getHealthMeta(item.health_status || "可用");
+      const hMeta = getAccountHealthMeta(item);
+      const warmInfo = getWarmingInfo(item);
       const agMeta = getAntigravityMeta(item.antigravity_tier || "无");
       const devMeta = getDeviceMeta(item.device_tag || "主机");
       const devAttr = (state.attributes || []).find((a) => a.attr_key === "device_tag");
@@ -1160,7 +1290,7 @@ function renderTableView(remaining, list = state.accounts) {
           <div class="u-health-popover" id="health-menu-${item.id}" style="display: none;">
             <div class="popover-title">维护可用状态</div>
             <button class="health-opt ${hMeta.key === 'available' ? 'active' : ''}" onclick="onQuickSelectHealth(${item.id}, '可用')">
-              <span class="badge-dot dot-available"></span><span>可用</span>
+              <span class="badge-dot dot-available"></span><span>${item.account_type === "Google" ? "已确认登录" : "可用"}</span>
             </button>
             <button class="health-opt ${hMeta.key === 'banned' ? 'active' : ''}" onclick="onQuickSelectHealth(${item.id}, '封号')">
               <span class="badge-dot dot-banned"></span><span>封号</span>
@@ -1284,7 +1414,7 @@ function renderTableView(remaining, list = state.accounts) {
               </div>
               <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap;">
                 ${showAgBadge ? agBadgeTableHtml : ""}
-                <button class="warm-badge warm-${escapeHtml((item.warming || {}).phase || "ready")}" onclick="openQuickCredModal(${item.id})" title="${escapeHtml((item.warming || {}).hint || "")}">🌱 ${escapeHtml((item.warming || {}).label || "可改密")}</button>
+                <button class="warm-badge warm-${escapeHtml(warmInfo.phase)}" onclick="openQuickCredModal(${item.id})" title="${escapeHtml(warmInfo.hint || warmInfo.label)}">🌱 ${escapeHtml(warmInfo.label)}</button>
                 <span class="u-usage-badge ${usage.status}">${escapeHtml(usage.duration_text)}</span>
               </div>
             </div>
@@ -1295,9 +1425,11 @@ function renderTableView(remaining, list = state.accounts) {
                 ? (item.custom_fields && item.custom_fields.latest_code
                     ? `<div class="tb-col-totp tb-mail-code-cell">
                         <span class="tb-mail-code-val" onclick="copyTotpCode(null, ${item.id})" title="点击复制最新邮件验证码: ${escapeHtml(item.custom_fields.latest_code)}">${escapeHtml(item.custom_fields.latest_code)}</span>
+                        <button type="button" class="mail-code-refresh" aria-label="刷新此邮箱验证码" onclick="event.stopPropagation(); refreshSingleEmailCode(${item.id}, this)">刷新</button>
                       </div>`
                     : `<div class="tb-col-totp tb-mail-code-cell">
                         <span class="tb-mail-code-pending" onclick="copyTotpCode(null, ${item.id})" title="点击立即连接邮箱查信">暂无 (查信)</span>
+                        <button type="button" class="mail-code-refresh" aria-label="刷新此邮箱验证码" onclick="event.stopPropagation(); refreshSingleEmailCode(${item.id}, this)">刷新</button>
                       </div>`
                   )
                 : `<div class="tb-col-totp">
@@ -1315,9 +1447,10 @@ function renderTableView(remaining, list = state.accounts) {
           </td>
           <td>
             <div class="tb-col-actions">
-              <button class="btn-browser tb-btn-browser" onclick="onClickLaunchBrowser(${item.id}, this)" title="${escapeHtml(fpInfo.tooltip)}">🌐 启动</button>
+              <button class="btn-browser tb-btn-browser" onclick="onClickLaunchBrowser(${item.id}, this)" title="${item.account_type === "Google" ? "在账号专属浏览器中手动登录 Google" : escapeHtml(fpInfo.tooltip)}">🌐 启动</button>
               <div class="u-card-tools tb-tools">
                 <button class="tool-link" onclick="openQuickCredModal(${item.id})" title="4步安全改密与养号进度">养护</button>
+                ${item.account_type === "域名邮箱" ? "" : `<button class="tool-link" onclick="openLoginTools(${item.id})">登录工具</button>`}
                 ${
                   item.account_type === "Google"
                     ? `<button class="tool-link" onclick="openRtOAuthModal(${item.id})" title="RT 诊断与 OAuth 授权">RT</button>`
@@ -1368,7 +1501,7 @@ async function onClickLaunchBrowser(accountId, btnEl = null) {
   const item = state.accounts.find((a) => a.id === accountId);
   if (!item) return;
   const fp = item.fp_config || {};
-  if (item.account_type === "域名邮箱") {
+  if (item.account_type === "域名邮箱" || item.account_type === "Google") {
     await executeLaunchBrowser(accountId, btnEl);
     return;
   }
@@ -1380,7 +1513,7 @@ async function onClickLaunchBrowser(accountId, btnEl = null) {
   await executeLaunchBrowser(accountId, btnEl);
 }
 
-async function executeLaunchBrowser(accountId, btnEl = null) {
+async function executeLaunchBrowser(accountId, btnEl = null, targetUrl = "") {
   const origHtml = btnEl ? btnEl.innerHTML : "";
   const item = state.accounts.find((a) => a.id === accountId);
   if (btnEl) {
@@ -1391,20 +1524,23 @@ async function executeLaunchBrowser(accountId, btnEl = null) {
   showToast("正在打开浏览器...", 2800);
 
   try {
-    const res = await callApi("launch_browser", accountId);
+    const res = targetUrl
+      ? await callApi("launch_browser", accountId, targetUrl, true)
+      : await callApi("launch_browser", accountId);
     if (res && res.ok) {
       if (res.mailbox) {
         showToast("已在默认浏览器打开域名邮箱");
         return;
       }
-      const fp = res.fp_config || {};
-      const nodeStr = fp.proxy_node ? ` · 节点:${fp.proxy_node}` : "";
-      showToast(`🌐 已启动 [${fp.profile_code || "FP"}] (${fp.gpu_short || "GPU"}${nodeStr}) · 自动登录助手已就绪`);
-      if (item && item.account_type === "域名邮箱") {
-        await loadDashboard();
+      if (res.account) {
+        const idx = state.accounts.findIndex((a) => a.id === accountId);
+        if (idx >= 0) state.accounts[idx] = res.account;
+        renderAccounts();
       }
+      showBrowserLaunchResult(accountId, res, res.account || item);
+      if (item?.account_type === "域名邮箱") await loadDashboard();
     } else {
-      showToast(res.error || "启动指纹浏览器失败");
+      showToast(res?.error || "启动浏览器失败");
     }
   } catch (err) {
     showToast("启动浏览器异常: " + err.message);
@@ -1414,6 +1550,94 @@ async function executeLaunchBrowser(accountId, btnEl = null) {
       btnEl.disabled = false;
       btnEl.innerHTML = origHtml;
     }
+  }
+}
+
+function showBrowserLaunchResult(accountId, result, account = state.accounts.find((item) => item.id === accountId)) {
+  if (account && account.account_type !== "域名邮箱") openLoginTools(accountId);
+  if (result.profile_cleanup_pending) {
+    showToast("请关闭该账号的浏览器窗口后重新启动，以处理旧扩展。");
+  } else if (result.inpage_toolbar) {
+    const engineLabel = result.engine ? `${result.engine} ` : "";
+    showToast(`已启动 ${engineLabel}独立浏览器（网页内顶部工具栏已启用 · ⊟ 最小缩胶囊 · Alt+K 显隐）`);
+  } else if (account?.account_type === "Google") {
+    showToast("请在 Google 页面登录。账号、密码和验证码可从 KeyVault 顶部的「登录工具」复制。");
+  } else {
+    showToast("已请求打开浏览器。");
+  }
+}
+
+function openLoginTools(accountId) {
+  state.loginToolsAccountId = accountId;
+  renderLoginTools();
+}
+
+async function showFloatingLoginTools(accountId = state.loginToolsAccountId) {
+  if (!accountId) return;
+  let error = "无法打开悬浮登录工具，可在 KeyVault 主窗口复制。";
+  try {
+    const result = await callApi("show_login_tools", accountId);
+    if (result?.ok) {
+      showToast("切回该账号的浏览器即可看到登录工具条。");
+      return;
+    }
+    error = result?.error || error;
+  } catch (_) {
+    // The dashboard toolbar remains available when the native panel cannot open.
+  }
+  showToast(error);
+}
+
+function closeLoginTools() {
+  state.loginToolsAccountId = null;
+  renderLoginTools();
+}
+
+function getLoginToolsAccount() {
+  return state.accounts.find((account) =>
+    account.id === state.loginToolsAccountId && account.account_type !== "域名邮箱"
+  );
+}
+
+function renderLoginTools() {
+  const toolbar = document.getElementById("login-tools");
+  const account = getLoginToolsAccount();
+  toolbar.hidden = !account;
+  document.getElementById("login-tool-account").textContent = account?.account || "";
+  document.getElementById("login-tool-copy-password").disabled = !account?.password;
+  renderLoginToolsTotp(account);
+}
+
+function renderLoginToolsTotp(account, remaining) {
+  const code = account?.totp?.valid ? account.totp.code : "";
+  document.getElementById("login-tool-totp").textContent = code ? formatTotpCode(code) : "—";
+  document.getElementById("login-tool-totp-time").textContent = code
+    ? `${remaining ?? document.getElementById("global-remaining").textContent}s`
+    : account ? "无动态验证码" : "";
+  document.getElementById("login-tool-copy-totp").disabled = !code;
+}
+
+async function copyLoginToolValue(button, field) {
+  const account = getLoginToolsAccount();
+  if (!account) return;
+  try {
+    let value = account[field];
+    if (field === "totp") {
+      const response = await callApi("preview_totp", account.secret_key);
+      if (getLoginToolsAccount()?.id !== account.id) return;
+      value = response?.totp?.valid ? response.totp.code : "";
+      account.totp = response?.totp;
+      renderLoginToolsTotp(account, response?.totp?.remaining);
+    }
+    if (!await writeClipboard(value)) {
+      showToast("没有可复制的内容，或剪贴板不可用。");
+      return;
+    }
+    flashCopyButton(button);
+    const labels = { account: "账号", password: "密码", totp: "验证码" };
+    showToast(`已复制${labels[field]}`);
+  } catch (_) {
+    showToast("复制失败，请重试。");
   }
 }
 
@@ -1567,6 +1791,7 @@ function renderNodeModalLockState(item) {
     btnSaveOnly.style.display = "inline-flex";
     btnSaveLaunch.textContent = "🚀 锁定此配置并启动指纹浏览器";
   }
+  syncCustomSelect(portSelect);
 }
 
 function renderNodeRegionTabs() {
@@ -1577,10 +1802,18 @@ function renderNodeRegionTabs() {
   });
 
   const tabsEl = document.getElementById("node-region-tabs");
+  if (!tabsEl) return;
+  if (!tabsEl._delegated) {
+    tabsEl._delegated = true;
+    tabsEl.addEventListener("click", (e) => {
+      const btn = e.target.closest(".region-tab[data-region]");
+      if (btn) selectNodeRegion(btn.getAttribute("data-region") || "全部");
+    });
+  }
   tabsEl.innerHTML = regions
     .map(
       (r) =>
-        `<button type="button" class="region-tab ${state.selectedRegion === r ? "active" : ""}" onclick="selectNodeRegion('${escapeHtml(r)}')">${escapeHtml(r)}</button>`
+        `<button type="button" class="region-tab ${state.selectedRegion === r ? "active" : ""}" data-region="${escapeHtml(r)}">${escapeHtml(r)}</button>`
     )
     .join("");
 }
@@ -1598,13 +1831,25 @@ function renderNodeGrid(isLocked) {
   const activeNodeName = (state.proxyEnv && state.proxyEnv.active_node) || "";
   const filtered = state.selectedRegion === "全部" ? nodes : nodes.filter((n) => n.region === state.selectedRegion);
   const gridEl = document.getElementById("node-grid-container");
+  if (!gridEl) return;
+  if (!gridEl._delegated) {
+    gridEl._delegated = true;
+    gridEl.addEventListener("click", (e) => {
+      const nodeEl = e.target.closest(".node-item[data-node-name]");
+      if (!nodeEl) return;
+      onSelectNodeItem(
+        nodeEl.getAttribute("data-node-name") || "",
+        nodeEl.getAttribute("data-node-locked") === "1"
+      );
+    });
+  }
 
   const curItem = state.accounts.find((a) => a.id === state.nodeModalAccountId);
   const isClaudeAcc = curItem && curItem.account_type === "Claude";
 
   const portOnlySelected = state.selectedNodeName === "";
   const portOnlyCard = `
-    <div class="node-item ${portOnlySelected ? "selected" : ""} ${isLocked ? "disabled" : ""}" onclick="onSelectNodeItem('', ${isLocked})">
+    <div class="node-item ${portOnlySelected ? "selected" : ""} ${isLocked ? "disabled" : ""}" data-node-name="" data-node-locked="${isLocked ? "1" : "0"}">
       <span>🌐 仅绑定代理端口 (不切换特定节点 / 兼容 v2rayN·Sing-box)</span>
     </div>
   `;
@@ -1627,7 +1872,7 @@ function renderNodeGrid(isLocked) {
         const isRecommend = isClaudeAcc && /miyaip|isp|住宅|家宽/i.test(n.name);
         const recBadge = isRecommend ? `<span class="node-badge-recommend">🌟 推荐住宅</span>` : "";
         return `
-          <div class="node-item ${isSel ? "selected" : ""} ${isLiveActive ? "is-active-now" : ""} ${isLocked ? "disabled" : ""}" onclick="onSelectNodeItem('${escapeHtml(n.name)}', ${isLocked})">
+          <div class="node-item ${isSel ? "selected" : ""} ${isLiveActive ? "is-active-now" : ""} ${isLocked ? "disabled" : ""}" data-node-name="${escapeHtml(n.name)}" data-node-locked="${isLocked ? "1" : "0"}">
             <span style="display:flex;align-items:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
               ${escapeHtml(n.name)}
               ${activeBadge}
@@ -1743,6 +1988,9 @@ async function regenerateAccountFp(accountId) {
 }
 
 async function toggleCardTwofaModified(accountId, nextVal) {
+  if (state.accounts.find((account) => account.id === accountId)?.account_type === "Google") {
+    return openQuickCredModal(accountId);
+  }
   try {
     const res = await callApi("toggle_twofa_modified", accountId, nextVal);
     if (res && res.ok) {
@@ -1755,6 +2003,9 @@ async function toggleCardTwofaModified(accountId, nextVal) {
 }
 
 async function toggleCardPasswordModified(accountId, nextVal) {
+  if (state.accounts.find((account) => account.id === accountId)?.account_type === "Google") {
+    return openQuickCredModal(accountId);
+  }
   try {
     const res = await callApi("toggle_password_modified", accountId, nextVal);
     if (res && res.ok) {
@@ -1772,7 +2023,8 @@ function startZeroOverheadTotpTicker() {
   const ringEl = document.getElementById("global-ring");
   const remEl = document.getElementById("global-remaining");
 
-  setInterval(async () => {
+  if (totpTickerTimer) clearInterval(totpTickerTimer);
+  totpTickerTimer = setInterval(async () => {
     const totpOffsetSec = Number(state.settings?.totp_offset_seconds || 0);
     const nowSec = Math.floor(Date.now() / 1000) + totpOffsetSec;
     const remaining = 30 - (((nowSec % 30) + 30) % 30);
@@ -1809,6 +2061,9 @@ function startZeroOverheadTotpTicker() {
       } catch (e) {
         console.error("Refresh TOTP error:", e);
       }
+    }
+    if (state.loginToolsAccountId !== null) {
+      renderLoginToolsTotp(getLoginToolsAccount(), remaining);
     }
   }, 1000);
 }
@@ -1955,10 +2210,14 @@ async function refreshDomainEmailCodes() {
   }
 }
 
-async function refreshSingleEmailCode(accountId) {
+async function refreshSingleEmailCode(accountId, button = null) {
   const codeEl = document.getElementById(`totp-code-${accountId}`);
   const prevText = codeEl ? codeEl.textContent : "";
-  if (codeEl) codeEl.textContent = "查信中...";
+  const prevButtonText = button ? button.textContent : "";
+  if (button) {
+    button.disabled = true;
+    button.textContent = "查信中…";
+  }
   showToast("正在检查该邮箱收件箱...", 2000);
   try {
     const result = await pollDomainEmailCodes(true, [accountId]);
@@ -1966,8 +2225,12 @@ async function refreshSingleEmailCode(accountId) {
       ? (result.codes[accountId] || result.codes[String(accountId)])
       : null;
     if (info && info.code) {
-      await writeClipboard(String(info.code));
-      showToast(`✓ 已获取并复制验证码: ${info.code}`);
+      if (button) {
+        showToast(`✓ 已刷新验证码: ${info.code}`);
+      } else {
+        await writeClipboard(String(info.code));
+        showToast(`✓ 已获取并复制验证码: ${info.code}`);
+      }
     } else if (codeEl && document.body.contains(codeEl)) {
       codeEl.textContent = prevText || "暂无 (查信)";
     }
@@ -1976,6 +2239,11 @@ async function refreshSingleEmailCode(accountId) {
       codeEl.textContent = prevText || "暂无 (查信)";
     }
     showToast("查信失败: " + err.message);
+  } finally {
+    if (button && document.body.contains(button)) {
+      button.disabled = false;
+      button.textContent = prevButtonText || "刷新";
+    }
   }
 }
 
@@ -2023,9 +2291,11 @@ async function writeClipboard(text) {
     ta.style.opacity = "0";
     document.body.appendChild(ta);
     ta.select();
-    document.execCommand("copy");
-    document.body.removeChild(ta);
-    return true;
+    try {
+      return document.execCommand("copy");
+    } finally {
+      ta.remove();
+    }
   }
 }
 
@@ -2093,24 +2363,22 @@ async function copyFullFormattedLine(accountId) {
 
 function flashCopyButton(btnEl) {
   if (!btnEl || !btnEl.classList.contains("copy-btn")) return;
-  const original = btnEl.textContent;
+  if (!btnEl.dataset.origText) {
+    btnEl.dataset.origText = btnEl.textContent;
+  }
+  if (btnEl._copyTimer) {
+    clearTimeout(btnEl._copyTimer);
+  }
   btnEl.classList.add("copied");
   btnEl.textContent = "✓ 已复制";
-  setTimeout(() => {
+  btnEl._copyTimer = setTimeout(() => {
     btnEl.classList.remove("copied");
-    btnEl.textContent = original;
+    btnEl.textContent = btnEl.dataset.origText || btnEl.textContent;
+    btnEl._copyTimer = null;
   }, 1100);
 }
 
-// Filters & Search
-
-function setStatusFilter(status) {
-  state.statusFilter = status;
-  document.querySelectorAll("#status-tabs .seg-btn").forEach((btn) => {
-    btn.classList.toggle("active", btn.dataset.status === status);
-  });
-  loadDashboard();
-}
+// Search & Filter
 
 let searchDebounce = null;
 function onSearchInput(val) {
@@ -2132,6 +2400,7 @@ function clearSearch() {
 function applyTheme(theme, persist = true) {
   state.theme = theme;
   document.documentElement.setAttribute("data-theme", theme);
+  document.body.classList.toggle("light-theme", theme === "light");
   if (persist) {
     callApi("save_settings", { theme }).catch(() => {});
   }
@@ -2166,7 +2435,11 @@ function fillTodayDeactivated() {
 }
 
 // Modal: Add / Edit + Express Smart Paste
+let accountEditDynamicValues = null;
+
 function openAddModal() {
+  clearAccountEditHistory();
+  accountEditDynamicValues = null;
   document.getElementById("modal-title").textContent = "添加账号 · 智能快递式识别";
   document.getElementById("smart-paste-section").style.display = "block";
   document.getElementById("batch-banner").style.display = "none";
@@ -2205,13 +2478,14 @@ function openEditModal(accountId) {
     device_tag: item.device_tag,
     ...(item.custom_fields || {}),
   });
+  accountEditDynamicValues = { accountType: item.account_type, values: getCurrentDynamicFormValues() };
   document.getElementById("field-password-modified").checked = !!item.password_modified;
   document.getElementById("field-twofa-modified").checked = !!item.twofa_modified;
   document.getElementById("field-account").value = item.account || "";
   const pwdEl = document.getElementById("field-password");
   pwdEl.value = item.password || "";
   pwdEl.oninput = () => {
-    if (item.password && pwdEl.value.trim() && pwdEl.value.trim() !== item.password) {
+    if (getRadioType() !== "Google" && item.password && pwdEl.value.trim() && pwdEl.value.trim() !== item.password) {
       document.getElementById("field-password-modified").checked = true;
     }
   };
@@ -2234,10 +2508,77 @@ function openEditModal(accountId) {
   onSecretFieldInput(item.secret_key || "");
 
   document.getElementById("account-modal").style.display = "flex";
+  loadAccountEditHistory(accountId);
 }
 
 function closeAccountModal() {
   document.getElementById("account-modal").style.display = "none";
+  accountEditDynamicValues = null;
+  clearAccountEditHistory();
+}
+
+function clearAccountEditHistory() {
+  document.getElementById("account-edit-history").hidden = true;
+  document.getElementById("account-edit-history-list").replaceChildren();
+}
+
+async function loadAccountEditHistory(accountId) {
+  const section = document.getElementById("account-edit-history");
+  const list = document.getElementById("account-edit-history-list");
+  const message = document.createElement("p");
+  message.textContent = "正在读取变更历史…";
+  list.replaceChildren(message);
+  section.hidden = false;
+  try {
+    const result = await callApi("get_account_change_history", accountId);
+    if (!message.isConnected) return;
+    if (!result?.ok) throw new Error(result?.error || "读取失败");
+    if (!result.history.length) {
+      message.textContent = "暂无变更记录。";
+      return;
+    }
+
+    const entries = document.createDocumentFragment();
+    for (const entry of result.history) {
+      const row = document.createElement("article");
+      row.className = "account-edit-history-entry";
+      row.innerHTML = `<div class="account-edit-history-meta"><strong></strong><time></time></div>
+        <div class="account-edit-history-values"><div>修改前 <span></span></div><div>修改后 <span></span></div></div>`;
+      row.querySelector("strong").textContent = entry.label || entry.field;
+      const time = row.querySelector("time");
+      time.dateTime = entry.created_at;
+      time.textContent = new Date(entry.created_at).toLocaleString();
+      const [before, after] = row.querySelectorAll(".account-edit-history-values span");
+      const format = (value) => {
+        if (value == null || value === "") return "（空）";
+        if (typeof value === "boolean") return value ? "是" : "否";
+        return typeof value === "object" ? JSON.stringify(value) : String(value);
+      };
+      const renderValues = (reveal) => {
+        before.textContent = reveal || !entry.old_value ? format(entry.old_value) : "••••••••";
+        after.textContent = reveal || !entry.new_value ? format(entry.new_value) : "••••••••";
+      };
+      renderValues(!entry.sensitive);
+      if (entry.sensitive) {
+        const reveal = document.createElement("button");
+        reveal.type = "button";
+        reveal.className = "btn btn-ghost btn-xs";
+        reveal.textContent = "显示原值";
+        reveal.setAttribute("aria-pressed", "false");
+        reveal.addEventListener("click", () => {
+          const visible = reveal.getAttribute("aria-pressed") !== "true";
+          reveal.setAttribute("aria-pressed", String(visible));
+          reveal.textContent = visible ? "隐藏原值" : "显示原值";
+          renderValues(visible);
+        });
+        row.querySelector(".account-edit-history-meta").append(reveal);
+      }
+      entries.append(row);
+    }
+    list.replaceChildren(entries);
+  } catch (error) {
+    message.textContent = "变更历史读取失败: " + error.message;
+  }
 }
 
 function setRadioHealth(status) {
@@ -2377,10 +2718,10 @@ async function onSmartPasteInput(rawText) {
       const cleaned = normalizeSecretString(sObj.secret_key);
       const secretEl = document.getElementById("field-secret");
       const initEl = document.getElementById("field-initial-secret");
-      if (secretEl.value && secretEl.value !== cleaned && !initEl.value) {
+      if (getRadioType() !== "Google" && secretEl.value && secretEl.value !== cleaned && !initEl.value) {
         initEl.value = normalizeSecretString(secretEl.value);
         document.getElementById("field-twofa-modified").checked = true;
-      } else if (sObj.twofa_modified) {
+      } else if (getRadioType() !== "Google" && sObj.twofa_modified) {
         document.getElementById("field-twofa-modified").checked = true;
       }
       secretEl.value = cleaned;
@@ -2411,10 +2752,12 @@ async function onSmartPasteInput(rawText) {
       antigravity_tier: first.antigravity_tier || "无",
       device_tag: first.device_tag || "主机",
     });
-    if (first.password_modified) {
-      document.getElementById("field-password-modified").checked = true;
+    if (recType !== "Google") {
+      if (first.password_modified) {
+        document.getElementById("field-password-modified").checked = true;
+      }
+      document.getElementById("field-twofa-modified").checked = !!first.twofa_modified;
     }
-    document.getElementById("field-twofa-modified").checked = !!first.twofa_modified;
     document.getElementById("field-account").value = first.account || "";
     document.getElementById("field-password").value = first.password || "";
     document.getElementById("field-secret").value = normalizeSecretString(first.secret_key);
@@ -2482,10 +2825,13 @@ async function submitAccountForm(e) {
   e.preventDefault();
   const accType = getRadioType();
   const dynVals = getCurrentDynamicFormValues();
+  const previous = accountEditDynamicValues?.accountType === accType ? accountEditDynamicValues.values : {};
   const custom_fields = {};
   (state.attributes || []).forEach((attr) => {
-    if (!["health_status", "device_tag", "antigravity_tier"].includes(attr.attr_key) && dynVals[attr.attr_key] !== undefined) {
-      custom_fields[attr.attr_key] = dynVals[attr.attr_key];
+    const key = attr.attr_key;
+    if (!["health_status", "device_tag", "antigravity_tier"].includes(key) &&
+        dynVals[key] !== undefined && dynVals[key] !== previous[key]) {
+      custom_fields[key] = dynVals[key];
     }
   });
   const recPwdVal = (document.getElementById("field-recovery-password")?.value || "").trim();
@@ -2495,7 +2841,9 @@ async function submitAccountForm(e) {
   }
   if (apiKeyOrSessionVal.startsWith("sk-")) {
     custom_fields.api_key = apiKeyOrSessionVal;
+    custom_fields.session_token = "";
   } else if (apiKeyOrSessionVal) {
+    custom_fields.api_key = "";
     custom_fields.session_token = apiKeyOrSessionVal;
   } else if (document.getElementById("field-id").value) {
     custom_fields.api_key = "";
@@ -2648,6 +2996,27 @@ function openSettingsModal() {
     if (defTotp && state.settings.totp_interval) defTotp.value = String(state.settings.totp_interval);
     if (selPlat && state.settings.default_account_type) selPlat.value = state.settings.default_account_type;
     if (selDev && state.settings.default_device_tag) selDev.value = state.settings.default_device_tag;
+
+    const engSel = document.getElementById("set-browser-engine");
+    if (engSel) {
+      const rawMode = state.settings.browser_engine_mode || "inpage_edge";
+      const validModes = ["inpage_edge", "inpage_chrome_cdp", "pure_native"];
+      engSel.value = validModes.includes(rawMode) ? rawMode : "inpage_edge";
+    }
+    const prefSel = document.getElementById("set-preferred-browser");
+    if (prefSel) prefSel.value = state.settings.preferred_browser || "auto";
+    const customPathEl = document.getElementById("set-custom-browser-path");
+    if (customPathEl) customPathEl.value = state.settings.custom_browser_path || "";
+    const langSel = document.getElementById("set-browser-lang");
+    if (langSel) langSel.value = state.settings.default_browser_lang || "match_region";
+    const startUrlSel = document.getElementById("set-default-start-url");
+    if (startUrlSel) startUrlSel.value = state.settings.default_start_url || "https://myaccount.google.com/";
+    const geoChk = document.getElementById("set-auto-probe-geo");
+    if (geoChk) geoChk.checked = state.settings.auto_probe_geo_on_launch !== false;
+    const urlChk = document.getElementById("set-url-interception");
+    if (urlChk) {
+      urlChk.checked = !!(state.settings.url_interception_live ?? state.settings.url_interception_enabled);
+    }
   }
 
   // Sync custom selects
@@ -2655,6 +3024,11 @@ function openSettingsModal() {
   syncCustomSelect(document.getElementById("set-totp-interval"));
   syncCustomSelect(selPlat);
   syncCustomSelect(selDev);
+  syncCustomSelect(document.getElementById("set-browser-engine"));
+  syncCustomSelect(document.getElementById("set-preferred-browser"));
+  syncCustomSelect(document.getElementById("set-browser-lang"));
+  syncCustomSelect(document.getElementById("set-default-start-url"));
+  onPreferredBrowserChange();
 
   const offsetEl = document.getElementById("lbl-totp-offset");
   if (offsetEl) {
@@ -2733,7 +3107,7 @@ function renderDictPane(dictType) {
       <td><strong>${escapeHtml(item.dict_key)}</strong></td>
       <td>
         <span class="dict-badge">
-          ${item.icon ? `<span>${item.icon}</span>` : ""}
+          ${item.icon ? `<span>${escapeHtml(item.icon)}</span>` : ""}
           <span>${escapeHtml(item.dict_label || item.dict_key)}</span>
         </span>
       </td>
@@ -2849,22 +3223,75 @@ async function confirmDeleteDict(dictId) {
   }
 }
 
+function onPreferredBrowserChange() {
+  const pref = document.getElementById("set-preferred-browser")?.value || "auto";
+  const grp = document.getElementById("set-custom-browser-group");
+  if (grp) grp.style.display = pref === "custom" ? "block" : "none";
+}
+
+async function onClickPickBrowserExe() {
+  try {
+    const res = await callApi("pick_browser_executable");
+    if (res && res.ok && !res.canceled && res.path) {
+      const inp = document.getElementById("set-custom-browser-path");
+      if (inp) inp.value = res.path;
+      const prefSel = document.getElementById("set-preferred-browser");
+      if (prefSel) {
+        prefSel.value = "custom";
+        syncCustomSelect(prefSel);
+      }
+      onPreferredBrowserChange();
+    }
+  } catch (err) {
+    showToast("选择浏览器路径失败: " + err.message);
+  }
+}
+
 async function saveGeneralSettings() {
   const viewMode = document.getElementById("set-default-view")?.value || "compact";
   const totpInterval = parseInt(document.getElementById("set-totp-interval")?.value, 10) || 30;
   const defPlat = document.getElementById("set-default-account-type")?.value || "ChatGPT";
   const defDev = document.getElementById("set-default-device-tag")?.value || "主机";
+  const browserEngineMode = document.getElementById("set-browser-engine")?.value || "inpage_edge";
+  const preferredBrowser = document.getElementById("set-preferred-browser")?.value || "auto";
+  const customBrowserPath = (document.getElementById("set-custom-browser-path")?.value || "").trim();
+  const defaultBrowserLang = document.getElementById("set-browser-lang")?.value || "match_region";
+  const defaultStartUrl = document.getElementById("set-default-start-url")?.value || "https://myaccount.google.com/";
+  const autoProbeGeo = !!document.getElementById("set-auto-probe-geo")?.checked;
+  const urlIntercept = !!document.getElementById("set-url-interception")?.checked;
 
+  const urlChk = document.getElementById("set-url-interception");
+  const prevIntercept = !!(state.settings?.url_interception_live ?? state.settings?.url_interception_enabled);
   try {
-    await callApi("save_settings", {
+    const updated = await callApi("save_settings", {
       view_mode: viewMode,
       totp_interval: totpInterval,
       default_account_type: defPlat,
       default_device_tag: defDev,
+      browser_engine_mode: browserEngineMode,
+      preferred_browser: preferredBrowser,
+      custom_browser_path: customBrowserPath,
+      default_browser_lang: defaultBrowserLang,
+      default_start_url: defaultStartUrl,
+      auto_probe_geo_on_launch: autoProbeGeo,
     });
-    showToast("✓ 系统常用设置已保存");
-    applyViewMode(viewMode, true);
+    state.settings = updated;
+    if (urlIntercept !== prevIntercept) {
+      const tRes = await callApi("toggle_url_interception", urlIntercept);
+      if (!tRes || !tRes.ok) {
+        if (urlChk) urlChk.checked = !!(tRes && tRes.enabled);
+        state.settings.url_interception_live = !!(tRes && tRes.enabled);
+        showToast((tRes && tRes.error) || "外链接管切换失败，其余设置已保存");
+        applyViewMode(viewMode, false);
+        await loadDashboard();
+        return;
+      }
+      state.settings.url_interception_live = !!tRes.enabled;
+    }
+    showToast("✓ 系统常用设置与浏览器防风控配置已保存");
+    applyViewMode(viewMode, false);
     closeSettingsModal();
+    await loadDashboard();
   } catch (err) {
     showToast("保存设置失败: " + err.message);
   }
@@ -2919,6 +3346,9 @@ function enhanceSelectToCustom(selectEl) {
   // Toggle dropdown on trigger click
   trigger.addEventListener("click", (e) => {
     e.stopPropagation();
+    if (selectEl.disabled || wrap.classList.contains("is-disabled")) {
+      return;
+    }
     const isOpen = wrap.classList.contains("open");
     closeAllCustomSelects();
     closeAllHealthPopovers();
@@ -2949,6 +3379,10 @@ function syncCustomSelect(selectEl) {
   const trigger = wrap.querySelector(".c-select-trigger");
   const labelEl = trigger.querySelector(".c-select-label");
   const menu = wrap.querySelector(".c-select-menu");
+  const isDisabled = !!selectEl.disabled;
+  trigger.disabled = isDisabled;
+  wrap.classList.toggle("is-disabled", isDisabled);
+  if (isDisabled) wrap.classList.remove("open", "drop-up");
 
   const selectedOpt = selectEl.options[selectEl.selectedIndex] || selectEl.options[0];
   const selectedVal = selectEl.value;
@@ -2973,6 +3407,7 @@ function syncCustomSelect(selectEl) {
 
     item.addEventListener("click", (e) => {
       e.stopPropagation();
+      if (selectEl.disabled) return;
       selectEl.value = opt.value;
       wrap.classList.remove("open");
       wrap.classList.remove("drop-up");
@@ -2992,7 +3427,7 @@ function closeAllCustomSelects() {
 }
 
 function initAllCustomSelects() {
-  document.querySelectorAll("select").forEach((sel) => {
+  document.querySelectorAll("select:not([data-native-select])").forEach((sel) => {
     enhanceSelectToCustom(sel);
   });
 
@@ -3040,6 +3475,11 @@ window.addEventListener("keydown", (e) => {
       closeAppealModal();
       return;
     }
+    const attrEditModal = document.getElementById("attr-edit-modal");
+    if (attrEditModal && attrEditModal.style.display !== "none") {
+      if (typeof closeAttrEditModal === "function") closeAttrEditModal();
+      return;
+    }
     const dictEditModal = document.getElementById("dict-edit-modal");
     if (dictEditModal && dictEditModal.style.display !== "none") {
       closeDictEditModal();
@@ -3055,9 +3495,15 @@ window.addEventListener("keydown", (e) => {
       closeNodeModal();
       return;
     }
-    const mainModal = document.getElementById("modal");
-    if (mainModal && mainModal.style.display !== "none") {
-      closeModal();
+    const exportModal = document.getElementById("export-modal");
+    if (exportModal && exportModal.style.display !== "none") {
+      if (typeof closeExportModal === "function") closeExportModal();
+      else exportModal.style.display = "none";
+      return;
+    }
+    const accountModal = document.getElementById("account-modal");
+    if (accountModal && accountModal.style.display !== "none") {
+      closeAccountModal();
       return;
     }
   }
@@ -3070,6 +3516,15 @@ window.addEventListener("keydown", (e) => {
 function renderAttributesPane() {
   const tbody = document.getElementById("attrs-table-body");
   if (!tbody) return;
+  if (!tbody._delegated) {
+    tbody._delegated = true;
+    tbody.addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-dict-tab]");
+      if (btn) {
+        switchSettingsTab("dict-" + (btn.getAttribute("data-dict-tab") || ""));
+      }
+    });
+  }
 
   const items = state.attributes || [];
   if (items.length === 0) {
@@ -3124,9 +3579,9 @@ function renderAttributesPane() {
             <button class="tool-link" onclick="openEditAttrModal(${item.id})">编辑</button>
             ${
               item.attr_type === "select" && item.dict_type
-                ? `<button class="tool-link" style="color:var(--color-chatgpt);" onclick="switchSettingsTab('dict-${escapeHtml(
+                ? `<button class="tool-link" style="color:var(--color-chatgpt);" data-dict-tab="${escapeHtml(
                     item.dict_type
-                  )}')">维护字典</button>`
+                  )}">维护字典</button>`
                 : ""
             }
             ${
@@ -3184,7 +3639,7 @@ function renderAttrPlatformCheckboxes(boundPlatforms) {
         <input type="checkbox" name="attr_platform" value="${escapeHtml(opt.key)}" ${
         checked ? "checked" : ""
       } onchange="onAttrPlatformCheckboxChange(this)" style="display:none;" />
-        <span>${opt.icon ? `${opt.icon} ` : ""}${escapeHtml(opt.label)}</span>
+        <span>${opt.icon ? `${escapeHtml(opt.icon)} ` : ""}${escapeHtml(opt.label)}</span>
       </label>
       `;
     })
@@ -3420,7 +3875,7 @@ function syncAccountTypeRadios(selectedType = "ChatGPT") {
       const dot = d.color_class
         ? `<span class="badge-dot dot-${escapeHtml(d.color_class)}"></span>`
         : d.icon
-        ? `${d.icon} `
+        ? `${escapeHtml(d.icon)} `
         : "";
       return `
       <label class="type-radio">
@@ -3467,8 +3922,8 @@ function renderAccountModalDynamicFields(accountType, currentValues = {}) {
         )
           .map((d) => {
             const checked = d.dict_key === curVal ? "checked" : "";
-            const cls = d.color_class ? `pill-${d.color_class}` : "";
-            const dot = d.color_class ? `<span class="badge-dot dot-${d.color_class}"></span>` : "";
+            const cls = d.color_class ? `pill-${escapeHtml(d.color_class)}` : "";
+            const dot = d.color_class ? `<span class="badge-dot dot-${escapeHtml(d.color_class)}"></span>` : "";
             return `
             <label class="type-radio">
               <input type="radio" name="health_status" value="${escapeHtml(d.dict_key)}" ${checked} />
@@ -3502,7 +3957,7 @@ function renderAccountModalDynamicFields(accountType, currentValues = {}) {
             return `
             <label class="type-radio">
               <input type="radio" name="device_tag" value="${escapeHtml(d.dict_key)}" ${checked} />
-              <span class="radio-pill"><span class="device-dot"></span>${d.icon ? `${d.icon} ` : ""}${escapeHtml(d.dict_label || d.dict_key)}</span>
+              <span class="radio-pill"><span class="device-dot"></span>${d.icon ? `${escapeHtml(d.icon)} ` : ""}${escapeHtml(d.dict_label || d.dict_key)}</span>
             </label>
           `;
           })
@@ -3529,8 +3984,8 @@ function renderAccountModalDynamicFields(accountType, currentValues = {}) {
         )
           .map((d) => {
             const checked = d.dict_key === curVal ? "checked" : "";
-            const cls = d.color_class ? `pill-${d.color_class}` : "";
-            const dot = d.color_class ? `<span class="badge-dot dot-${d.color_class}"></span>` : "";
+            const cls = d.color_class ? `pill-${escapeHtml(d.color_class)}` : "";
+            const dot = d.color_class ? `<span class="badge-dot dot-${escapeHtml(d.color_class)}"></span>` : "";
             return `
             <label class="type-radio">
               <input type="radio" name="antigravity_tier" value="${escapeHtml(d.dict_key)}" ${checked} />
@@ -3558,7 +4013,7 @@ function renderAccountModalDynamicFields(accountType, currentValues = {}) {
             return `
             <label class="type-radio">
               <input type="radio" name="${escapeHtml(attr.attr_key)}" value="${escapeHtml(d.dict_key)}" ${checked} />
-              <span class="radio-pill">${d.icon ? `${d.icon} ` : ""}${escapeHtml(d.dict_label || d.dict_key)}</span>
+              <span class="radio-pill">${d.icon ? `${escapeHtml(d.icon)} ` : ""}${escapeHtml(d.dict_label || d.dict_key)}</span>
             </label>
           `;
           })
@@ -3740,6 +4195,13 @@ async function onClickSyncGoogleTime() {
 async function loadBackupsList() {
   const box = document.getElementById("settings-backup-list");
   if (!box) return;
+  if (!box._delegated) {
+    box._delegated = true;
+    box.addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-restore-backup]");
+      if (btn) onClickRestoreBackup(btn.getAttribute("data-restore-backup") || "");
+    });
+  }
   try {
     const res = await callApi("list_backups");
     const list = (res && res.backups) || [];
@@ -3755,7 +4217,7 @@ async function loadBackupsList() {
             <strong>${escapeHtml(b.filename)}</strong>
             <span>${escapeHtml(b.created_at)} · ${(Number(b.size_bytes || 0) / 1024).toFixed(1)} KB</span>
           </div>
-          <button type="button" class="btn btn-secondary btn-xs" onclick="onClickRestoreBackup('${escapeHtml(b.filename)}')">
+          <button type="button" class="btn btn-secondary btn-xs" data-restore-backup="${escapeHtml(b.filename)}">
             ♻️ 恢复到此版本
           </button>
         </div>
@@ -3805,14 +4267,21 @@ async function openQuickCredModal(accountId) {
   state.activeQuickCredAccountId = accountId;
 
   document.getElementById("qc-account-id").value = String(accountId);
-  document.getElementById("qc-modal-title").textContent = `🛡️ 养护与快捷改密 · ${acc.account}`;
-  document.getElementById("qc-modal-subtitle").textContent = `${acc.account_type} · 当前健康状态: ${acc.health_status || "可用"}`;
+  const isGoogle = acc.account_type === "Google";
+  const title = isGoogle ? "账号养护" : "养护与快捷改密";
+  document.getElementById("qc-modal-title").textContent = `${title} · ${acc.account}`;
+  document.getElementById("qc-modal-subtitle").textContent = `${acc.account_type} · ${getAccountHealthMeta(acc).label}`;
+  document.getElementById("qc-generate-password").textContent = isGoogle ? "生成候选密码" : "生成密码并复制";
+  const genSecretBtn = document.getElementById("qc-generate-secret");
+  if (genSecretBtn) {
+    genSecretBtn.textContent = "随机新密钥";
+    genSecretBtn.hidden = isGoogle;
+  }
+  document.getElementById("qc-google-confirm-label").hidden = !isGoogle;
+  document.getElementById("qc-google-confirmed").checked = false;
+  renderGoogleReview(acc);
 
-  const warm = acc.warming || { phase: "ready", label: "可改密", hint: "" };
-  const wb = document.getElementById("qc-warming-badge");
-  wb.className = `warm-badge warm-${warm.phase}`;
-  wb.textContent = `🌱 ${warm.label}`;
-  document.getElementById("qc-warming-hint").textContent = warm.hint || "";
+  renderQuickCredWarming(acc);
   document.getElementById("qc-scan-qr-mode").checked = !!(acc.custom_fields && acc.custom_fields.scan_qr_mode);
 
   const sec = acc.security || {};
@@ -3828,20 +4297,21 @@ async function openQuickCredModal(accountId) {
   document.getElementById("qc-note").value = acc.note || "";
   onQcSecretInput(acc.secret_key || "");
 
+  const recoveryEmail = document.getElementById("qc-recovery-email");
   const chipsEl = document.getElementById("qc-top-recovery-chips");
-  if (chipsEl) {
-    const tops = state.topRecoveryEmails || [];
-    chipsEl.innerHTML = tops.length
-      ? tops
-          .slice(0, 6)
-          .map(
-            (x) =>
-              `<button type="button" class="recovery-chip" onclick="document.getElementById('qc-recovery-email').value='${escapeHtml(
-                x.email
-              )}'" title="已使用 ${x.count} 次">${escapeHtml(x.email)} (${x.count})</button>`
-          )
-          .join("")
-      : "";
+  chipsEl.replaceChildren();
+  for (const { email, count } of state.topRecoveryEmails.slice(0, 6)) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "recovery-chip";
+    chip.title = `已使用 ${count} 次`;
+    chip.textContent = `${email} (${count})`;
+    chip.addEventListener("click", () => {
+      if (recoveryEmail.value === email) return;
+      recoveryEmail.value = email;
+      recoveryEmail.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    chipsEl.append(chip);
   }
 
   document.getElementById("quick-cred-modal").style.display = "flex";
@@ -3849,50 +4319,105 @@ async function openQuickCredModal(accountId) {
 }
 
 function closeQuickCredModal() {
-  const modal = document.getElementById("quick-cred-modal");
-  if (modal) modal.style.display = "none";
+  state.activeQuickCredAccountId = null;
+  document.getElementById("quick-cred-modal").style.display = "none";
+  document.getElementById("qc-history-list").replaceChildren();
+  document.getElementById("qc-history-count").textContent = "";
 }
+
+function renderQuickCredWarming(account) {
+  const warm = getWarmingInfo(account);
+  const badge = document.getElementById("qc-warming-badge");
+  badge.className = `warm-badge warm-${warm.phase}`;
+  badge.textContent = `🌱 ${warm.label}`;
+  document.getElementById("qc-warming-hint").textContent = warm.hint || "";
+}
+
+function renderGoogleReview(account) {
+  document.getElementById("qc-google-review").hidden = account.account_type !== "Google";
+  if (account.account_type !== "Google") return;
+  const reviewedAt = account.custom_fields?.google_reviewed_at;
+  const statusLabel = getAccountHealthMeta(account).label;
+  document.getElementById("qc-modal-subtitle").textContent = `Google · ${statusLabel}`;
+  document.getElementById("qc-google-review-status").textContent = statusLabel;
+  document.getElementById("qc-google-review-time").textContent = reviewedAt
+    ? `上次核对 ${new Date(reviewedAt).toLocaleString()}`
+    : "尚无人工核对时间";
+}
+
+async function onGoogleReviewChange(select) {
+  const accountId = state.activeQuickCredAccountId;
+  const status = select.value;
+  if (!accountId || !status) return;
+  select.disabled = true;
+  try {
+    await onQuickSelectHealth(accountId, status);
+  } finally {
+    select.value = "";
+    select.disabled = false;
+  }
+}
+
+function openGoogleSecurityPage() {
+  const accountId = state.activeQuickCredAccountId;
+  if (accountId) return executeLaunchBrowser(accountId, null, "https://myaccount.google.com/security");
+}
+
+document.getElementById("quick-cred-modal").addEventListener("input", (event) => {
+  if (["qc-password", "qc-secret", "qc-recovery-email", "qc-recovery-password", "qc-sec-pwd",
+    "qc-sec-2fa", "qc-sec-recovery", "qc-sec-devices"].includes(event.target.id)) {
+    document.getElementById("qc-google-confirmed").checked = false;
+  }
+});
 
 async function loadQuickCredHistory(accountId) {
   const listEl = document.getElementById("qc-history-list");
   const countEl = document.getElementById("qc-history-count");
-  if (!listEl) return;
+  const message = document.createElement("div");
+  message.className = "backup-empty";
+  message.textContent = "正在加载凭据历史…";
+  countEl.textContent = "";
+  listEl.replaceChildren(message);
   try {
     const res = await callApi("get_credential_history", accountId);
-    const hist = (res && res.history) || [];
-    if (countEl) countEl.textContent = `${hist.length} 条记录`;
-    if (!hist.length) {
-      listEl.innerHTML = `<div class="backup-empty">暂无历史变更记录（修改密码 / 2FA / 辅助邮箱后将自动归档旧凭据）</div>`;
+    if (!message.isConnected) return;
+    const history = res?.history || [];
+    countEl.textContent = `${history.length} 条记录`;
+    if (!history.length) {
+      message.textContent = "暂无历史变更记录（修改密码 / 2FA / 辅助邮箱后将自动归档旧凭据）";
       return;
     }
-    listEl.innerHTML = hist
-      .map((h) => {
-        const parts = [];
-        if (h.old_password) {
-          parts.push(`<span class="hist-chip" onclick="copyPlainText('${escapeHtml(h.old_password)}','历史密码')" title="点击复制旧密码">🔑 ${escapeHtml(h.old_password)}</span>`);
-        }
-        if (h.old_secret_key) {
-          parts.push(`<span class="hist-chip" onclick="copyPlainText('${escapeHtml(h.old_secret_key)}','历史2FA')" title="点击复制旧2FA">🛡️ ${escapeHtml(h.old_secret_key)}</span>`);
-        }
-        if (h.old_recovery_email) {
-          parts.push(`<span class="hist-chip" onclick="copyPlainText('${escapeHtml(h.old_recovery_email)}','历史辅助邮箱')" title="点击复制旧辅助邮箱">📧 ${escapeHtml(h.old_recovery_email)}</span>`);
-        }
-        if (h.old_recovery_password) {
-          parts.push(`<span class="hist-chip" onclick="copyPlainText('${escapeHtml(h.old_recovery_password)}','历史辅助密码')" title="点击复制旧辅助邮箱密码">🔐 ${escapeHtml(h.old_recovery_password)}</span>`);
-        }
-        return `
-          <div class="cred-history-item">
-            <div class="cred-history-meta">
-              <span>${escapeHtml(h.created_at || "")}</span>
-              <span class="hist-reason">${escapeHtml(h.reason || "update")}</span>
-            </div>
-            <div class="cred-history-vals">${parts.join("")}</div>
-          </div>
-        `;
-      })
-      .join("");
+
+    const items = document.createDocumentFragment();
+    for (const entry of history) {
+      const item = document.createElement("div");
+      item.className = "cred-history-item";
+      item.innerHTML = `
+        <div class="cred-history-meta"><span></span><span class="hist-reason"></span></div>
+        <div class="cred-history-vals"></div>`;
+      item.querySelector(".cred-history-meta span").textContent = entry.created_at || "";
+      item.querySelector(".hist-reason").textContent = entry.reason || "update";
+      const values = item.querySelector(".cred-history-vals");
+      for (const [value, icon, label] of [
+        [entry.old_password, "🔑", "历史密码"],
+        [entry.old_secret_key, "🛡️", "历史2FA"],
+        [entry.old_recovery_email, "📧", "历史辅助邮箱"],
+        [entry.old_recovery_password, "🔐", "历史辅助密码"],
+      ]) {
+        if (!value) continue;
+        const chip = document.createElement("button");
+        chip.type = "button";
+        chip.className = "hist-chip";
+        chip.title = `点击复制${label}`;
+        chip.textContent = `${icon} ${value}`;
+        chip.addEventListener("click", () => copyPlainText(value, label));
+        values.append(chip);
+      }
+      items.append(item);
+    }
+    listEl.replaceChildren(items);
   } catch (err) {
-    listEl.innerHTML = `<div class="backup-empty">加载失败: ${escapeHtml(err.message)}</div>`;
+    message.textContent = `加载失败: ${err.message}`;
   }
 }
 
@@ -3919,6 +4444,11 @@ async function onClickQcGenPassword() {
     const res = await callApi("generate_strong_password", 16);
     if (res && res.password) {
       document.getElementById("qc-password").value = res.password;
+      if (state.accounts.find((account) => account.id === state.activeQuickCredAccountId)?.account_type === "Google") {
+        document.getElementById("qc-google-confirmed").checked = false;
+        copyPlainText(res.password, "16位候选密码（请在 Google 安全页修改生效后勾选确认再保存）");
+        return;
+      }
       document.getElementById("qc-sec-pwd").checked = true;
       copyPlainText(res.password, "16位强密码");
     }
@@ -3928,6 +4458,9 @@ async function onClickQcGenPassword() {
 }
 
 async function onClickQcGenSecret() {
+  if (state.accounts.find((account) => account.id === state.activeQuickCredAccountId)?.account_type === "Google") {
+    return openGoogleSecurityPage();
+  }
   try {
     const res = await callApi("generate_strong_password", 16);
     if (res && res.secret_key) {
@@ -3942,18 +4475,22 @@ async function onClickQcGenSecret() {
 }
 
 async function onClickResetWarming() {
-  const accountId = Number(document.getElementById("qc-account-id").value);
+  const accountId = state.activeQuickCredAccountId;
   if (!accountId) return;
-  const scanQr = !!document.getElementById("qc-scan-qr-mode")?.checked;
+  const scanQr = document.getElementById("qc-scan-qr-mode").checked;
   try {
     const res = await callApi("reset_warming_time", accountId, scanQr, "");
-    if (res && res.ok) {
-      showToast("🔄 已从今日重新开始计算养号周期");
-      await loadDashboard();
-      openQuickCredModal(accountId);
+    if (!res?.ok) {
+      showToast(res?.error || "重置提醒失败");
+      return;
     }
+    showToast("已从今日重新计时");
+    if (res.account && state.activeQuickCredAccountId === accountId) {
+      renderQuickCredWarming(res.account);
+    }
+    await loadDashboard();
   } catch (err) {
-    showToast("重置养号计时失败: " + err.message);
+    showToast("重置提醒失败: " + err.message);
   }
 }
 
@@ -3972,13 +4509,14 @@ async function saveQuickCredModal(e) {
     sec_recovery_modified: !!document.getElementById("qc-sec-recovery").checked,
     sec_devices_cleared: !!document.getElementById("qc-sec-devices").checked,
     scan_qr_mode: !!document.getElementById("qc-scan-qr-mode").checked,
+    google_confirmed: document.getElementById("qc-google-confirmed").checked,
     reason: "quick_edit",
   };
   try {
     const res = await callApi("quick_update_credentials", accountId, payload);
     if (res && res.ok) {
       showToast("🛡️ 安全凭据已保存（旧凭据已自动归档历史）");
-      closeQuickCredModal();
+      if (state.activeQuickCredAccountId === accountId) closeQuickCredModal();
       await loadDashboard();
     } else {
       showToast("保存失败: " + (res?.error || "未知错误"));
@@ -3990,23 +4528,57 @@ async function saveQuickCredModal(e) {
 
 // --- Antigravity / GCP RT Diagnostic & OAuth Workbench ---
 
-function openRtOAuthModal(accountId = null) {
+function getModalAccountsFallback() {
+  return (state.modalAccountsPool && state.modalAccountsPool.length) ? state.modalAccountsPool : state.accounts;
+}
+
+async function loadAllAccountsForModal() {
+  const hasCustomFilter = Object.values(state.customFilters || {}).some((v) => v && v !== "All");
+  const isFiltered =
+    state.filterType !== "All" ||
+    Boolean((state.searchQuery || "").trim()) ||
+    state.statusFilter !== "All" ||
+    state.healthFilter !== "All" ||
+    state.antigravityFilter !== "All" ||
+    state.deviceFilter !== "All" ||
+    hasCustomFilter;
+  if (!isFiltered && state.accounts.length) {
+    state.modalAccountsPool = state.accounts.slice();
+    return state.modalAccountsPool;
+  }
+  try {
+    const res = await callApi("get_dashboard", "All", "", "All", "All", "All", "All", {});
+    if (res && Array.isArray(res.accounts)) {
+      state.modalAccountsPool = res.accounts;
+      return state.modalAccountsPool;
+    }
+  } catch (_) {}
+  state.modalAccountsPool = state.accounts.slice();
+  return state.modalAccountsPool;
+}
+
+async function openRtOAuthModal(accountId = null) {
   const modal = document.getElementById("rt-oauth-modal");
   if (!modal) return;
 
-  const googleAccs = state.accounts.filter((a) => a.account_type === "Google");
-  const pool = googleAccs.length ? googleAccs : state.accounts;
+  const allAccs = await loadAllAccountsForModal();
+  const pool = allAccs.filter((a) => a.account_type === "Google");
   const sel = document.getElementById("rt-modal-account-select");
   if (sel) {
-    sel.innerHTML = pool
-      .map(
-        (a) =>
-          `<option value="${a.id}">${escapeHtml(a.account)} (${escapeHtml(a.account_type)}${a.has_rt ? " · 已绑RT" : ""})</option>`
-      )
-      .join("");
+    sel.innerHTML = pool.length
+      ? pool
+          .map(
+            (a) =>
+              `<option value="${a.id}">${escapeHtml(a.account)} (${escapeHtml(a.account_type)}${a.has_rt ? " · 已绑RT" : ""})</option>`
+          )
+          .join("")
+      : '<option value="">暂无 Google 账号，请先添加</option>';
     if (accountId && pool.some((a) => a.id === accountId)) {
       sel.value = String(accountId);
+    } else if (pool.length) {
+      sel.value = String(pool[0].id);
     }
+    syncCustomSelect(sel);
   }
   const chosenId = Number(sel?.value || accountId || (pool[0] && pool[0].id) || 0);
   state.activeRtAccountId = chosenId || null;
@@ -4016,15 +4588,27 @@ function openRtOAuthModal(accountId = null) {
   modal.style.display = "flex";
 }
 
+function stopOAuthStatusPoller() {
+  if (state.oauthPollTimer) {
+    clearInterval(state.oauthPollTimer);
+    state.oauthPollTimer = null;
+  }
+  state.oauthPollingAccountId = null;
+}
+
 function closeRtOAuthModal() {
+  stopOAuthStatusPoller();
   const modal = document.getElementById("rt-oauth-modal");
   if (modal) modal.style.display = "none";
 }
 
 function onRtAccountSelectChange(val) {
   const accId = Number(val || 0);
+  if (state.oauthPollingAccountId && accId !== state.oauthPollingAccountId) {
+    stopOAuthStatusPoller();
+  }
   state.activeRtAccountId = accId || null;
-  const acc = state.accounts.find((a) => a.id === accId);
+  const acc = getModalAccountsFallback().find((a) => a.id === accId);
   const banner = document.getElementById("rt-account-status-banner");
   const ta = document.getElementById("rt-json-textarea");
   if (!acc) {
@@ -4053,10 +4637,9 @@ async function onClickStartBuiltinOAuth() {
     showToast("请先选择一个 Google 账号");
     return;
   }
-  const pureNative = !!document.getElementById("rt-oauth-pure-native")?.checked;
   const statusEl = document.getElementById("oauth-loopback-status");
   try {
-    const res = await callApi("start_builtin_oauth", accId, true, pureNative);
+    const res = await callApi("start_builtin_oauth", accId, true, true);
     if (!res || !res.ok) {
       showToast("启动 OAuth 失败: " + (res?.error || "未知错误"));
       return;
@@ -4066,8 +4649,11 @@ async function onClickStartBuiltinOAuth() {
     document.getElementById("btn-cancel-oauth").style.display = "inline-flex";
     document.getElementById("btn-copy-oauth-url").style.display = "inline-flex";
     if (statusEl) {
-      statusEl.textContent = `⏳ 已在隔离浏览器打开授权页，正在本地监听回调 (${res.redirect_uri})...`;
+      statusEl.textContent = res.browser_launch?.ok
+        ? "已请求打开授权页，正在等待 Google 授权。"
+        : `浏览器启动失败（${res.browser_launch?.error || "未知错误"}）。可复制授权链接到浏览器继续。`;
     }
+    if (res.browser_launch?.ok) showBrowserLaunchResult(accId, res.browser_launch);
     startOAuthStatusPoller(res.session_id, accId);
   } catch (err) {
     showToast("启动 OAuth 异常: " + err.message);
@@ -4075,14 +4661,14 @@ async function onClickStartBuiltinOAuth() {
 }
 
 function startOAuthStatusPoller(sessionId, accId) {
-  if (state.oauthPollTimer) clearInterval(state.oauthPollTimer);
+  stopOAuthStatusPoller();
+  state.oauthPollingAccountId = accId;
   state.oauthPollTimer = setInterval(async () => {
     try {
       const st = await callApi("get_builtin_oauth_status", sessionId);
       const statusEl = document.getElementById("oauth-loopback-status");
       if (!st || !st.ok || st.status !== "pending") {
-        clearInterval(state.oauthPollTimer);
-        state.oauthPollTimer = null;
+        stopOAuthStatusPoller();
         document.getElementById("btn-cancel-oauth").style.display = "none";
         if (st && st.status === "success") {
           if (statusEl) statusEl.textContent = `✅ OAuth 授权完成并已自动保存 RT 凭据 (${st.email || "已绑定"})`;
@@ -4098,10 +4684,7 @@ function startOAuthStatusPoller(sessionId, accId) {
 }
 
 async function onClickCancelBuiltinOAuth() {
-  if (state.oauthPollTimer) {
-    clearInterval(state.oauthPollTimer);
-    state.oauthPollTimer = null;
-  }
+  stopOAuthStatusPoller();
   if (state.oauthSessionId) {
     await callApi("cancel_builtin_oauth", state.oauthSessionId);
     state.oauthSessionId = "";
@@ -4239,16 +4822,36 @@ async function onClickInjectAntigravity() {
   }
 }
 
+async function onClickProbeLiveValidation() {
+  const accId = Number(document.getElementById("rt-modal-account-select")?.value || 0);
+  if (!accId) return;
+  showToast("🔐 正在探测实时 Google Verify 验证直链...");
+  try {
+    const res = await callApi("probe_live_validation", accId);
+    if (res && res.target_url) {
+      showToast(res.message || "已获取验证链接，正在打开隔离浏览器");
+      await executeLaunchBrowser(accId, null, res.target_url);
+    } else {
+      showToast(res?.message || res?.error || "✓ 无需验证");
+    }
+  } catch (err) {
+    showToast("探测验证页异常: " + err.message);
+  }
+}
+
 async function onClickResetRejectedSession() {
   const accId = Number(document.getElementById("rt-modal-account-select")?.value || 0);
   if (!accId) return;
   try {
     const res = await callApi("reset_rejected_session", accId);
     if (res && res.ok) {
-      showToast(`🧹 会话锁清理完成 (${(res.removed || []).join(", ") || "无残留锁文件"})`);
+      const removed = (res.removed || []).length;
+      showToast(`🧹 已清理异常会话缓存 (${removed} 项)，可重新打开纯净登录`);
+    } else {
+      showToast(res?.error || "清理异常会话失败");
     }
   } catch (err) {
-    showToast("重置会话异常: " + err.message);
+    showToast("清理异常会话异常: " + err.message);
   }
 }
 
@@ -4299,6 +4902,26 @@ async function onClickProbeAiAccount(accountId) {
 
 // --- Google / GCP Appeal & Recovery Channels Modal ---
 
+function isGoogleAppealCandidate(acc) {
+  if (!acc || acc.account_type !== "Google") return false;
+  const health = String(acc.health_status || "可用").trim();
+  const gcp = String(acc.gcp_status || "none").trim();
+  const rt = String(acc.rt_status || "none").trim();
+  const hasValUrl = !!(acc.custom_fields && acc.custom_fields.rt_validation_url);
+  return (
+    health !== "可用" ||
+    Boolean(acc.deactivated_date) ||
+    acc.availability === "不可用" ||
+    hasValUrl ||
+    gcp === "suspended" ||
+    gcp === "validation" ||
+    gcp === "unsupported" ||
+    rt === "suspended" ||
+    rt === "invalid_grant" ||
+    rt === "unsupported"
+  );
+}
+
 async function openAppealModal(accountId = null) {
   const modal = document.getElementById("appeal-modal");
   if (!modal) return;
@@ -4309,14 +4932,26 @@ async function openAppealModal(accountId = null) {
     } catch (_) {}
   }
 
+  const allAccs = await loadAllAccountsForModal();
+  const pool = allAccs.filter(isGoogleAppealCandidate);
+
   const sel = document.getElementById("appeal-account-select");
   if (sel) {
-    sel.innerHTML = state.accounts
-      .map((a) => `<option value="${a.id}">${escapeHtml(a.account)} (${escapeHtml(a.account_type)} · ${escapeHtml(a.health_status || "可用")})</option>`)
-      .join("");
-    if (accountId && state.accounts.some((a) => a.id === accountId)) {
+    sel.innerHTML = pool.length
+      ? pool
+          .map((a) => {
+            const hLabel = getAccountHealthMeta(a).label;
+            const gcpTag = a.gcp_status && a.gcp_status !== "none" ? ` · GCP:${a.gcp_status}` : "";
+            return `<option value="${a.id}">${escapeHtml(a.account)} (${escapeHtml(hLabel)}${escapeHtml(gcpTag)})</option>`;
+          })
+          .join("")
+      : '<option value="">暂无异常或不可用状态的 Google 账号</option>';
+    if (accountId && pool.some((a) => a.id === accountId)) {
       sel.value = String(accountId);
+    } else if (pool.length) {
+      sel.value = String(pool[0].id);
     }
+    syncCustomSelect(sel);
   }
   renderAppealValidationBanner();
   renderAppealChannelsList();
@@ -4328,11 +4963,34 @@ function closeAppealModal() {
   if (modal) modal.style.display = "none";
 }
 
+function _bindAppealActionDelegation(container) {
+  if (!container || container._delegated) return;
+  container._delegated = true;
+  container.addEventListener("click", (e) => {
+    const openBtn = e.target.closest("[data-open-url]");
+    if (openBtn) {
+      onClickOpenAppealUrl(
+        openBtn.getAttribute("data-open-url") || "",
+        openBtn.getAttribute("data-pure-native") === "1"
+      );
+      return;
+    }
+    const copyBtn = e.target.closest("[data-copy-url]");
+    if (copyBtn) {
+      copyPlainText(
+        copyBtn.getAttribute("data-copy-url") || "",
+        copyBtn.getAttribute("data-copy-label") || "链接"
+      );
+    }
+  });
+}
+
 function renderAppealValidationBanner() {
   const banner = document.getElementById("appeal-validation-banner");
   const accId = Number(document.getElementById("appeal-account-select")?.value || 0);
-  const acc = state.accounts.find((a) => a.id === accId);
+  const acc = getModalAccountsFallback().find((a) => a.id === accId);
   if (!banner) return;
+  _bindAppealActionDelegation(banner);
   const valUrl = acc && acc.custom_fields && acc.custom_fields.rt_validation_url;
   if (valUrl) {
     banner.style.display = "flex";
@@ -4342,8 +5000,8 @@ function renderAppealValidationBanner() {
         <div class="appeal-val-url">${escapeHtml(valUrl)}</div>
       </div>
       <div style="display:flex;gap:8px;">
-        <button type="button" class="btn btn-primary btn-xs" onclick="onClickOpenAppealUrl('${escapeHtml(valUrl)}', true)">🛡️ 纯净浏览器立即验证</button>
-        <button type="button" class="btn btn-secondary btn-xs" onclick="copyPlainText('${escapeHtml(valUrl)}','验证链接')">📋 复制</button>
+        <button type="button" class="btn btn-primary btn-xs" data-open-url="${escapeHtml(valUrl)}" data-pure-native="1">打开验证页面</button>
+        <button type="button" class="btn btn-secondary btn-xs" data-copy-url="${escapeHtml(valUrl)}" data-copy-label="验证链接">📋 复制</button>
       </div>
     `;
   } else {
@@ -4354,7 +5012,11 @@ function renderAppealValidationBanner() {
 function renderAppealChannelsList() {
   const box = document.getElementById("appeal-channels-list");
   if (!box) return;
+  _bindAppealActionDelegation(box);
   const channels = state.appealChannels || [];
+  const accountId = Number(document.getElementById("appeal-account-select")?.value || 0);
+  const selectedAcc = accountId ? getModalAccountsFallback().find((account) => account.id === accountId) : null;
+  const isGoogle = !selectedAcc || selectedAcc.account_type === "Google";
   box.innerHTML = channels
     .map(
       (ch) => `
@@ -4371,9 +5033,9 @@ function renderAppealChannelsList() {
           ${(ch.steps || []).map((s) => `<li>${escapeHtml(s)}</li>`).join("")}
         </ul>
         <div class="appeal-ch-actions">
-          <button type="button" class="btn btn-primary btn-xs" onclick="onClickOpenAppealUrl('${escapeHtml(ch.url)}', false)">🌐 指纹浏览器打开</button>
-          <button type="button" class="btn btn-secondary btn-xs" onclick="onClickOpenAppealUrl('${escapeHtml(ch.url)}', true)">🛡️ 纯净无扩展打开</button>
-          <button type="button" class="btn btn-ghost btn-xs" onclick="copyPlainText('${escapeHtml(ch.url)}','申诉链接')">📋 复制链接</button>
+          ${isGoogle ? "" : `<button type="button" class="btn btn-primary btn-xs" data-open-url="${escapeHtml(ch.url)}" data-pure-native="0">指纹浏览器打开</button>`}
+          <button type="button" class="btn btn-secondary btn-xs" data-open-url="${escapeHtml(ch.url)}" data-pure-native="1">使用账号专属浏览器打开</button>
+          <button type="button" class="btn btn-ghost btn-xs" data-copy-url="${escapeHtml(ch.url)}" data-copy-label="申诉链接">📋 复制链接</button>
         </div>
       </div>
     `
@@ -4384,13 +5046,14 @@ function renderAppealChannelsList() {
 async function onClickOpenAppealUrl(url, pureNative = false) {
   const accId = Number(document.getElementById("appeal-account-select")?.value || 0);
   if (!accId) {
-    showToast("请先选择一个账号以使用其专属代理容器打开");
+    showToast("暂无或未选择异常状态的 Google 账号。");
     return;
   }
   try {
-    const res = await callApi("launch_browser", accId, url, !!pureNative);
+    const account = getModalAccountsFallback().find((item) => item.id === accId);
+    const res = await callApi("launch_browser", accId, url, pureNative || account?.account_type === "Google");
     if (res && res.ok) {
-      showToast(`🌐 已在${pureNative ? "纯净无扩展" : "指纹隔离"}浏览器打开申诉通道`);
+      showBrowserLaunchResult(accId, res, account);
     } else {
       showToast("打开失败: " + (res?.error || "未知错误"));
     }

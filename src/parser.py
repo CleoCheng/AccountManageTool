@@ -114,11 +114,15 @@ def parse_single_line(
         return None
 
     # Support ----, ---, |, or tab delimiters
+    delim_used = ""
     if "---" in line:
+        delim_used = "---"
         parts = [p.strip() for p in re.split(r"-{3,}", line)]
     elif "|" in line:
+        delim_used = "|"
         parts = [p.strip() for p in line.split("|")]
     elif "\t" in line:
+        delim_used = "\t"
         parts = [p.strip() for p in line.split("\t")]
     else:
         # Collapse space-grouped 4-char Base32 chunks (e.g. 'abcd efgh ijkl mnop') before splitting
@@ -129,7 +133,18 @@ def parse_single_line(
         )
         parts = [p.strip() for p in re.split(r"\s{2,}", collapsed)]
 
-    parts = [p for p in parts if p != ""]
+    # Preserve empty middle slots (e.g. empty recovery email in 6-field Google format)
+    # when an explicit delimiter separated >= 6 columns with account+password populated.
+    non_empty_parts = [p for p in parts if p != ""]
+    if delim_used and len(parts) >= 6 and parts[0] and parts[1]:
+        while len(parts) > 6 and parts[-1] == "":
+            parts.pop()
+        if len(parts) >= 6:
+            pass
+        else:
+            parts = non_empty_parts
+    else:
+        parts = non_empty_parts
     if not parts:
         return None
     # Do not treat a standalone Base32 secret line as an account username
@@ -522,13 +537,32 @@ def parse_account_text(
         if records:
             return records
 
-    # Case 2: Single structured block containing '新2FA' or standalone MMDD date line
-    if re.search(r"(?i)新2FA|new\s*2fa", normalized) or re.search(r"(?m)^\s*\d{4}(?:\s*[-|]+\s*\d{4})?\s*$", normalized):
-        rec = _parse_structured_block(
-            normalized, default_year=default_year, account_type=account_type
-        )
-        if rec and rec["account"]:
-            return [rec]
+    # Case 2: Unnumbered structured block(s) containing '新2FA' or standalone MMDD date lines
+    date_line_matches = re.findall(r"(?m)^\s*\d{4}(?:\s*[-|]+\s*\d{4})?\s*$", normalized)
+    if re.search(r"(?i)新2FA|new\s*2fa", normalized) or date_line_matches:
+        # Split on standalone MMDD date lines (when multiple blocks exist) OR blank lines between accounts
+        chunks: list[str]
+        if len(date_line_matches) >= 2:
+            raw_chunks = re.split(r"(?m)(?=^\s*\d{4}(?:\s*[-|]+\s*\d{4})?\s*$)", normalized)
+            chunks = [c for c in raw_chunks if c.strip()]
+        else:
+            blank_chunks = [c for c in re.split(r"\n\s*\n+", normalized) if c.strip()]
+            # Only treat blank lines as block separators if at least 2 chunks each carry an account/credential
+            cred_chunks = [
+                c for c in blank_chunks
+                if "@" in c or "---" in c or "|" in c or "\t" in c
+            ]
+            chunks = blank_chunks if len(cred_chunks) >= 2 else [normalized]
+
+        records = []
+        for blk in chunks:
+            rec = _parse_structured_block(
+                blk, default_year=default_year, account_type=account_type
+            )
+            if rec and rec["account"]:
+                records.append(rec)
+        if records:
+            return records
 
     # Case 3: Standard line-by-line or cross-line wrapped records (support ---- or |)
     stitched = re.sub(r"\n\s*(-{3,}|\|+)", r"\1", normalized)

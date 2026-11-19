@@ -2,6 +2,7 @@ import imaplib
 import re
 import ssl
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from email import policy
 from email.parser import BytesParser
@@ -59,7 +60,10 @@ def _message_code(raw: bytes, email: str, earliest: float, now: float) -> str | 
     content = body.get_content() if body else ""
     if body and body.get_content_type() == "text/html":
         parser = _VisibleText()
-        parser.feed(content)
+        try:
+            parser.feed(content)
+        finally:
+            parser.close()
         content = " ".join(parser.text)
     codes = set(_CODE.findall(subject + "\n" + re.sub(r"https?://\S+", "", content)))
     if len(codes) != 1:
@@ -86,7 +90,10 @@ def _generic_message(raw: bytes, max_age_seconds: int, now: float) -> dict | Non
     content = body.get_content() if body else ""
     if body and body.get_content_type() == "text/html":
         parser = _VisibleText()
-        parser.feed(content)
+        try:
+            parser.feed(content)
+        finally:
+            parser.close()
         content = " ".join(parser.text)
     match = _CODE.search(subject + "\n" + re.sub(r"https?://\S+", "", content))
     if not match:
@@ -101,11 +108,29 @@ def _generic_message(raw: bytes, max_age_seconds: int, now: float) -> dict | Non
     }
 
 
+@contextmanager
+def _open_imap_readonly():
+    ctx = imaplib.IMAP4_SSL(
+        MAIL_HOST,
+        993,
+        ssl_context=ssl.create_default_context(),
+        timeout=8,
+    )
+    inbox = ctx.__enter__()
+    try:
+        yield inbox
+    finally:
+        try:
+            ctx.__exit__(None, None, None)
+        except Exception:
+            pass
+
+
 def fetch_latest_mail_code(email: str, password: str, max_age_seconds: int = 1800) -> dict | None:
     """Read the latest inbox messages and return a recent verification code."""
     now = time.time()
     try:
-        with imaplib.IMAP4_SSL(MAIL_HOST, 993, ssl_context=ssl.create_default_context(), timeout=8) as inbox:
+        with _open_imap_readonly() as inbox:
             inbox.login(email, password)
             if inbox.select("INBOX", readonly=True)[0] != "OK":
                 return None
@@ -146,7 +171,7 @@ def read_github_code(email: str, password: str, started_at: int) -> str:
     search_date = datetime.fromtimestamp(earliest - 86400, timezone.utc)
     since = f"{search_date.day:02d}-{_MONTHS[search_date.month - 1]}-{search_date.year}"
     try:
-        with imaplib.IMAP4_SSL(MAIL_HOST, 993, ssl_context=ssl.create_default_context(), timeout=8) as inbox:
+        with _open_imap_readonly() as inbox:
             inbox.login(email, password)
             if inbox.select("INBOX", readonly=True)[0] != "OK":
                 raise ValueError("无法打开收件箱，请打开网页邮箱查看。")

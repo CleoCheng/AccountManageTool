@@ -135,6 +135,90 @@ def test_api_health_status_lifecycle_and_dashboard_filter(tmp_path: Path):
     assert len(dash_avail["accounts"]) == 0
 
 
+def test_dashboard_health_counts_follow_platform_and_other_filters(tmp_path: Path):
+    api = AccountApi(tmp_path)
+
+    def add(platform, name, **fields):
+        saved = api.save_account({"account_type": platform, "account": f"{name}@example.test", **fields})
+        assert saved["ok"]
+        return saved["account"]["id"]
+
+    google_fields = {"device_tag": "iPhone", "custom_fields": {"warming_group": "team"}}
+    confirmed = add("Google", "in-scope-confirmed", **google_fields)
+    unreviewed = add("Google", "in-scope-unreviewed", **google_fields)
+    deactivated = add("Google", "in-scope-deactivated", deactivated_date="2026-10-01", **google_fields)
+    challenged = add("Google", "other-challenged", health_status="验证")
+    assert api.set_health_status(confirmed, "可用")["ok"]
+    assert api.set_health_status(deactivated, "可用")["ok"]
+    chatgpt = {add("ChatGPT", "chat-1"), add("ChatGPT", "chat-2")}
+    add("ChatGPT", "chat-banned", health_status="封号")
+    add("Qcoder", "other-active")
+
+    overall = api.get_dashboard()
+    assert overall["health_counts"] == {"可用": 4, "不可用": 3, "未核对": 1}
+    assert overall["stats"]["health"]["未核对"] == 1
+    assert overall["stats"]["total"] == 8
+
+    expected_google = {"可用": (confirmed,), "不可用": (deactivated, challenged), "未核对": (unreviewed,)}
+    for status, ids in expected_google.items():
+        dashboard = api.get_dashboard(account_type="Google", health_status=status)
+        assert tuple(account["id"] for account in dashboard["accounts"]) == ids
+        assert dashboard["health_counts"] == {"可用": 1, "不可用": 2, "未核对": 1}
+        assert dashboard["stats"]["types"]["ChatGPT"] == 3
+    assert [item["id"] for item in api.db.list_accounts(health_status="未核对")] == [unreviewed]
+    assert [item["id"] for item in api.get_dashboard("Google", health_status="验证")["accounts"]] == [challenged]
+
+    chat_dashboard = api.get_dashboard(account_type="ChatGPT", health_status="可用")
+    assert {account["id"] for account in chat_dashboard["accounts"]} == chatgpt
+    assert chat_dashboard["health_counts"] == {"可用": 2, "不可用": 1, "未核对": 0}
+    assert api.get_dashboard(account_type="Qcoder")["health_counts"] == {"可用": 1, "不可用": 0, "未核对": 0}
+    assert api.get_dashboard(account_type="WorkBuddy")["health_counts"] == {"可用": 0, "不可用": 0, "未核对": 0}
+
+    scope = dict(account_type="Google", search="in-scope", status="active", device_tag="iPhone")
+    narrowed = api.get_dashboard(**scope, custom_filters={"warming_group": "team"}, health_status="未核对")
+    assert narrowed["health_counts"] == {"可用": 1, "不可用": 0, "未核对": 1}
+    assert [item["id"] for item in narrowed["accounts"]] == [unreviewed]
+    empty = api.get_dashboard(**scope, custom_filters={"warming_group": "unknown"})
+    assert empty["health_counts"] == {"可用": 0, "不可用": 0, "未核对": 0}
+    assert not empty["accounts"]
+
+    assert api.set_health_status(unreviewed, "可用")["ok"]
+    assert api.get_dashboard(**scope)["health_counts"] == {"可用": 2, "不可用": 0, "未核对": 0}
+
+
+def test_google_interactive_save_rejects_invalid_totp_without_archiving(tmp_path: Path):
+    api = AccountApi(tmp_path)
+    google = {"account_type": "Google", "account": "totp-check@example.test"}
+    invalid = api.save_account({**google, "secret_key": "123456"})
+    assert not invalid["ok"] and "2FA 密钥格式无效" in invalid["error"]
+    assert not api.db.list_accounts()
+
+    uri = "otpauth://totp/Test?secret=jbsw%20y3dp%20ehpk%203pxp"
+    created = api.save_account({**google, "secret_key": uri, "note": "original"})
+    assert created["ok"]
+    account = created["account"]
+    account_id = account["id"]
+    assert account["secret_key"] == "JBSWY3DPEHPK3PXP"
+    assert account["totp"]["valid"]
+
+    invalid_edit = api.save_account({**google, "id": account_id, "secret_key": "234567", "note": "discard"})
+    assert not invalid_edit["ok"] and "2FA 密钥格式无效" in invalid_edit["error"]
+    invalid_quick = api.quick_update_credentials(account_id, {
+        "secret_key": "123456", "google_confirmed": True, "note": "discard",
+    })
+    assert not invalid_quick["ok"] and "2FA 密钥格式无效" in invalid_quick["error"]
+    assert api.db.get_account(account_id)["secret_key"] == account["secret_key"]
+    assert api.db.get_account(account_id)["note"] == "original"
+    assert api.get_credential_history(account_id)["history"] == []
+
+    legacy = api.db.add_account({**google, "account": "legacy-totp@example.test", "secret_key": "123456"})
+    assert api.save_account({**legacy, "note": "keep the existing key"})["ok"]
+    corrected = api.quick_update_credentials(legacy["id"], {"secret_key": uri, "google_confirmed": True})
+    assert corrected["ok"] and corrected["account"]["totp"]["valid"]
+    cleared = api.quick_update_credentials(legacy["id"], {"secret_key": "", "google_confirmed": True})
+    assert cleared["ok"] and not cleared["account"]["secret_key"]
+
+
 def test_api_antigravity_tier_lifecycle_and_dashboard_filter(tmp_path: Path):
     data_dir = tmp_path / "data"
     api = AccountApi(data_dir=data_dir)
@@ -616,12 +700,25 @@ def test_rt_inspect_save_batch_export_and_inject(tmp_path: Path, monkeypatch):
     assert exp["count"] == 2
 
     appdata_dir = tmp_path / "appdata"
+    ag_dir = appdata_dir / "Antigravity"
+    ag_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("APPDATA", str(appdata_dir))
+
+    from src import maintenance_service as ms
+    monkeypatch.setattr(
+        ms,
+        "_http_json_request",
+        lambda url, **kw: (200, {"access_token": "fresh_at_123", "expires_in": 3600})
+        if url.endswith("/token")
+        else (404, {}),
+    )
     inj = api.inject_rt_to_antigravity(acc["id"])
     assert inj["ok"] is True
-    cred_file = appdata_dir / "Antigravity" / "oauth_credentials.json"
+    cred_file = ag_dir / "oauth_credentials.json"
     assert cred_file.exists()
-    assert "1//09abcdef_test_refresh_token" in cred_file.read_text(encoding="utf-8")
+    text = cred_file.read_text(encoding="utf-8")
+    assert "1//09abcdef_test_refresh_token" in text
+    assert "fresh_at_123" in text
 
 
 def test_probe_ai_and_appeal_channels_and_backup_endpoints(tmp_path: Path):
@@ -651,3 +748,346 @@ def test_probe_ai_and_appeal_channels_and_backup_endpoints(tmp_path: Path):
     assert b1["ok"] is True
     blist = api.list_backups()
     assert any(x["filename"] == b1["filename"] for x in blist["backups"])
+
+
+def test_builtin_oauth_only_reports_success_after_saving_matching_account(tmp_path, monkeypatch):
+    import threading
+    from src import maintenance_service
+
+    api = AccountApi(data_dir=tmp_path / "data")
+    account = api.save_account({"account_type": "Google", "account": "test.owner@gmail.com"})["account"]
+    authorized_email = "different.user@gmail.com"
+
+    def fake_request(url, **kwargs):
+        if url.endswith("/token"):
+            return 200, {"access_token": "mock-access-token", "refresh_token": "1//09mock_refresh_token"}
+        return 200, {"email": authorized_email}
+
+    def exchange(session_id):
+        api._oauth._sessions[session_id] = {
+            "status": "pending",
+            "session_id": session_id,
+            "account_id": account["id"],
+            "redirect_uri": "http://127.0.0.1:12345/oauth-callback",
+            "auth_url": "https://accounts.google.com/o/oauth2/v2/auth",
+            "code_verifier": "mock-verifier",
+            "proxy_url": "",
+            "stop_event": threading.Event(),
+        }
+        api._oauth._exchange_code(session_id, "mock-code")
+        return api.get_builtin_oauth_status(session_id)
+
+    monkeypatch.setattr(maintenance_service, "_http_json_request", fake_request)
+    rejected = exchange("different-email")
+    assert rejected["status"] == "error" and not rejected["has_rt"]
+    assert not api.db.get_account(account["id"])["has_rt"]
+
+    authorized_email = "test.owner@gmail.com"
+    accepted = exchange("same-email")
+    assert accepted["status"] == "success" and accepted["has_rt"]
+    assert api.db.get_account(account["id"])["has_rt"]
+
+
+def test_google_session_reset_live_validation_and_browser_launch_tracking(tmp_path: Path, monkeypatch):
+    import src.browser_service as bs
+    from src import maintenance_service
+
+    api = AccountApi(data_dir=tmp_path / "data")
+    google = api.save_account({"account_type": "Google", "account": "track@gmail.com"})["account"]
+    assert google["browser_open_count"] == 0
+    assert google["browser_last_opened_at"] == ""
+
+    # Both Chrome and Edge exist, and the global default is ``inpage_edge``.
+    monkeypatch.setattr(bs, "find_chromium_executable", lambda: "C:\\fake\\chrome.exe")
+    monkeypatch.delenv("KEYVAULT_BROWSER_PATH", raising=False)
+    monkeypatch.setattr(bs, "detect_edge_path", lambda: "C:\\fake\\msedge.exe")
+    monkeypatch.setattr(bs, "detect_chrome_path", lambda: "C:\\fake\\chrome.exe")
+    cdp_calls: list[tuple] = []
+    monkeypatch.setattr(bs, "_start_cdp_injector", lambda *a, **kw: cdp_calls.append((a, kw)))
+    shown: list[tuple] = []
+    api._show_login_tools = lambda account_id, profile, *, launching=False: shown.append(
+        (account_id, profile, launching)
+    )
+
+    class _Running:
+        pid = 0
+
+        def wait(self, timeout):
+            import subprocess
+
+            raise subprocess.TimeoutExpired("chrome", timeout)
+
+    monkeypatch.setattr(bs.subprocess, "Popen", lambda *a, **kw: _Running())
+
+    # Google always forces the PurpleShield pure-native Chrome flow, even though
+    # the global engine is ``inpage_edge``: no toolbar, no CDP, external strip.
+    launched = api.launch_browser(google["id"])
+    assert launched["ok"] is True
+    assert launched["inpage_toolbar"] is False
+    assert launched["pure_native"] is True
+    assert launched["browser_engine_mode"] == "pure_native"
+    assert launched["engine"] == "Chrome"
+    assert launched["zero_cdp"] is True
+    assert cdp_calls == []
+    assert shown == [(google["id"], tmp_path / "data" / "browsers" / f"acc_{google['id']}", True)]
+    assert launched["account"]["browser_open_count"] == 1
+    assert launched["account"]["browser_last_opened_at"] != ""
+
+    # An explicit target_url (security page / validation / appeal) still spawns
+    # the external WinForms pilot strip for Google accounts.
+    shown.clear()
+    with_url = api.launch_browser(google["id"], target_url="https://myaccount.google.com/security")
+    assert with_url["ok"] is True
+    assert with_url["pure_native"] is True
+    assert shown == [(google["id"], tmp_path / "data" / "browsers" / f"acc_{google['id']}", True)]
+
+    # Non-Google accounts keep the in-page Edge toolbar and never spawn the
+    # external strip ("other platforms stay untouched").
+    chatgpt = api.save_account({"account_type": "ChatGPT", "account": "chat_track@example.test"})["account"]
+    shown.clear()
+    launched_chat = api.launch_browser(chatgpt["id"])
+    assert launched_chat["ok"] is True
+    assert launched_chat["inpage_toolbar"] is True
+    assert launched_chat["pure_native"] is False
+    assert launched_chat["browser_engine_mode"] == "inpage_edge"
+    assert launched_chat["engine"] == "Edge"
+    assert launched_chat["zero_cdp"] is True
+    assert cdp_calls == []
+    assert shown == []
+
+    # Google reset_rejected_session is now supported when unlocked
+    p_dir = tmp_path / "data" / "browsers" / f"acc_{google['id']}"
+    (p_dir / "DevToolsActivePort").write_text("9222\n/devtools", encoding="utf-8")
+    reset = api.reset_rejected_session(google["id"])
+    assert reset["ok"] is True
+    assert "DevToolsActivePort" in reset["removed"]
+
+    # Probe live validation falls back gracefully when no RT, and extracts validationUrl when RT returns VALIDATION_REQUIRED
+    fallback_val = api.probe_live_validation(google["id"])
+    assert fallback_val["ok"] is True
+    assert fallback_val["status"] == "security_checkup"
+    assert "security-checkup" in fallback_val["target_url"]
+
+    api.save_account_rt(google["id"], "1//09abcdef_test_refresh_token")
+    monkeypatch.setattr(
+        maintenance_service,
+        "probe_antigravity_rt",
+        lambda acc, proxy_url="", timeout=15.0: {
+            "ok": False,
+            "gcp_status": "validation",
+            "validation_url": "https://accounts.google.com/v3/signin/continue?plt=live123",
+        },
+    )
+    live_val = api.probe_live_validation(google["id"])
+    assert live_val["ok"] is True
+    assert live_val["status"] == "live_validation_url"
+    assert live_val["target_url"] == "https://accounts.google.com/v3/signin/continue?plt=live123"
+
+
+def test_api_startup_purges_only_google_legacy_extensions_and_keeps_cookies(tmp_path: Path):
+    import sqlite3
+
+    import src.browser_service as bs
+
+    data_dir = tmp_path / "data"
+    first = AccountApi(data_dir=data_dir)
+    google = first.save_account({"account_type": "Google", "account": "startup_google@gmail.test"})["account"]
+    chatgpt = first.save_account({"account_type": "ChatGPT", "account": "startup_chat@example.test"})["account"]
+
+    google_profile = data_dir / "browsers" / f"acc_{google['id']}"
+    chat_profile = data_dir / "browsers" / f"acc_{chatgpt['id']}"
+    bs.prepare_profile_dir(data_dir, google)
+    bs.prepare_profile_dir(data_dir, chatgpt)
+    bs._build_extension_files(
+        google_profile / "fp_ext",
+        bs.generate_fingerprint_config(google["id"], google["account"]),
+        google,
+    )
+    bs._build_extension_files(
+        chat_profile / "fp_ext",
+        bs.generate_fingerprint_config(chatgpt["id"], chatgpt["account"]),
+        chatgpt,
+    )
+    (google_profile / "DevToolsActivePort").write_text("9222\n/devtools", encoding="utf-8")
+    net_dir = google_profile / "Default" / "Network"
+    net_dir.mkdir(parents=True, exist_ok=True)
+    cookies_db = net_dir / "Cookies"
+    conn = sqlite3.connect(cookies_db)
+    try:
+        conn.execute("CREATE TABLE cookies (name TEXT)")
+        conn.execute("INSERT INTO cookies (name) VALUES ('SID')")
+        conn.commit()
+    finally:
+        conn.close()
+
+    # A fresh AccountApi startup sweep cleans Google leftovers only.
+    AccountApi(data_dir=data_dir)
+    assert not (google_profile / "fp_ext").exists()
+    assert not (google_profile / "DevToolsActivePort").exists()
+    assert cookies_db.exists()
+    assert (chat_profile / "fp_ext" / "autologin.js").exists()
+
+
+def test_google_risk_status_and_warming_reset_clear_automation_markers_only(tmp_path: Path):
+    api = AccountApi(data_dir=tmp_path / "data")
+    google = api.save_account({"account_type": "Google", "account": "markers@gmail.test"})["account"]
+    chatgpt = api.save_account({"account_type": "ChatGPT", "account": "markers_chat@example.test"})["account"]
+
+    google_profile = tmp_path / "data" / "browsers" / f"acc_{google['id']}"
+    chat_profile = tmp_path / "data" / "browsers" / f"acc_{chatgpt['id']}"
+    for profile in (google_profile, chat_profile):
+        (profile / "Default").mkdir(parents=True, exist_ok=True)
+        (profile / "Default" / "Cookies").write_bytes(b"session")
+
+    for status in ("人机", "短信", "验证", "封号"):
+        (google_profile / "DevToolsActivePort").write_text("9222\n/devtools", encoding="utf-8")
+        (chat_profile / "DevToolsActivePort").write_text("9222\n/devtools", encoding="utf-8")
+        assert api.set_health_status(google["id"], status)["ok"] is True
+        assert api.set_health_status(chatgpt["id"], status)["ok"] is True
+        assert not (google_profile / "DevToolsActivePort").exists()
+        # Non-Google accounts keep their session markers untouched.
+        assert (chat_profile / "DevToolsActivePort").exists()
+        assert (google_profile / "Default" / "Cookies").exists()
+
+    (google_profile / "DevToolsActivePort").write_text("9222\n/devtools", encoding="utf-8")
+    (chat_profile / "DevToolsActivePort").write_text("9222\n/devtools", encoding="utf-8")
+    assert api.reset_warming_time(google["id"], scan_qr_mode=True)["ok"] is True
+    assert api.reset_warming_time(chatgpt["id"], scan_qr_mode=True)["ok"] is True
+    assert not (google_profile / "DevToolsActivePort").exists()
+    assert (chat_profile / "DevToolsActivePort").exists()
+    assert (google_profile / "Default" / "Cookies").exists()
+
+
+def test_handle_dispatched_url_routes_auth_and_forwards_non_auth(tmp_path: Path, monkeypatch):
+    import src.api as api_module
+
+    api = AccountApi(data_dir=tmp_path / "data")
+    g_acc = api.save_account({"account_type": "Google", "account": "dispatch@gmail.com"})["account"]
+    c_acc = api.save_account({"account_type": "Claude", "account": "claude_dispatch@example.com"})["account"]
+
+    forwarded: list[str] = []
+    monkeypatch.setattr(api_module, "forward_to_original_browser", lambda u: forwarded.append(u) or True)
+    res_non = api.handle_dispatched_url("https://news.ycombinator.com/")
+    assert res_non["ok"] is True and res_non["forwarded"] is True
+    assert forwarded == ["https://news.ycombinator.com/"]
+
+    calls: list[tuple[int, str]] = []
+    monkeypatch.setattr(
+        api,
+        "launch_browser",
+        lambda acc_id, target_url="", pure_native=None: calls.append((acc_id, target_url)) or {"ok": True},
+    )
+    res_claude = api.handle_dispatched_url("https://claude.ai/oauth/authorize?code=1")
+    assert res_claude["ok"] is True and res_claude["dispatched_account_id"] == c_acc["id"]
+    res_google = api.handle_dispatched_url("https://accounts.google.com/v3/signin/continue?plt=1")
+    assert res_google["ok"] is True and res_google["dispatched_account_id"] == g_acc["id"]
+    assert calls == [
+        (c_acc["id"], "https://claude.ai/oauth/authorize?code=1"),
+        (g_acc["id"], "https://accounts.google.com/v3/signin/continue?plt=1"),
+    ]
+
+
+def test_api_settings_atomic_validation_hud_notify_and_bounded_shutdown(tmp_path: Path, monkeypatch):
+    api = AccountApi(data_dir=tmp_path / "data", base_dir=tmp_path)
+    saved = api.save_settings({
+        "theme": "invalid_theme",
+        "totp_offset_seconds": "15",
+        "browser_engine_mode": "pure_native",
+    })
+    assert saved["theme"] == "dark"
+    assert saved["totp_offset_seconds"] == 15
+    assert saved["browser_engine_mode"] == "pure_native"
+
+    notified: list[int] = []
+    class _FakePanel:
+        def notify_account_updated(self, acc):
+            notified.append(int(acc["id"]))
+    api._login_tools_panel = _FakePanel()
+
+    acc = api.save_account({"account_type": "Google", "account": "hud@gmail.com", "password": "pw"})["account"]
+    api.set_health_status(acc["id"], "可用")
+    api.bind_proxy_node(acc["id"], "http://127.0.0.1:7890", "HK-1", locked=True)
+    api.set_node_lock(acc["id"], False)
+    assert len(notified) == 4
+
+    seen_timeouts: list[float] = []
+    monkeypatch.setattr(api._workbuddy, "close", lambda timeout=5.0: seen_timeouts.append(timeout))
+    api._shutdown()
+    assert seen_timeouts == [5.0]
+
+
+def test_rt_probe_classification_custom_secret_and_proxy_specs(tmp_path: Path, monkeypatch):
+    from src import maintenance_service as ms
+
+    # Colon in password & SOCKS guard
+    spec = ms.parse_proxy_spec("127.0.0.1:8080:myuser:p@ss:with:colons")
+    assert spec["user"] == "myuser"
+    assert spec["password"] == "p@ss:with:colons"
+    socks_stat, socks_body = ms._http_json_request("https://example.com", proxy_url="socks5://127.0.0.1:1080")
+    assert socks_stat == 0 and socks_body["error"] == "unsupported_proxy_scheme"
+
+    # Custom client_id keeps its own client_secret instead of overwriting with ANTIGRAVITY_CLIENT_SECRET
+    custom = ms.inspect_rt_json('{"refresh_token":"1//custom","client_id":"other-client","client_secret":"other-sec"}')
+    assert custom["ok"] and custom["client_id"] == "other-client" and custom["client_secret"] == "other-sec"
+    no_sec = ms.inspect_rt_json('{"refresh_token":"1//custom","client_id":"other-client"}')
+    assert no_sec["ok"] and no_sec["client_secret"] == ""
+
+    # 503 on token refresh preserves prior rt_status instead of overwriting with invalid_grant
+    acc = {"account": "probe@gmail.com", "custom_fields": {"rt_json": "1//tok", "rt_status": "active", "gcp_status": "active"}}
+    monkeypatch.setattr(ms, "_http_json_request", lambda *_a, **_kw: (503, {"error": "temporarily_unavailable"}))
+    transient = ms.probe_antigravity_rt(acc)
+    assert transient["ok"] is False and transient["transient"] is True and transient["rt_status"] == "active"
+
+    # Generic 403 -> suspended unless secondary probe yields validationUrl -> validation
+    def fake_403_suspended(url, **_kw):
+        if url.endswith("/token"):
+            return 200, {"access_token": "at_1", "expires_in": 3600}
+        return 403, {"error": {"status": "PERMISSION_DENIED", "message": "Account disabled"}}
+
+    monkeypatch.setattr(ms, "_http_json_request", fake_403_suspended)
+    res_susp = ms.probe_antigravity_rt(acc)
+    assert res_susp["rt_status"] == "suspended" and res_susp["gcp_status"] == "suspended"
+
+    def fake_403_with_secondary_validation(url, **_kw):
+        if url.endswith("/token"):
+            return 200, {"access_token": "at_1", "expires_in": 3600}
+        if "streamGenerateContent" in url:
+            return 403, {"validationUrl": "https://accounts.google.com/v3/signin/continue?plt=val"}
+        return 403, {"error": {"status": "PERMISSION_DENIED", "message": "Restricted"}}
+
+    monkeypatch.setattr(ms, "_http_json_request", fake_403_with_secondary_validation)
+    res_val = ms.probe_antigravity_rt(acc)
+    assert res_val["gcp_status"] == "validation"
+    assert res_val["validation_url"] == "https://accounts.google.com/v3/signin/continue?plt=val"
+
+    # inject_rt_to_antigravity_client rejects missing APPDATA\Antigravity directory
+    missing_app = tmp_path / "no_appdata"
+    monkeypatch.setenv("APPDATA", str(missing_app))
+    inj_missing = ms.inject_rt_to_antigravity_client(acc)
+    assert inj_missing["ok"] is False and "未找到" in inj_missing["error"]
+
+
+def test_oauth_loopback_escapes_html_preempts_and_adds_hl(monkeypatch):
+    import urllib.request
+    from src import maintenance_service as ms
+
+    mgr = ms.OAuthLoopbackManager()
+    s1 = mgr.start_session(1, login_hint="a@gmail.com", hl="en-US")
+    assert s1["ok"] and "&hl=en-US" in s1["auth_url"]
+
+    # Starting s2 preempts s1 and verifies reflected ?error= is HTML-escaped on callback page
+    s2 = mgr.start_session(2, login_hint="b@gmail.com", hl="ja-JP", preempt=True)
+    assert s2["ok"] and "&hl=ja-JP" in s2["auth_url"]
+    assert mgr.get_status(s1["session_id"])["status"] == "cancelled"
+
+    cb_url = s2["redirect_uri"] + "?error=%3Cscript%3Ealert(1)%3C/script%3E"
+    try:
+        urllib.request.urlopen(cb_url, timeout=3.0)
+        pytest.fail("Expected HTTP 400 on OAuth error callback")
+    except urllib.error.HTTPError as exc:
+        assert exc.code == 400
+        body = exc.read().decode("utf-8", errors="replace")
+        assert "<script>" not in body
+        assert "&lt;script&gt;" in body
+    finally:
+        mgr.shutdown()
