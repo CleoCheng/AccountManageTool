@@ -797,7 +797,6 @@ def test_google_session_reset_live_validation_and_browser_launch_tracking(tmp_pa
     assert google["browser_open_count"] == 0
     assert google["browser_last_opened_at"] == ""
 
-    # Both Chrome and Edge exist, and the global default is ``inpage_edge``.
     monkeypatch.setattr(bs, "find_chromium_executable", lambda: "C:\\fake\\chrome.exe")
     monkeypatch.delenv("KEYVAULT_BROWSER_PATH", raising=False)
     monkeypatch.setattr(bs, "detect_edge_path", lambda: "C:\\fake\\msedge.exe")
@@ -819,8 +818,6 @@ def test_google_session_reset_live_validation_and_browser_launch_tracking(tmp_pa
 
     monkeypatch.setattr(bs.subprocess, "Popen", lambda *a, **kw: _Running())
 
-    # Google always forces the PurpleShield pure-native Chrome flow, even though
-    # the global engine is ``inpage_edge``: no toolbar, no CDP, external strip.
     launched = api.launch_browser(google["id"])
     assert launched["ok"] is True
     assert launched["inpage_toolbar"] is False
@@ -840,20 +837,6 @@ def test_google_session_reset_live_validation_and_browser_launch_tracking(tmp_pa
     assert with_url["ok"] is True
     assert with_url["pure_native"] is True
     assert shown == [(google["id"], tmp_path / "data" / "browsers" / f"acc_{google['id']}", True)]
-
-    # Non-Google accounts keep the in-page Edge toolbar and never spawn the
-    # external strip ("other platforms stay untouched").
-    chatgpt = api.save_account({"account_type": "ChatGPT", "account": "chat_track@example.test"})["account"]
-    shown.clear()
-    launched_chat = api.launch_browser(chatgpt["id"])
-    assert launched_chat["ok"] is True
-    assert launched_chat["inpage_toolbar"] is True
-    assert launched_chat["pure_native"] is False
-    assert launched_chat["browser_engine_mode"] == "inpage_edge"
-    assert launched_chat["engine"] == "Edge"
-    assert launched_chat["zero_cdp"] is True
-    assert cdp_calls == []
-    assert shown == []
 
     # Google reset_rejected_session is now supported when unlocked
     p_dir = tmp_path / "data" / "browsers" / f"acc_{google['id']}"
@@ -882,6 +865,85 @@ def test_google_session_reset_live_validation_and_browser_launch_tracking(tmp_pa
     assert live_val["ok"] is True
     assert live_val["status"] == "live_validation_url"
     assert live_val["target_url"] == "https://accounts.google.com/v3/signin/continue?plt=live123"
+
+
+def test_account_launch_uses_native_mode_with_legacy_settings(tmp_path: Path, monkeypatch):
+    import json
+    import sqlite3
+    import src.browser_service as bs
+
+    api = AccountApi(data_dir=tmp_path)
+    chrome = r"C:\fake\chrome.exe"
+    edge = r"C:\fake\msedge.exe"
+    monkeypatch.setattr(bs, "find_chromium_executable", lambda: chrome)
+    monkeypatch.setattr(bs, "detect_edge_path", lambda: edge)
+    monkeypatch.setattr(bs, "activate_proxy_node", lambda *args, **kwargs: {"ok": True})
+    monkeypatch.setattr(bs, "_ensure_claude_proxy", lambda account, **kwargs: {"ok": True, **kwargs})
+    monkeypatch.setattr(bs, "resolve_browser_env_config", lambda *args, **kwargs: {"enabled": False})
+
+    cdp_calls, launched, shown = [], [], []
+    monkeypatch.setattr(bs, "_start_cdp_injector", lambda *args: cdp_calls.append(args))
+    api._show_login_tools = lambda account_id, profile, *, launching: shown.append(
+        (account_id, profile, launching)
+    )
+
+    class BrowserProcess:
+        pid = 0
+
+        def wait(self, timeout):
+            return 0
+
+    def start_browser(args, **kwargs):
+        launched.append(args)
+        return BrowserProcess()
+
+    monkeypatch.setattr(bs.subprocess, "Popen", start_browser)
+    for platform, old_mode, preference, expected_browser in (
+        ("ChatGPT", "inpage_edge", "auto", chrome),
+        ("Claude", "inpage_chrome_cdp", "auto", chrome),
+        ("域名邮箱", "inpage_edge", "edge", edge),
+    ):
+        api.settings_path.write_text(
+            json.dumps({"browser_engine_mode": old_mode, "preferred_browser": preference}),
+            encoding="utf-8",
+        )
+        account_id = api.save_account(
+            {"account_type": platform, "account": f"test-{len(launched)}@example.test"}
+        )["account"]["id"]
+        if platform == "域名邮箱":
+            api.db.bind_account_proxy_node(account_id, "http://127.0.0.1:17600", "Test node", locked=True)
+        profile = tmp_path / "browsers" / f"acc_{account_id}"
+        ext = profile / "fp_ext"
+        ext.mkdir(parents=True)
+        (ext / "manifest.json").write_text('{"name": "KeyVault"}', encoding="utf-8")
+        cookies = profile / "Default" / "Network" / "Cookies"
+        cookies.parent.mkdir(parents=True)
+        conn = sqlite3.connect(cookies)
+        try:
+            with conn:
+                conn.execute("CREATE TABLE cookies (name TEXT)")
+                conn.execute("INSERT INTO cookies VALUES ('synthetic-session')")
+        finally:
+            conn.close()
+        cookie_contents = cookies.read_bytes()
+
+        target = "https://example.test/sign-in"
+        result = api.launch_browser(account_id, target_url=target, pure_native=False)
+
+        assert result["ok"], result
+        assert result["browser_engine_mode"] == "pure_native"
+        assert result["manual_login"] is True
+        assert result["inpage_toolbar"] is False
+        assert result["zero_cdp"] is True
+        args = launched[-1]
+        assert args[0] == expected_browser
+        assert f"--user-data-dir={profile.resolve()}" in args
+        assert target in args
+        assert not any(arg.startswith(("--load-extension", "--remote-debugging-port")) for arg in args)
+        assert not ext.exists()
+        assert cookies.read_bytes() == cookie_contents
+        assert shown[-1] == (account_id, profile, True)
+    assert cdp_calls == []
 
 
 def test_api_startup_purges_only_google_legacy_extensions_and_keeps_cookies(tmp_path: Path):
@@ -992,7 +1054,7 @@ def test_api_settings_atomic_validation_hud_notify_and_bounded_shutdown(tmp_path
     saved = api.save_settings({
         "theme": "invalid_theme",
         "totp_offset_seconds": "15",
-        "browser_engine_mode": "pure_native",
+        "browser_engine_mode": "inpage_chrome_cdp",
     })
     assert saved["theme"] == "dark"
     assert saved["totp_offset_seconds"] == 15

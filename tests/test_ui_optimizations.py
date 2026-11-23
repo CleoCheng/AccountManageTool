@@ -63,20 +63,16 @@ def test_settings_modal_sort_mode_and_open_count_in_ui(tmp_path: Path, monkeypat
             first_id_count = page.locator("article.u-card").first.get_attribute("data-id")
             assert first_id_count == str(g_ok["id"])
 
-            # Verify Settings modal loads & saves Option C browser engine / kernel / language settings
+            # Verify Settings loads and saves the local browser preferences.
             page.evaluate("openSettingsModal()")
-            page.locator("#set-browser-engine").wait_for(state="attached")
-            assert page.evaluate("document.getElementById('set-browser-engine').value") == "inpage_edge"
-            engine_opts = page.evaluate(
-                "Array.from(document.querySelectorAll('#set-browser-engine option')).map(o => o.value)"
-            )
-            assert engine_opts == ["inpage_edge", "inpage_chrome_cdp", "pure_native"]
+            page.locator("#set-preferred-browser").wait_for(state="attached")
+            assert page.locator("#set-browser-engine").count() == 0
+            assert api._ensure_settings()["browser_engine_mode"] == "pure_native"
             assert page.evaluate("document.getElementById('set-preferred-browser').value") == "auto"
             assert page.evaluate("document.getElementById('set-browser-lang').value") == "match_region"
             assert page.evaluate("document.getElementById('set-default-start-url').value") == "https://myaccount.google.com/"
 
             page.evaluate("""
-                document.getElementById('set-browser-engine').value = 'inpage_chrome_cdp';
                 document.getElementById('set-preferred-browser').value = 'edge';
                 document.getElementById('set-browser-lang').value = 'en-US';
                 document.getElementById('set-default-start-url').value = 'https://mail.google.com/';
@@ -85,7 +81,7 @@ def test_settings_modal_sort_mode_and_open_count_in_ui(tmp_path: Path, monkeypat
             page.evaluate("saveGeneralSettings()")
             page.wait_for_function("state.settings.preferred_browser === 'edge'")
             saved = api._ensure_settings()
-            assert saved["browser_engine_mode"] == "inpage_chrome_cdp"
+            assert saved["browser_engine_mode"] == "pure_native"
             assert saved["preferred_browser"] == "edge"
             assert saved["default_browser_lang"] == "en-US"
             assert saved["default_start_url"] == "https://mail.google.com/"

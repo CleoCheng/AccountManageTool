@@ -25,7 +25,11 @@ def test_browser_launch_registers_only_successful_account_launch(tmp_path: Path,
     assert api.launch_browser(chat["id"])["ok"] is False
     assert api.show_login_tools(google["id"])["ok"] is True
     assert api.show_login_tools(-1)["ok"] is False
-    assert shown == [(chat["id"], chat_dir, True), (google["id"], google_dir, False)]
+    assert shown == [
+        (chat["id"], chat_dir, True),
+        (chat["id"], chat_dir, True),
+        (google["id"], google_dir, False),
+    ]
 
 
 def test_tools_track_browser_handles_and_dispose_on_close(monkeypatch, tmp_path):
@@ -267,6 +271,17 @@ def test_browser_window_rect_and_winforms_hud_strip_smoke():
                 assert "https://myaccount.google.com/deleteservices" in opened_urls
             finally:
                 menu.Dispose()
+
+            strip.set_account("chat@example.test", True, {**account, "account_type": "ChatGPT"})
+            strip._show_links_menu(strip._btn_gov, _CaptureMenu, ToolStripSeparator)
+            menu = captured["menu"]
+            try:
+                menu_texts = [item.Text for item in menu.Items if item.Text]
+                assert any("ChatGPT 对话主页" in text for text in menu_texts)
+                assert not any("Google" in text or "关闭支付资料" in text for text in menu_texts)
+            finally:
+                menu.Dispose()
+                strip.set_account(account["account"], True, account)
 
             strip.set_collapsed(True)
             w_min, h_min = strip.size

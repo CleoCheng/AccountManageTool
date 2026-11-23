@@ -3445,7 +3445,9 @@ _google_profile_launch_lock = threading.Lock()
 _profile_launch_lock = _google_profile_launch_lock
 
 
-def _remove_legacy_google_extension(profile_dir: Path) -> bool:
+def _remove_legacy_google_extension(
+    profile_dir: Path, *, clear_rejected_cookies: bool = True
+) -> bool:
     """Remove only KeyVault's generated extension when Chromium has closed the profile."""
     ext_dir = profile_dir / "fp_ext"
     legacy_dirs = (profile_dir / "_ag_fp_shield", profile_dir / "_gcp_sync_ext")
@@ -3495,7 +3497,7 @@ def _remove_legacy_google_extension(profile_dir: Path) -> bool:
                     cleaned = True
                 except OSError:
                     pass
-        if cleaned:
+        if cleaned and clear_rejected_cookies:
             # If the profile was only touched by the old extension and never completed login,
             # clear unauthenticated rejected cookies once while keeping logged-in sessions intact.
             _clear_unauthenticated_rejected_cookies(profile_dir)
@@ -3844,7 +3846,7 @@ def prepare_profile_dir(
     if not manual:
         _build_extension_files(ext_dir, fp, account)
     else:
-        _remove_legacy_google_extension(profile_dir)
+        _remove_legacy_google_extension(profile_dir, clear_rejected_cookies=is_google)
 
     if not _profile_has_active_lock(profile_dir):
         _write_chromium_preferences(
@@ -4515,7 +4517,7 @@ def launch_isolated_browser(
     try:
         if use_pure_native:
             with _profile_launch_lock:
-                if not _remove_legacy_google_extension(profile_root):
+                if not _remove_legacy_google_extension(profile_root, clear_rejected_cookies=is_google):
                     return {
                         "ok": False,
                         "manual_login": True,

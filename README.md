@@ -1,6 +1,6 @@
 # 🔐 KeyVault · 全平台账号与凭据管家 (KeyVault Account & Credential Vault)
 
-一款轻量、100% 本地离线存储、支持 **ChatGPT、Google、WorkBuddy、Qcoder** 及自定义平台的全能多账号凭据管理与防关联指纹工作台。
+一款轻量、100% 本地离线存储、支持 **ChatGPT、Google、WorkBuddy、Qcoder** 及自定义平台的多账号凭据管理工具。
 
 > [!WARNING]
 > **使用前请阅读文末「⚠️ 免责声明」。** 本项目仅供学习研究及管理您本人合法拥有的账号。
@@ -18,10 +18,10 @@
 - 🛡️ **安全状态标记 & 生命周期统计**
   - 独立标记 **「密码已改 / 初始密码」** 与 **「2FA已改 / 初始2FA」**，支持一键切换及保留初始 2FA 秘钥备份。
   - 根据购买日期与停用日期自动计算账号状态（`使用中` / `已停用`）与累计使用天数。
-- 🌐 **三引擎账号专属浏览器环境与 Google 纯原生守护**
+- 🌐 **账号专属浏览器**
   - 每个账号使用独立持久化的浏览器配置目录（`data/browsers/acc_<id>`）。
-  - 支持三种启动引擎切换：内置扩展模式（`inpage_edge` / Edge）、Chrome 无扩展隐身注入（`inpage_chrome_cdp`）、以及 **Pure C++ 纯原生模式（`pure_native`）**。
-  - **Google 账号强制纯原生保护**：始终以本机官方 Chrome 为首选（禁用 `--load-extension` / `--remote-debugging-port` 与 JS 注入），启动时静默清理历史扩展残留并保留已认证 `SID` Cookie，通过外部 WinForms 紫盾领航栏（HUD）与硬件扫描码粘贴提供账号/密码/2FA 填写与安全核对闭环。
+  - 从账号卡片启动时，自动优先选择已安装的 Chrome，也可在设置里指定 Chrome、Edge 或自定义浏览器路径。
+  - 所有平台的账号浏览器都使用原生模式。登录工具条由 Windows 窗口提供，账号档案关闭后会在下次启动时清理旧版 KeyVault 扩展文件。
 - 🔑 **外部紫盾领航栏（HUD）& 登录工具**
   - 从账号的「登录工具」查看动态验证码，或复制账号、密码和动态验证码。Windows 下从 KeyVault 启动账号浏览器后，WinForms 紫盾领航栏会停靠在对应前台浏览器内部顶部（支持全屏自适应、收起为迷你胶囊、极速改密/2FA 浮窗与常见维护直链）。关闭工具条后，可在 KeyVault 主窗口点击「贴到浏览器」重新打开。
   - 在 Google 账号的「养护」里记录本人核对的结果，支持 RT 4 步探测、Antigravity 客户端注入、本地 Loopback OAuth 2.0 + PKCE 授权，以及凭据变更在 Google 生效后确认归档；另支持 Windows Named Pipe 外链接管（仅拦截认证/验证链接，普通网页透传回原生浏览器）。
@@ -37,7 +37,7 @@
 | 平台 | 状态 |
 |---|---|
 | **Windows 10 / 11** | ✅ 主要开发与测试平台（含 `KeyVault.exe` 一键启动器） |
-| macOS / Linux | ⚠️ 未充分测试。核心代码做了跨平台路径适配，但指纹 User-Agent 目前固定为 Windows，与真实系统不一致 |
+| macOS / Linux | ⚠️ 未充分测试。随浏览器显示的登录工具条依赖 Windows |
 
 ---
 
@@ -102,7 +102,7 @@ powershell -ExecutionPolicy Bypass -File tools\launcher\build.ps1
 │   └── browsers/            # 各账号独立的浏览器配置目录 (acc_1, acc_2 ...)
 ├── src/
 │   ├── api.py                 # pywebview 前后端桥接 API
-│   ├── browser_service.py     # 浏览器三引擎、Google 纯原生清理与环境配置
+│   ├── browser_service.py     # 账号浏览器启动、档案与环境配置
 │   ├── browser_window.py      # Win32 浏览器窗口绑定、DPI 与屏幕越界救援
 │   ├── crash_logger.py        # pythonw 与 WinForms/CLR 异常日志轮转
 │   ├── db_service.py          # SQLite WAL 存储、历史归档与 Rolling 备份

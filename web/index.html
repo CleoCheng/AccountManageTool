@@ -28,7 +28,7 @@
           </div>
           <div>
             <h1 class="brand-title">KeyVault 账号管家</h1>
-            <p class="brand-sub">全平台凭据 · 2FA 动态秘钥 · 指纹隔离终端</p>
+            <p class="brand-sub">全平台凭据 · 2FA 动态秘钥 · 独立账号浏览器</p>
           </div>
         </div>
 
@@ -220,7 +220,7 @@
           <button class="btn btn-secondary" id="workbuddy-progress" onclick="openWorkBuddyModal()" style="display: none;">查看任务进度</button>
           <button class="btn btn-primary" id="workbuddy-start" onclick="startWorkBuddyQueue()" disabled>批量注册WorkBuddy</button>
         </span>
-        <p>点击「🌐 启动浏览器」一键打开带专属隔离指纹与代理的注册窗口 · 点击卡片「邮件码」或上方刷新按需查信（静默刷新默认关闭，可按需开启）· 每 2 个邮箱收到验证码自动换下一节点</p>
+        <p>点击「🌐 启动浏览器」打开邮箱的专属浏览器 · 点击卡片「邮件码」或上方刷新按需查信（静默刷新默认关闭，可按需开启）· 每 2 个邮箱收到验证码自动换下一节点</p>
       </section>
       <div id="accounts-container" class="accounts-grid"></div>
 
@@ -539,7 +539,7 @@
     <div class="modal-card">
       <div class="modal-header">
         <div>
-          <h2 id="node-modal-title">指纹浏览器 · 专属代理端口与节点锁定</h2>
+          <h2 id="node-modal-title">账号浏览器 · 专属代理端口与节点锁定</h2>
           <p class="modal-subtitle" id="node-modal-sub">自动探测本机代理软件 (Clash / Mihomo / v2rayN / Sing-box 等) 端口与节点，绑定并锁定后不解锁绝不变更</p>
         </div>
         <button class="modal-close" onclick="closeNodeModal()">×</button>
@@ -610,7 +610,7 @@
             🔒 仅锁定并保存节点
           </button>
           <button type="button" class="btn btn-primary" id="btn-save-and-launch" onclick="saveAndLockNode(true)">
-            🚀 锁定此节点并启动指纹浏览器
+            🚀 锁定此节点并启动浏览器
           </button>
         </div>
       </div>
@@ -737,8 +737,8 @@
               <div class="sec-mini-card">
                 <span class="sec-mini-icon">🌐</span>
                 <div class="sec-mini-text">
-                  <strong>独立指纹沙箱容器</strong>
-                  <span>防关联硬件隔离，保障账号资产</span>
+                  <strong>独立浏览器档案</strong>
+                  <span>每个账号分别保存浏览器数据</span>
                 </div>
               </div>
             </div>
@@ -747,24 +747,14 @@
           <div class="settings-section" style="margin-top: 14px;">
             <div class="settings-section-head">
               <span class="sec-dot dot-blue"></span>
-              <h3 class="settings-section-title">🛡️ 独立养号浏览器与防风控引擎</h3>
+              <h3 class="settings-section-title">账号浏览器</h3>
             </div>
             <div class="form-grid-2">
               <div class="form-group">
-                <label for="set-browser-engine">浏览器工具栏与防风控模式（非 Google 平台）</label>
-                <div class="settings-select-wrap">
-                  <select id="set-browser-engine" class="settings-select">
-                    <option value="inpage_edge">🌐 网页内顶部停靠栏 · Edge 免 CDP（推荐 · 全屏可见/零调试端口）</option>
-                    <option value="inpage_chrome_cdp">🌐 网页内顶部停靠栏 · Chrome 静默 CDP（沿用 Chrome Cookie）</option>
-                    <option value="pure_native">🛡️ 外部悬浮领航栏 · PurpleShield 纯原生零注入（零扩展）</option>
-                  </select>
-                </div>
-              </div>
-              <div class="form-group">
-                <label for="set-preferred-browser">首选浏览器内核</label>
+                <label for="set-preferred-browser">首选浏览器</label>
                 <div class="settings-select-wrap">
                   <select id="set-preferred-browser" class="settings-select" onchange="onPreferredBrowserChange()">
-                    <option value="auto">自动智能选择（Google 优先 Chrome · 其余按引擎模式）</option>
+                    <option value="auto">自动选择（优先 Chrome）</option>
                     <option value="chrome">强制 Google Chrome</option>
                     <option value="edge">强制 Microsoft Edge</option>
                     <option value="custom">自定义可执行文件路径</option>
@@ -773,7 +763,7 @@
               </div>
             </div>
             <div style="font-size:11.5px;color:var(--text-muted);margin-top:6px;line-height:1.45;">
-              🛡️ <strong>Google 账号养护专属策略：</strong>固定使用官方 Chrome 纯 C++ 原生隔离模式（零扩展、零调试端口、零脚本注入，自动清理残留扩展并拉起外部紫盾领航栏），彻底规避人机验证；上方「网页内顶部停靠栏」仅对 ChatGPT / Claude / 域名邮箱生效（点 <code>⊟ 最小</code> 缩胶囊，按 <code>Alt+K</code> 显隐）。
+              每个账号沿用独立的浏览器档案。Windows 登录工具条随对应的浏览器窗口显示。
             </div>
             <div class="form-group" id="set-custom-browser-group" style="display: none; margin-top: 10px;">
               <label for="set-custom-browser-path">自定义浏览器路径</label>
@@ -1263,7 +1253,7 @@
       <div class="modal-header">
         <div>
           <h2>🏥 Google / GCP 申诉与风控救号中心</h2>
-          <p class="modal-subtitle">选择需救号的账号环境，一键在绑定专属代理的指纹浏览器或纯净模式中打开官方申诉表单</p>
+          <p class="modal-subtitle">选择要申诉的账号，在该账号的专属浏览器中打开官方申诉表单。</p>
         </div>
         <button class="modal-close" onclick="closeAppealModal()">×</button>
       </div>
@@ -1282,7 +1272,7 @@
     </div>
   </div>
 
-  <script src="app.js?v=20261118_8"></script>
+  <script src="app.js?v=20261123_1"></script>
   <script src="workbuddy.js?v=20261118_2"></script>
 </body>
 </html>

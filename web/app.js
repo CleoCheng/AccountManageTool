@@ -722,30 +722,22 @@ function getUnifiedMetaSummary(item) {
 function getFpSummary(item) {
   const fp = item.fp_config || {};
   const code = fp.profile_code || `FP-${String(item.id).padStart(3, "0")}`;
-  const gpu = fp.gpu_short || "RTX 4070";
-  const cpu = fp.cpu_cores || 12;
-  const mem = fp.memory_gb || 16;
-  const scr = fp.screen || "1920x1080";
   const proxyNode = fp.proxy_node || "";
   const locked = !!fp.node_locked;
   const proxyPort = fp.proxy ? fp.proxy.replace("http://127.0.0.1:", ":") : "";
 
   const isClaude = item.account_type === "Claude";
-  const isBound = !!(proxyNode || fp.proxy);
   const tz = fp.timezone || (isClaude ? "America/Los_Angeles" : "系统默认");
   const locale = fp.locale || (isClaude ? "en-US, en" : "系统默认");
-  const warnText = isClaude && !isBound ? "⚠️ 未绑定代理" : "";
-
-  let tooltip = `专属配对指纹环境 [${code}]\nGPU: ${gpu}\nCPU/内存: ${cpu}核 / ${mem}GB\n分辨率: ${scr}\n绑定节点: ${proxyNode || (isClaude ? "⚠️ 未绑定代理 (建议美西住宅代理)" : "未绑定")} (${locked ? "已锁定" : "未锁定"})\n端口: ${fp.proxy || "默认"}\n时区/语言: ${tz} · ${locale}\n数据隔离目录: data/browsers/acc_${item.id}`;
+  const tooltip = `浏览器档案 [${code}]\n绑定节点: ${proxyNode || "未绑定"} (${locked ? "已锁定" : "未锁定"})\n端口: ${fp.proxy || "默认"}\n时区/语言: ${tz} · ${locale}\n档案目录: data/browsers/acc_${item.id}`;
 
   return {
     code,
     proxyNode,
     locked,
     proxyPort,
-    shortDesc: `${gpu} · ${cpu}核/${mem}G · ${scr}${warnText ? ` · ${warnText}` : ""}`,
+    shortDesc: proxyNode || (fp.proxy ? "使用固定代理" : "未绑定代理"),
     tooltip,
-    warnText,
   };
 }
 
@@ -1046,11 +1038,10 @@ function renderCardItem(item, remaining) {
         }
         ${renderCustomDrawerRows(item)}
         <div class="detail-row">
-          <span class="detail-key">指纹环境</span>
+          <span class="detail-key">浏览器档案</span>
           <span class="detail-val">[${escapeHtml(fpInfo.code)}] ${escapeHtml(fpInfo.shortDesc)}</span>
           <div class="detail-ops">
             <button class="u-peek-btn" onclick="openNodeModal(${item.id})">${fpInfo.locked ? "🔒 节点已锁" : "配置节点"}</button>
-            <button class="u-peek-btn" onclick="regenerateAccountFp(${item.id})" title="重新生成该账号绑定的硬件指纹参数">换新指纹</button>
           </div>
         </div>
         <div class="detail-row">
@@ -1204,7 +1195,7 @@ function renderCardItem(item, remaining) {
               ? `<button class="copy-btn" onclick="copyFieldValue(this, ${item.id}, 'secret_key', '2FA秘钥')">2FA</button>`
               : ""
           }
-          <button class="btn-browser" onclick="onClickLaunchBrowser(${item.id}, this)" title="${item.account_type === "Google" ? "在账号专属浏览器中手动登录 Google" : escapeHtml(fpInfo.tooltip)}">
+          <button class="btn-browser" onclick="onClickLaunchBrowser(${item.id}, this)" title="打开账号专属浏览器">
             🌐 启动浏览器
           </button>
         </div>
@@ -1447,7 +1438,7 @@ function renderTableView(remaining, list = state.accounts) {
           </td>
           <td>
             <div class="tb-col-actions">
-              <button class="btn-browser tb-btn-browser" onclick="onClickLaunchBrowser(${item.id}, this)" title="${item.account_type === "Google" ? "在账号专属浏览器中手动登录 Google" : escapeHtml(fpInfo.tooltip)}">🌐 启动</button>
+              <button class="btn-browser tb-btn-browser" onclick="onClickLaunchBrowser(${item.id}, this)" title="打开账号专属浏览器">🌐 启动</button>
               <div class="u-card-tools tb-tools">
                 <button class="tool-link" onclick="openQuickCredModal(${item.id})" title="4步安全改密与养号进度">养护</button>
                 ${item.account_type === "域名邮箱" ? "" : `<button class="tool-link" onclick="openLoginTools(${item.id})">登录工具</button>`}
@@ -1481,7 +1472,7 @@ function renderTableView(remaining, list = state.accounts) {
       <thead>
         <tr>
           <th style="width: 9%; min-width: 72px;"># 平台</th>
-          <th style="width: 27%; min-width: 195px;">账号 / 指纹节点</th>
+          <th style="width: 27%; min-width: 195px;">账号 / 代理节点</th>
           <th style="width: 13%; min-width: 100px;">设备 / 状态</th>
           <th style="width: 16%; min-width: 120px;">安全 / Pro</th>
           <th style="width: 11%; min-width: 80px;">2FA动态码</th>
@@ -1524,9 +1515,7 @@ async function executeLaunchBrowser(accountId, btnEl = null, targetUrl = "") {
   showToast("正在打开浏览器...", 2800);
 
   try {
-    const res = targetUrl
-      ? await callApi("launch_browser", accountId, targetUrl, true)
-      : await callApi("launch_browser", accountId);
+    const res = await callApi("launch_browser", accountId, targetUrl);
     if (res && res.ok) {
       if (res.mailbox) {
         showToast("已在默认浏览器打开域名邮箱");
@@ -1557,11 +1546,6 @@ function showBrowserLaunchResult(accountId, result, account = state.accounts.fin
   if (account && account.account_type !== "域名邮箱") openLoginTools(accountId);
   if (result.profile_cleanup_pending) {
     showToast("请关闭该账号的浏览器窗口后重新启动，以处理旧扩展。");
-  } else if (result.inpage_toolbar) {
-    const engineLabel = result.engine ? `${result.engine} ` : "";
-    showToast(`已启动 ${engineLabel}独立浏览器（网页内顶部工具栏已启用 · ⊟ 最小缩胶囊 · Alt+K 显隐）`);
-  } else if (account?.account_type === "Google") {
-    showToast("请在 Google 页面登录。账号、密码和验证码可从 KeyVault 顶部的「登录工具」复制。");
   } else {
     showToast("已请求打开浏览器。");
   }
@@ -1789,7 +1773,7 @@ function renderNodeModalLockState(item) {
     portSelect.disabled = false;
     if (customInput) customInput.disabled = false;
     btnSaveOnly.style.display = "inline-flex";
-    btnSaveLaunch.textContent = "🚀 锁定此配置并启动指纹浏览器";
+    btnSaveLaunch.textContent = "🚀 锁定此配置并启动浏览器";
   }
   syncCustomSelect(portSelect);
 }
@@ -1972,19 +1956,6 @@ async function saveAndLockNode(andLaunch = false) {
 
 function closeNodeModal() {
   document.getElementById("node-modal").style.display = "none";
-}
-
-async function regenerateAccountFp(accountId) {
-  try {
-    const res = await callApi("regenerate_fingerprint", accountId);
-    if (res && res.ok) {
-      const fp = res.account.fp_config || {};
-      showToast(`✓ 已为 [${fp.profile_code}] 重新生成专属指纹 (${fp.gpu_short} · ${fp.screen})`);
-      await loadDashboard();
-    }
-  } catch (err) {
-    showToast("重置指纹失败");
-  }
 }
 
 async function toggleCardTwofaModified(accountId, nextVal) {
@@ -2997,12 +2968,6 @@ function openSettingsModal() {
     if (selPlat && state.settings.default_account_type) selPlat.value = state.settings.default_account_type;
     if (selDev && state.settings.default_device_tag) selDev.value = state.settings.default_device_tag;
 
-    const engSel = document.getElementById("set-browser-engine");
-    if (engSel) {
-      const rawMode = state.settings.browser_engine_mode || "inpage_edge";
-      const validModes = ["inpage_edge", "inpage_chrome_cdp", "pure_native"];
-      engSel.value = validModes.includes(rawMode) ? rawMode : "inpage_edge";
-    }
     const prefSel = document.getElementById("set-preferred-browser");
     if (prefSel) prefSel.value = state.settings.preferred_browser || "auto";
     const customPathEl = document.getElementById("set-custom-browser-path");
@@ -3024,7 +2989,6 @@ function openSettingsModal() {
   syncCustomSelect(document.getElementById("set-totp-interval"));
   syncCustomSelect(selPlat);
   syncCustomSelect(selDev);
-  syncCustomSelect(document.getElementById("set-browser-engine"));
   syncCustomSelect(document.getElementById("set-preferred-browser"));
   syncCustomSelect(document.getElementById("set-browser-lang"));
   syncCustomSelect(document.getElementById("set-default-start-url"));
@@ -3252,7 +3216,6 @@ async function saveGeneralSettings() {
   const totpInterval = parseInt(document.getElementById("set-totp-interval")?.value, 10) || 30;
   const defPlat = document.getElementById("set-default-account-type")?.value || "ChatGPT";
   const defDev = document.getElementById("set-default-device-tag")?.value || "主机";
-  const browserEngineMode = document.getElementById("set-browser-engine")?.value || "inpage_edge";
   const preferredBrowser = document.getElementById("set-preferred-browser")?.value || "auto";
   const customBrowserPath = (document.getElementById("set-custom-browser-path")?.value || "").trim();
   const defaultBrowserLang = document.getElementById("set-browser-lang")?.value || "match_region";
@@ -3268,7 +3231,6 @@ async function saveGeneralSettings() {
       totp_interval: totpInterval,
       default_account_type: defPlat,
       default_device_tag: defDev,
-      browser_engine_mode: browserEngineMode,
       preferred_browser: preferredBrowser,
       custom_browser_path: customBrowserPath,
       default_browser_lang: defaultBrowserLang,
@@ -4969,10 +4931,7 @@ function _bindAppealActionDelegation(container) {
   container.addEventListener("click", (e) => {
     const openBtn = e.target.closest("[data-open-url]");
     if (openBtn) {
-      onClickOpenAppealUrl(
-        openBtn.getAttribute("data-open-url") || "",
-        openBtn.getAttribute("data-pure-native") === "1"
-      );
+      onClickOpenAppealUrl(openBtn.getAttribute("data-open-url") || "");
       return;
     }
     const copyBtn = e.target.closest("[data-copy-url]");
@@ -5000,7 +4959,7 @@ function renderAppealValidationBanner() {
         <div class="appeal-val-url">${escapeHtml(valUrl)}</div>
       </div>
       <div style="display:flex;gap:8px;">
-        <button type="button" class="btn btn-primary btn-xs" data-open-url="${escapeHtml(valUrl)}" data-pure-native="1">打开验证页面</button>
+        <button type="button" class="btn btn-primary btn-xs" data-open-url="${escapeHtml(valUrl)}">打开验证页面</button>
         <button type="button" class="btn btn-secondary btn-xs" data-copy-url="${escapeHtml(valUrl)}" data-copy-label="验证链接">📋 复制</button>
       </div>
     `;
@@ -5014,9 +4973,6 @@ function renderAppealChannelsList() {
   if (!box) return;
   _bindAppealActionDelegation(box);
   const channels = state.appealChannels || [];
-  const accountId = Number(document.getElementById("appeal-account-select")?.value || 0);
-  const selectedAcc = accountId ? getModalAccountsFallback().find((account) => account.id === accountId) : null;
-  const isGoogle = !selectedAcc || selectedAcc.account_type === "Google";
   box.innerHTML = channels
     .map(
       (ch) => `
@@ -5033,8 +4989,7 @@ function renderAppealChannelsList() {
           ${(ch.steps || []).map((s) => `<li>${escapeHtml(s)}</li>`).join("")}
         </ul>
         <div class="appeal-ch-actions">
-          ${isGoogle ? "" : `<button type="button" class="btn btn-primary btn-xs" data-open-url="${escapeHtml(ch.url)}" data-pure-native="0">指纹浏览器打开</button>`}
-          <button type="button" class="btn btn-secondary btn-xs" data-open-url="${escapeHtml(ch.url)}" data-pure-native="1">使用账号专属浏览器打开</button>
+          <button type="button" class="btn btn-primary btn-xs" data-open-url="${escapeHtml(ch.url)}">使用账号专属浏览器打开</button>
           <button type="button" class="btn btn-ghost btn-xs" data-copy-url="${escapeHtml(ch.url)}" data-copy-label="申诉链接">📋 复制链接</button>
         </div>
       </div>
@@ -5043,7 +4998,7 @@ function renderAppealChannelsList() {
     .join("");
 }
 
-async function onClickOpenAppealUrl(url, pureNative = false) {
+async function onClickOpenAppealUrl(url) {
   const accId = Number(document.getElementById("appeal-account-select")?.value || 0);
   if (!accId) {
     showToast("暂无或未选择异常状态的 Google 账号。");
@@ -5051,7 +5006,7 @@ async function onClickOpenAppealUrl(url, pureNative = false) {
   }
   try {
     const account = getModalAccountsFallback().find((item) => item.id === accId);
-    const res = await callApi("launch_browser", accId, url, pureNative || account?.account_type === "Google");
+    const res = await callApi("launch_browser", accId, url);
     if (res && res.ok) {
       showBrowserLaunchResult(accId, res, account);
     } else {

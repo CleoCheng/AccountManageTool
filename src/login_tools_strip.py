@@ -2000,6 +2000,25 @@ class LoginToolsStrip:
 
             return add_action(text, _open)
 
+        def add_bind_2fa():
+            if callable(self._actions.get("bind_2fa_clipboard")):
+                add_action(
+                    "◆ 从剪贴板绑定/录入 2FA 密钥",
+                    self._actions["bind_2fa_clipboard"],
+                    color=Color.FromArgb(251, 191, 36),
+                    bold=True,
+                )
+
+        platform = (self._account.get("account_type") or "").strip().lower()
+        if platform != "google":
+            add_bind_2fa()
+            if platform == "域名邮箱":
+                add_url("◆ 打开邮箱收件箱", "https://mail.ggb6.com/")
+            add_url("★ ChatGPT 对话主页", "https://chatgpt.com/")
+            add_url("✦ Claude 对话主页", "https://claude.ai/")
+            menu.Show(anchor_btn, Point(0, anchor_btn.Height + 2))
+            return
+
         if callable(self._actions.get("start_oauth")):
             add_action(
                 "▸ 反重力首次登录/OAuth 扫码授权",
@@ -2038,13 +2057,7 @@ class LoginToolsStrip:
                 self._actions["copy_persona"],
                 color=Color.FromArgb(167, 139, 250),
             )
-        if callable(self._actions.get("bind_2fa_clipboard")):
-            add_action(
-                "◆ 从剪贴板绑定/录入 2FA 密钥",
-                self._actions["bind_2fa_clipboard"],
-                color=Color.FromArgb(251, 191, 36),
-                bold=True,
-            )
+        add_bind_2fa()
 
         add_separator()
 

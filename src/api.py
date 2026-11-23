@@ -68,7 +68,7 @@ DEFAULT_SETTINGS = {
     "domain_email_login_url": "https://mail.ggb6.com",
     "default_start_url": "https://myaccount.google.com/",
     "last_filter_type": "All",
-    "browser_engine_mode": "inpage_edge",
+    "browser_engine_mode": "pure_native",
     "preferred_browser": "auto",
     "custom_browser_path": "",
     "default_browser_lang": "match_region",
@@ -165,11 +165,8 @@ class AccountApi:
                 elif k == "theme":
                     merged[k] = v if v in ("dark", "light") else DEFAULT_SETTINGS["theme"]
                 elif k == "browser_engine_mode":
-                    merged[k] = (
-                        v
-                        if v in ("inpage_edge", "inpage_chrome_cdp", "pure_native")
-                        else DEFAULT_SETTINGS["browser_engine_mode"]
-                    )
+                    # Stored settings and older clients can still send retired modes.
+                    continue
                 elif k == "preferred_browser":
                     merged[k] = (
                         v
@@ -480,6 +477,7 @@ class AccountApi:
         target_url: str = "",
         pure_native: bool | None = None,
     ) -> dict:
+        """Launch the account profile natively, accepting the legacy mode argument for older clients."""
         import src.browser_service as bs
 
         account = self.db.get_account(int(account_id))
@@ -496,12 +494,12 @@ class AccountApi:
         kwargs: dict = {}
         if target_url:
             kwargs["target_url"] = target_url
-        if pure_native is not None:
-            kwargs["pure_native"] = bool(pure_native)
         try:
             params = inspect.signature(launch_fn).parameters
             if "settings" in params:
                 kwargs["settings"] = settings
+            if "pure_native" in params:
+                kwargs["pure_native"] = True
         except (TypeError, ValueError):
             pass
 
@@ -521,7 +519,6 @@ class AccountApi:
                 result.get("profile_dir")
                 and self._show_login_tools
                 and not result.get("inpage_toolbar")
-                and (not target_url or account.get("account_type") == "Google")
             ):
                 try:
                     _call_supported(
